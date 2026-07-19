@@ -640,3 +640,33 @@ def test_missing_explicit_config_exits_with_config_error(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     assert main(["--config-path", str(tmp_path / "nope.json")]) == 2
+
+
+def test_task_ref_uses_task_number_not_seq(monkeypatch):
+    """`TASK-<taskSeq>` 404s server-side; the resolvable ref is taskNumber."""
+    from alissa.tools.github.reviewloop import alissa as alissa_mod
+
+    row = {
+        "taskSeq": 998,
+        "taskNumber": 617115756,
+        "title": f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-1874352953)",
+        "status": "pending_validation",
+    }
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: [row])
+
+    task = alissa_mod.Alissa().find_review_task(OWNER, REPO, NUMBER)
+    assert task is not None
+    assert task.ref == "TASK-617115756"
+
+
+def test_task_without_a_number_is_skipped(monkeypatch):
+    from alissa.tools.github.reviewloop import alissa as alissa_mod
+
+    row = {
+        "taskSeq": 998,
+        "title": f"Review PR {OWNER}/{REPO}#{NUMBER}",
+        "status": "committed",
+    }
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: [row])
+
+    assert alissa_mod.Alissa().find_review_task(OWNER, REPO, NUMBER) is None
