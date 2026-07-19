@@ -7,8 +7,9 @@ The skill lists trigger automation as a planned tier ("a CI job on
 `pull_request.ready_for_review` ... is not part of this skill's contract"). This
 is that tier, as a polling daemon instead of a webhook.
 
-Shipped as `alissa.tools.github.reviewloop` in the `alissa.tools` distribution
-(`alissa-tools/`); see that package's README for the layout conventions.
+Shipped as the module `alissa.tools.github.reviewloop`, in the distribution
+`alissa-tools-github-reviewloop/`. `alissa.tools.github` is a PEP 420 namespace
+other repos can extend — see that package's README.
 
 ## What it does
 
@@ -49,7 +50,7 @@ CR3's "fresh instance per round" falls out for free — each trigger spawns a ne
 ```sh
 python -m venv venv && source venv/bin/activate
 pip install -r requirements-develop.txt
-pip install -e ./alissa-tools
+pip install -e ./alissa-tools-github-reviewloop
 
 cp reviewloop.config.example.json reviewloop.config.json
 $EDITOR reviewloop.config.json          # set workspace_root at minimum
@@ -152,10 +153,10 @@ and, on cap-out, comments. Reviewer posture (CR6) is enforced in every directive
 ## Tests
 
 ```sh
-bash tests-unit.sh alissa-tools
-bash tests-coverage.sh alissa-tools
-bash check-style.sh alissa-tools
-bash check-types.sh alissa-tools
+bash tests-unit.sh alissa-tools-github-reviewloop
+bash tests-coverage.sh alissa-tools-github-reviewloop
+bash check-style.sh alissa-tools-github-reviewloop
+bash check-types.sh alissa-tools-github-reviewloop
 ```
 
 26 tests cover the decision state machine with GitHub and Alissa faked.

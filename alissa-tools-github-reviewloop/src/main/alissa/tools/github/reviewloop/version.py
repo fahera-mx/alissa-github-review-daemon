@@ -40,7 +40,7 @@ class Version:
 
 
 try:
-    version = Version.from_path(name="alissa.tools", dirpath=os.path.dirname(__file__))
+    version = Version.from_path(name="alissa-tools-github-reviewloop", dirpath=os.path.dirname(__file__))
 except Exception:
-    print("Version file not found for package name: alissa.tools, using 0.0.0")
-    version = Version(name="alissa.tools", value="0.0.0")
+    print("Version file not found for package name: alissa-tools-github-reviewloop, using 0.0.0")
+    version = Version(name="alissa-tools-github-reviewloop", value="0.0.0")

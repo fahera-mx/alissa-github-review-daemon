@@ -6,7 +6,7 @@ jobs:
     strategy:
       matrix:
         path:
-          - alissa-tools
+          - alissa-tools-github-reviewloop
     name: Wheel Package Check for ${{ matrix.path }}
     runs-on: ubuntu-latest
     steps:
