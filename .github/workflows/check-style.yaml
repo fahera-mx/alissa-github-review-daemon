@@ -1,0 +1,27 @@
+name: Check Python Style
+on: [pull_request]
+
+jobs:
+  python-style-check:
+    strategy:
+      matrix:
+        path:
+          - alissa-tools-github-reviewloop
+    name: Python Style Check for ${{ matrix.path }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-develop.txt
+      - name: Execute Style Check
+        run: |
+          bash check-style.sh ${{ matrix.path }}

@@ -1,0 +1,1 @@
+(cd ${1}; coverage report --omit="test_*","*_remote_module_non_scriptable.py")

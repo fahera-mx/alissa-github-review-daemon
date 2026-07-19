@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+.pytest_cache/
+.mypy_cache/
+
+# Worktree-local environments (R10: worktrees are self-contained)
+venv/
+.venv/
+
+# Local daemon config — carries workspace paths, not portable
+reviewloop.config.json

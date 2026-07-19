@@ -1,0 +1,30 @@
+name: Check Unit-Tests and Simple Coverage Report
+on: [pull_request]
+
+jobs:
+  python-unit-testing:
+    strategy:
+      matrix:
+        path:
+          - alissa-tools-github-reviewloop
+    name: Unit-Test Check for ${{ matrix.path }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-develop.txt
+      - name: Install Package
+        run: python -m pip install -e ./${{ matrix.path }}
+      - name: Execute Unit-Tests
+        run: |
+          bash tests-unit.sh ${{ matrix.path }}
+          bash tests-coverage.sh ${{ matrix.path }}
