@@ -1,0 +1,20 @@
+{
+  "workspace_root": "~/Documents/Alissa-Repos",
+  "hub_template": "{root}/{repo}/main",
+
+  "poll_interval": 60,
+  "round_cap": 3,
+
+  "repos": [],
+
+  "agent_profile": "claude",
+  "reviewer_login": null,
+
+  "state_path": "~/.local/state/reviewloop/state.db",
+  "on_missing_review_task": "spawn_anyway",
+
+  "_on_missing_hub": "'skip' (default) or 'add' to run `alissa code workspace add`. 'add' requires a non-empty repos allowlist.",
+  "on_missing_hub": "skip",
+
+  "dry_run": false
+}
