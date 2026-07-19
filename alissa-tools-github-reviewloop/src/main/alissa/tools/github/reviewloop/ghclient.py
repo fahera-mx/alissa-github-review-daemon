@@ -45,6 +45,17 @@ class Review:
     commit_id: str
     submitted_at: str
     url: str
+    body: str = ""
+
+    @property
+    def is_substantive(self) -> bool:
+        """A real review round, not a side effect of an inline comment.
+
+        Posting a standalone inline comment on a PR creates its own review
+        record with an empty body, so review records outnumber rounds. The
+        round-closing review always carries the verdict write-up in its body.
+        """
+        return bool(self.body.strip())
 
 
 class RateLimited(RuntimeError):
@@ -159,16 +170,34 @@ class GitHub:
                 commit_id=r.get("commit_id") or "",
                 submitted_at=r.get("submitted_at") or "",
                 url=r.get("html_url", ""),
+                body=r.get("body") or "",
             )
             for r in data
         ]
 
     def my_reviews(self, owner: str, repo: str, number: int) -> list[Review]:
-        """My submitted reviews, oldest first -- one per completed round."""
+        """My substantive submitted reviews, oldest first -- one per round.
+
+        Empty-bodied records are dropped: a standalone inline comment creates
+        its own zero-body review record, so counting raw records overcounts
+        rounds badly. On fahera-mx/studio.alissa.app#210 three real rounds
+        produced six records (round 1 plus three inline-comment artifacts, then
+        rounds 2 and 3), and round 3's reviewer was told it was "round 6 of
+        cap 10".
+
+        Do NOT dedupe by `commit_id` instead -- it looks like the natural
+        grouping key but it UNDERCOUNTS. A round reviews whatever head is
+        current, and consecutive rounds routinely land on the same commit when
+        the implementer triages findings without pushing: on #210 rounds 2 and
+        3 both carry head 805398a and would collapse into one. Body presence
+        tracks "a reviewer wrote a verdict"; commit identity does not.
+        """
         mine = [
             r
             for r in self.reviews(owner, repo, number)
-            if r.author == self.login and r.state in SUBMITTED_STATES
+            if r.author == self.login
+            and r.state in SUBMITTED_STATES
+            and r.is_substantive
         ]
         return sorted(mine, key=lambda r: r.submitted_at)
 

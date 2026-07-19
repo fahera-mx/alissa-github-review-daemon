@@ -2,7 +2,10 @@
 
 One pass = poll GitHub for pending review requests, decide per PR whether a
 fresh reviewer round is owed, and enqueue it. Rounds are derived from GitHub
-(one submitted review per round), not from local bookkeeping.
+(one *substantive* submitted review per round -- empty-bodied records are
+inline-comment artifacts, not rounds), not from local bookkeeping. Convergence
+comes from either the GitHub review state or the CR6 verdict envelope on the
+Alissa review task.
 """
 
 from __future__ import annotations
@@ -14,9 +17,9 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from .alissa import Alissa
+from .alissa import VERDICT_APPROVE, Alissa, Task
 from .config import HUB_ADD, ON_MISSING_SKIP, Config
-from .ghclient import GitHub, PullRequest, RateLimited
+from .ghclient import GitHub, PullRequest, RateLimited, Review
 from .proc import CommandError
 from .state import State
 
@@ -114,8 +117,13 @@ class ReviewWatcher:
         my_reviews = self.github.my_reviews(owner, repo, number)
         completed = len(my_reviews)
 
-        if my_reviews and my_reviews[-1].state == "APPROVED":
-            return Decision(Action.CONVERGED, "last verdict is approve", completed)
+        # Looked up here rather than inside _spawn: convergence needs the ref
+        # too. _spawn still handles `task is None` exactly as before.
+        task = self.alissa.find_review_task(owner, repo, number)
+
+        converged = self._convergence_reason(my_reviews, task)
+        if converged is not None:
+            return Decision(Action.CONVERGED, converged, completed)
 
         # CR9: never queue round cap+1.
         if completed >= self.config.round_cap:
@@ -138,13 +146,36 @@ class ReviewWatcher:
                 age / 60,
             )
 
-        return self._spawn(pr, round_)
+        return self._spawn(pr, round_, task)
+
+    def _convergence_reason(self, my_reviews: list[Review], task: Task | None) -> str | None:
+        """Why the loop is done, or None if it is not.
+
+        Two independent signals, because neither alone is sufficient:
+
+        * The GitHub review state. Authoritative when it says APPROVED, but
+          reviewers work in comment mode, which can only ever produce
+          COMMENTED -- #210 has zero APPROVED records across its whole history.
+          On its own this made convergence unreachable: every PR, however
+          clean, ran to the round cap and escalated.
+        * The CR6 verdict envelope on the Alissa review task. The review skill
+          declares this the verdict of record, and unlike the GitHub state it
+          can actually express approval, so it is the signal that closes the
+          loop in practice.
+        """
+        if my_reviews and my_reviews[-1].state == "APPROVED":
+            return "last GitHub review state is APPROVED"
+
+        # Only checkable once a review task exists; before that there is
+        # nowhere for a verdict to have been recorded.
+        if task is not None and self.alissa.latest_verdict(task.ref) == VERDICT_APPROVE:
+            return f"newest verdict envelope on {task.ref} reads approve"
+
+        return None
 
     # -- actions -----------------------------------------------------------
 
-    def _spawn(self, pr: PullRequest, round_: int) -> Decision:
-        task = self.alissa.find_review_task(pr.owner, pr.repo, pr.number)
-
+    def _spawn(self, pr: PullRequest, round_: int, task: Task | None) -> Decision:
         if task is None:
             if self.config.on_missing_review_task == ON_MISSING_SKIP:
                 return Decision(
