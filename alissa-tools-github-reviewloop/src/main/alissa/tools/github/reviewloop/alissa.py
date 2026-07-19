@@ -15,6 +15,23 @@ log = logging.getLogger(__name__)
 # A review task is "open" while it can still receive a verdict.
 OPEN_STATUSES = {"committed", "in_progress", "pending_validation", "todo"}
 
+# CR6 verdict envelope outcomes.
+VERDICT_APPROVE = "approve"
+VERDICT_REQUEST_CHANGES = "request_changes"
+
+# Envelope titles and bodies both read:
+#   Review verdict: <org>/<repo>#<n> — request_changes (round 3, ...)
+#   # Review verdict: <org>/<repo>#<n> — approve
+# The separator is an em-dash in practice; en-dash and hyphen are accepted too
+# so a hand-written envelope does not silently fail to parse.
+# Kept to a single line on purpose: the verdict word sits on the same line as
+# the "Review verdict:" lead-in, so matching across newlines could only pick up
+# a later round's wording out of order.
+_VERDICT_RE = re.compile(
+    r"Review\s+verdict\s*:[^\n]*?[—–-]\s*(approve|request_changes)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class Task:
@@ -73,6 +90,69 @@ class Alissa:
                 matches[0].ref,
             )
         return matches[0]
+
+    def latest_verdict(self, task_ref: str) -> str | None:
+        """The newest CR6 verdict envelope on a review task, or None.
+
+        Returns VERDICT_APPROVE / VERDICT_REQUEST_CHANGES. This is the verdict
+        of record: reviewers post comment-mode reviews, so the GitHub review
+        state is always COMMENTED and cannot express approval at all.
+
+        Never raises. The daemon polls forever and this runs inside every pass,
+        so absent, empty or malformed evidence degrades to "no verdict" rather
+        than taking the loop down.
+        """
+        try:
+            data = run_json(["alissa", "task", "get", task_ref, "--json"], timeout=90)
+        except CommandError as exc:
+            log.warning("could not read verdict evidence for %s: %s", task_ref, exc)
+            return None
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("unexpected failure reading verdict evidence for %s", task_ref)
+            return None
+
+        try:
+            return self._newest_verdict(data)
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("could not parse verdict evidence for %s", task_ref)
+            return None
+
+    @staticmethod
+    def _newest_verdict(payload: object) -> str | None:
+        """Pick the newest parseable verdict out of a task's evidence array.
+
+        Every layer is optional by design -- the payload shape is whatever the
+        CLI printed, and a task with no evidence is the normal round-1 case.
+        """
+        if not isinstance(payload, dict):
+            return None
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, list):
+            return None
+
+        found: list[tuple[str, str]] = []
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title")
+            content = item.get("markdownContent")
+            for blob in (title, content):
+                if not isinstance(blob, str):
+                    continue
+                match = _VERDICT_RE.search(blob)
+                if match:
+                    created = item.get("createdAt")
+                    found.append(
+                        (created if isinstance(created, str) else "", match.group(1).lower())
+                    )
+                    break
+
+        if not found:
+            return None
+        # ISO-8601 timestamps sort lexicographically. Undated evidence sorts
+        # first (empty string), so a dated envelope always wins over one that
+        # lost its timestamp.
+        return max(found, key=lambda pair: pair[0])[1]
 
     def enqueue_reviewer(
         self,

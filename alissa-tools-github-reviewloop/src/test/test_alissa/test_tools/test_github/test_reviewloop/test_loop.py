@@ -36,7 +36,11 @@ class FakeGitHub:
         return self._pr
 
     def my_reviews(self, owner, repo, number):
-        return [r for r in self._reviews if r.author == self.login]
+        # Mirrors GitHub.my_reviews: mine, substantive, oldest first.
+        mine = [
+            r for r in self._reviews if r.author == self.login and r.is_substantive
+        ]
+        return sorted(mine, key=lambda r: r.submitted_at)
 
     def comment(self, owner, repo, number, body):
         self.comments.append(body)
@@ -46,14 +50,18 @@ class FakeGitHub:
 
 
 class FakeAlissa:
-    def __init__(self, task=None):
+    def __init__(self, task=None, verdict=None):
         self.task = task
+        self.verdict = verdict  # newest CR6 envelope verdict, or None
         self.enqueued: list[dict] = []
         self.added: list[tuple] = []
         self.on_add = None  # optional side effect: actually create the hub
 
     def find_review_task(self, owner, repo, number):
         return self.task
+
+    def latest_verdict(self, task_ref):
+        return self.verdict
 
     def enqueue_reviewer(self, **kwargs):
         self.enqueued.append(kwargs)
@@ -87,13 +95,21 @@ def make_pr(*, draft=False, author="teammate", sha="abc123") -> PullRequest:
     )
 
 
-def review(state="CHANGES_REQUESTED", sha="abc123", at="2026-07-18T10:00:00Z"):
+def review(
+    state="CHANGES_REQUESTED",
+    sha="abc123",
+    at="2026-07-18T10:00:00Z",
+    body="## Review verdict\n\nFindings follow.",
+):
+    """A substantive review by default -- pass body="" for the zero-body record
+    that a standalone inline comment leaves behind."""
     return Review(
         author="alissa-app",
         state=state,
         commit_id=sha,
         submitted_at=at,
         url=f"https://github.com/{SLUG}/pull/{NUMBER}#r1",
+        body=body,
     )
 
 
@@ -109,9 +125,9 @@ def config(tmp_path):
     )
 
 
-def watcher(config, pr, reviews, task=FakeTask(), state=None):
+def watcher(config, pr, reviews, task=FakeTask(), state=None, verdict=None):
     gh = FakeGitHub(pr, reviews)
-    al = FakeAlissa(task)
+    al = FakeAlissa(task, verdict=verdict)
     w = ReviewWatcher(config, github=gh, alissa=al, state=state or State(config.state_db))
     return w, gh, al
 
@@ -205,6 +221,78 @@ def test_comment_only_review_still_closes_a_round(config):
     assert d.round == 2
 
 
+# -- round counting: records vs rounds -------------------------------------
+
+
+def pr210_review_records():
+    """The real record shape from fahera-mx/studio.alissa.app#210.
+
+    Three rounds produced six review records: round 1, then three zero-body
+    artifacts left by standalone inline comments, then rounds 2 and 3.
+    """
+    return [
+        review("COMMENTED", sha="111aaa", at="2026-07-18T18:31:59Z", body="x" * 4399),
+        review("COMMENTED", sha="111aaa", at="2026-07-18T18:32:30Z", body=""),
+        review("COMMENTED", sha="111aaa", at="2026-07-18T18:32:30Z", body=""),
+        review("COMMENTED", sha="111aaa", at="2026-07-18T18:32:31Z", body=""),
+        review("COMMENTED", sha="805398a", at="2026-07-18T20:17:14Z", body="y" * 8030),
+        review("COMMENTED", sha="805398a", at="2026-07-18T20:20:22Z", body="z" * 4826),
+    ]
+
+
+def test_inline_comment_artifacts_do_not_count_as_rounds(config):
+    """#210: 6 review records, 3 real rounds. The daemon told round 3's
+    reviewer it was on round 6."""
+    import dataclasses
+
+    cfg = dataclasses.replace(config, round_cap=10)
+    w, gh, _ = watcher(cfg, make_pr(sha="805398a"), pr210_review_records())
+
+    assert len(gh.my_reviews(OWNER, REPO, NUMBER)) == 3
+    assert w.evaluate(OWNER, REPO, NUMBER).round == 4, "next round after 3, not after 6"
+
+
+def test_rounds_are_not_grouped_by_commit_id(config):
+    """Deduping by commit_id is the obvious-looking fix and it UNDERCOUNTS:
+    #210's rounds 2 and 3 both ran on head 805398a."""
+    import dataclasses
+
+    cfg = dataclasses.replace(config, round_cap=10)
+    w, _, _ = watcher(cfg, make_pr(sha="805398a"), pr210_review_records())
+
+    # Commit grouping would see 2 distinct commits and say round 3.
+    assert w.evaluate(OWNER, REPO, NUMBER).round == 4
+
+
+def test_a_zero_body_record_alone_does_not_close_round_1(config):
+    w, _, al = watcher(config, make_pr(), [review("COMMENTED", body="")])
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.round == 1, "an inline-comment artifact is not a completed round"
+    assert al.enqueued[0]["session"] == "review-widgets-pr7-r1"
+
+
+def test_whitespace_only_body_is_not_substantive(config):
+    w, _, _ = watcher(config, make_pr(), [review("COMMENTED", body="   \n\t ")])
+    assert w.evaluate(OWNER, REPO, NUMBER).round == 1
+
+
+def test_artifacts_do_not_push_the_loop_into_a_false_cap_out(config):
+    """cap=3 with 1 real round plus 3 artifacts must still spawn round 2."""
+    reviews = [
+        review("COMMENTED", at="2026-07-18T18:31:59Z", body="the round-1 review"),
+        review("COMMENTED", at="2026-07-18T18:32:30Z", body=""),
+        review("COMMENTED", at="2026-07-18T18:32:31Z", body=""),
+        review("COMMENTED", at="2026-07-18T18:32:32Z", body=""),
+    ]
+    w, gh, al = watcher(config, make_pr(), reviews)
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 2
+    assert gh.comments == [], "must not escalate on artifact count"
+
+
 # -- convergence and cap-out ----------------------------------------------
 
 
@@ -216,6 +304,49 @@ def test_approved_pr_is_converged(config):
 
     assert d.action is Action.CONVERGED
     assert al.enqueued == []
+
+
+def test_approve_verdict_envelope_converges_a_comment_mode_review(config):
+    """Reviewers post comment-mode reviews, so COMMENTED is the only state
+    GitHub ever carries. The CR6 envelope on the task is the verdict of
+    record; without it convergence is unreachable."""
+    w, _, al = watcher(
+        config, make_pr(), [review("COMMENTED")], verdict="approve"
+    )
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert "TASK-500" in d.reason
+    assert al.enqueued == []
+
+
+def test_request_changes_envelope_does_not_converge(config):
+    w, _, al = watcher(
+        config, make_pr(), [review("COMMENTED")], verdict="request_changes"
+    )
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 2
+
+
+def test_comment_mode_without_an_envelope_runs_to_the_cap(config):
+    """The pre-fix behaviour, still correct when nobody ever approved."""
+    reviews = [review("COMMENTED", at=f"2026-07-18T1{i}:00:00Z") for i in range(3)]
+    w, gh, _ = watcher(config, make_pr(), reviews, verdict=None)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+
+
+def test_convergence_is_skipped_when_there_is_no_review_task(config):
+    """No task means nowhere for a verdict to live; behaviour is unchanged."""
+    w, _, al = watcher(
+        config, make_pr(), [review("COMMENTED")], task=None, verdict="approve"
+    )
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert al.enqueued[0]["task_ref"] is None
 
 
 def test_cap_out_escalates_and_never_spawns_round_four(config):
@@ -657,6 +788,111 @@ def test_task_ref_uses_task_number_not_seq(monkeypatch):
     task = alissa_mod.Alissa().find_review_task(OWNER, REPO, NUMBER)
     assert task is not None
     assert task.ref == "TASK-617115756"
+
+
+# -- CR6 verdict envelopes -------------------------------------------------
+
+
+def envelope(verdict, round_, at, extra=""):
+    """A real-shaped envelope. Note the em-dash and the hyphenated org name."""
+    slug = "fahera-mx/studio.alissa.app#210"
+    return {
+        "title": f"Review verdict: {slug} — {verdict} (round {round_}{extra})",
+        "markdownContent": (
+            f"# Review verdict: {slug} — {verdict}\n\nRound {round_} findings.\n"
+        ),
+        "createdAt": at,
+    }
+
+
+def verdict_from(monkeypatch, payload, ref="TASK-500"):
+    from alissa.tools.github.reviewloop import alissa as alissa_mod
+
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: payload)
+    return alissa_mod.Alissa().latest_verdict(ref)
+
+
+def test_newest_verdict_envelope_wins(monkeypatch):
+    payload = {
+        "evidence": [
+            envelope("request_changes", 1, "2026-07-18T18:31:00Z", ", revised"),
+            envelope("approve", 3, "2026-07-18T20:20:00Z"),
+            envelope("request_changes", 2, "2026-07-18T20:17:00Z"),
+        ]
+    }
+    assert verdict_from(monkeypatch, payload) == "approve"
+
+
+def test_request_changes_envelope_is_parsed(monkeypatch):
+    payload = {
+        "evidence": [
+            envelope(
+                "request_changes",
+                3,
+                "2026-07-18T20:20:00Z",
+                ", bounced on triage — CAP REACHED, escalate",
+            )
+        ]
+    }
+    assert verdict_from(monkeypatch, payload) == "request_changes"
+
+
+def test_verdict_is_read_from_the_body_when_the_title_is_bare(monkeypatch):
+    item = envelope("approve", 1, "2026-07-18T20:20:00Z")
+    item["title"] = "Round 1 verdict"
+    assert verdict_from(monkeypatch, {"evidence": [item]}) == "approve"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"evidence": None},
+        {"evidence": []},
+        {"evidence": "not-a-list"},
+        {"evidence": [None, 42, "nope"]},
+        {"evidence": [{"title": "Unrelated deliverable", "createdAt": "x"}]},
+        {"evidence": [{"title": None, "markdownContent": None}]},
+        {"evidence": [{"title": "Review verdict: slug — maybe"}]},
+        [],
+        "garbage",
+    ],
+    ids=[
+        "null",
+        "empty-dict",
+        "null-evidence",
+        "empty-evidence",
+        "evidence-not-a-list",
+        "junk-items",
+        "unrelated-evidence",
+        "null-fields",
+        "unknown-verdict-word",
+        "top-level-list",
+        "top-level-string",
+    ],
+)
+def test_malformed_or_absent_evidence_degrades_to_no_verdict(monkeypatch, payload):
+    """The daemon polls forever; this must never raise."""
+    assert verdict_from(monkeypatch, payload) is None
+
+
+def test_undated_envelope_loses_to_a_dated_one(monkeypatch):
+    undated = envelope("request_changes", 2, "2026-07-18T20:17:00Z")
+    del undated["createdAt"]
+    payload = {"evidence": [undated, envelope("approve", 3, "2026-07-18T20:20:00Z")]}
+    assert verdict_from(monkeypatch, payload) == "approve"
+
+
+def test_cli_failure_is_not_fatal(monkeypatch):
+    from alissa.tools.github.reviewloop import alissa as alissa_mod
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    def boom(*a, **k):
+        raise CommandError(["alissa", "task", "get"], 1, "task not found")
+
+    monkeypatch.setattr(alissa_mod, "run_json", boom)
+    assert alissa_mod.Alissa().latest_verdict("TASK-500") is None
 
 
 def test_task_without_a_number_is_skipped(monkeypatch):
