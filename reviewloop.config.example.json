@@ -1,16 +1,21 @@
 {
-  "workspace_root": "~/Documents/Alissa-Repos",
+  "_workspace_root": "NOT a config key — pass --workspace-root, or run the daemon from inside the workspace. This lets one config file drive several daemons over different workspaces on the same machine.",
+
+  "_": "Every key below can also be given as a CLI flag (--poll-interval, --repo, ...), and the CLI wins. Keys prefixed with _ are comments.",
+
   "hub_template": "{root}/{repo}/main",
 
   "poll_interval": 60,
   "round_cap": 3,
 
+  "_repos": "Allowlist of owner/repo; empty means every repo that requests a review. --repo replaces this list rather than extending it.",
   "repos": [],
 
   "agent_profile": "claude",
   "reviewer_login": null,
 
-  "state_path": "~/.local/state/reviewloop/state.db",
+  "_state_path": "Omit to default to <workspace-root>/.reviewloop/state.db, which keeps daemons on different workspaces from sharing a spawn ledger.",
+
   "on_missing_review_task": "spawn_anyway",
 
   "_on_missing_hub": "'skip' (default) or 'add' to run `alissa code workspace add`. 'add' requires a non-empty repos allowlist.",

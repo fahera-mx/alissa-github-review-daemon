@@ -10,7 +10,13 @@ import time
 
 import pytest
 
-from alissa.tools.github.reviewloop.config import HUB_ADD, ON_MISSING_SKIP, Config
+from alissa.tools.github.reviewloop.config import (
+    CONFIG_FILENAME,
+    HUB_ADD,
+    ON_MISSING_SKIP,
+    Config,
+    resolve_config_path,
+)
 from alissa.tools.github.reviewloop.ghclient import GitHub, IdentityMismatch, PullRequest, Review
 from alissa.tools.github.reviewloop.loop import STALE_ROUND_SECONDS, Action, ReviewWatcher, session_name
 from alissa.tools.github.reviewloop.state import State
@@ -106,7 +112,7 @@ def config(tmp_path):
 def watcher(config, pr, reviews, task=FakeTask(), state=None):
     gh = FakeGitHub(pr, reviews)
     al = FakeAlissa(task)
-    w = ReviewWatcher(config, github=gh, alissa=al, state=state or State(config.state_path))
+    w = ReviewWatcher(config, github=gh, alissa=al, state=state or State(config.state_db))
     return w, gh, al
 
 
@@ -149,7 +155,7 @@ def test_self_authored_pr_is_skipped(config):
 
 
 def test_round_is_not_respawned_while_in_flight(config):
-    st = State(config.state_path)
+    st = State(config.state_db)
     w, _, al = watcher(config, make_pr(), [], state=st)
 
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
@@ -160,7 +166,7 @@ def test_round_is_not_respawned_while_in_flight(config):
 
 
 def test_stalled_round_is_respawned_after_grace_period(config):
-    st = State(config.state_path)
+    st = State(config.state_db)
     w, _, al = watcher(config, make_pr(), [], state=st)
     w.evaluate(OWNER, REPO, NUMBER)
 
@@ -224,7 +230,7 @@ def test_cap_out_escalates_and_never_spawns_round_four(config):
 
 
 def test_escalation_is_posted_only_once_per_head_sha(config):
-    st = State(config.state_path)
+    st = State(config.state_db)
     reviews = [review("CHANGES_REQUESTED", at=f"2026-07-18T1{i}:00:00Z") for i in range(3)]
     w, gh, _ = watcher(config, make_pr(), reviews, state=st)
 
@@ -237,7 +243,7 @@ def test_escalation_is_posted_only_once_per_head_sha(config):
 
 def test_new_commits_after_cap_out_re_escalate(config):
     """A push moves head; the operator decision is about the new state."""
-    st = State(config.state_path)
+    st = State(config.state_db)
     reviews = [review("CHANGES_REQUESTED", at=f"2026-07-18T1{i}:00:00Z") for i in range(3)]
     w, gh, _ = watcher(config, make_pr(sha="aaa"), reviews, state=st)
     w.evaluate(OWNER, REPO, NUMBER)
@@ -317,7 +323,7 @@ def test_hub_is_provisioned_then_reviewer_spawns(tmp_path):
     al = FakeAlissa(FakeTask())
     # Simulate the CLI actually creating the hub.
     al.on_add = lambda o, r: (tmp_path / r / "main").mkdir(parents=True)
-    w = ReviewWatcher(cfg, github=gh, alissa=al, state=State(cfg.state_path))
+    w = ReviewWatcher(cfg, github=gh, alissa=al, state=State(cfg.state_db))
 
     d = w.evaluate(OWNER, REPO, NUMBER)
 
@@ -328,7 +334,7 @@ def test_hub_is_provisioned_then_reviewer_spawns(tmp_path):
 
 def test_hub_add_that_does_not_produce_the_hub_is_reported(tmp_path):
     cfg = hub_add_config(tmp_path)
-    w, _, al = watcher(cfg, make_pr(), [], state=State(cfg.state_path))
+    w, _, al = watcher(cfg, make_pr(), [], state=State(cfg.state_db))
 
     d = w.evaluate(OWNER, REPO, NUMBER)  # FakeAlissa.add is a no-op
 
@@ -340,7 +346,7 @@ def test_hub_add_that_does_not_produce_the_hub_is_reported(tmp_path):
 def test_hub_add_refuses_outside_a_real_workspace(tmp_path):
     cfg = hub_add_config(tmp_path)
     cfg.manifest_path.unlink()
-    w, _, al = watcher(cfg, make_pr(), [], state=State(cfg.state_path))
+    w, _, al = watcher(cfg, make_pr(), [], state=State(cfg.state_db))
 
     d = w.evaluate(OWNER, REPO, NUMBER)
 
@@ -353,7 +359,7 @@ def test_hub_add_refuses_repo_outside_allowlist(tmp_path):
     import dataclasses
 
     cfg = dataclasses.replace(hub_add_config(tmp_path), repos=("other/repo",))
-    w, _, al = watcher(cfg, make_pr(), [], state=State(cfg.state_path))
+    w, _, al = watcher(cfg, make_pr(), [], state=State(cfg.state_db))
 
     d = w.evaluate(OWNER, REPO, NUMBER)
 
@@ -363,27 +369,19 @@ def test_hub_add_refuses_repo_outside_allowlist(tmp_path):
 
 
 def test_config_rejects_auto_add_without_allowlist(tmp_path):
-    import json
-
-    path = tmp_path / "c.json"
-    path.write_text(
-        json.dumps(
-            {"workspace_root": str(tmp_path), "on_missing_hub": "add", "repos": []}
-        )
-    )
     with pytest.raises(ValueError, match="allowlist"):
-        Config.load(path)
+        Config.build(tmp_path, {"on_missing_hub": "add", "repos": []})
 
-    path.write_text(
-        json.dumps(
-            {
-                "workspace_root": str(tmp_path),
-                "on_missing_hub": "add",
-                "repos": ["acme/widgets"],
-            }
-        )
+    cfg = Config.build(tmp_path, {"on_missing_hub": "add", "repos": ["acme/widgets"]})
+    assert cfg.on_missing_hub == HUB_ADD
+
+
+def test_allowlist_may_be_supplied_by_cli_instead_of_config(tmp_path):
+    """The allowlist guard runs after merging, so --repo satisfies it."""
+    cfg = Config.build(
+        tmp_path, {"on_missing_hub": "add"}, {"repos": ("acme/widgets",)}
     )
-    assert Config.load(path).on_missing_hub == HUB_ADD
+    assert cfg.repos == ("acme/widgets",)
 
 
 # -- identity --------------------------------------------------------------
@@ -419,7 +417,7 @@ def test_dry_run_never_enqueues_or_records(config):
     import dataclasses
 
     cfg = dataclasses.replace(config, dry_run=True)
-    st = State(cfg.state_path)
+    st = State(cfg.state_db)
     w, _, al = watcher(cfg, make_pr(), [], state=st)
 
     w.evaluate(OWNER, REPO, NUMBER)
@@ -448,13 +446,197 @@ def test_session_names_are_tmux_safe_and_unique():
 
 
 def test_config_rejects_bad_values(tmp_path):
+    with pytest.raises(ValueError, match="round_cap"):
+        Config.build(tmp_path, {"round_cap": 0})
+
+    with pytest.raises(ValueError, match="poll_interval"):
+        Config.build(tmp_path, {"poll_interval": 2})
+
+    with pytest.raises(ValueError, match="unknown config key"):
+        Config.build(tmp_path, {"pol_interval": 60})
+
+
+# -- config layering -------------------------------------------------------
+
+
+def test_workspace_root_is_rejected_as_a_config_key(tmp_path):
+    """It is a property of the process, not of the settings — one config file
+    is meant to drive several daemons over different workspaces."""
+    with pytest.raises(ValueError, match="not a config key"):
+        Config.build(tmp_path, {"workspace_root": str(tmp_path)})
+
+
+def test_cli_overrides_win_over_the_config_file(tmp_path):
+    cfg = Config.build(
+        tmp_path,
+        {"poll_interval": 60, "round_cap": 3, "agent_profile": "claude"},
+        {"poll_interval": 300, "round_cap": 5, "agent_profile": None},
+    )
+    assert cfg.poll_interval == 300
+    assert cfg.round_cap == 5
+    assert cfg.agent_profile == "claude", "None override must not clobber the file"
+
+
+def test_cli_repos_replace_rather_than_extend(tmp_path):
+    cfg = Config.build(
+        tmp_path, {"repos": ["a/one", "a/two"]}, {"repos": ("b/three",)}
+    )
+    assert cfg.repos == ("b/three",)
+
+
+def test_config_file_is_optional(tmp_path):
+    cfg = Config.build(tmp_path, None, {"poll_interval": 45})
+    assert cfg.poll_interval == 45
+    assert cfg.round_cap == 3
+
+
+def test_underscore_keys_are_treated_as_comments(tmp_path):
+    cfg = Config.build(tmp_path, {"_note": "json has no comments", "round_cap": 2})
+    assert cfg.round_cap == 2
+
+
+def test_state_path_defaults_inside_the_workspace(tmp_path):
+    """Two daemons over different workspaces must not share a spawn ledger."""
+    one = Config.build(tmp_path / "ws-one")
+    two = Config.build(tmp_path / "ws-two")
+
+    assert one.state_db == (tmp_path / "ws-one" / ".reviewloop" / "state.db")
+    assert one.state_db != two.state_db
+
+
+def test_explicit_state_path_still_wins(tmp_path):
+    cfg = Config.build(tmp_path, {"state_path": str(tmp_path / "custom.db")})
+    assert cfg.state_db == tmp_path / "custom.db"
+
+
+def test_workspace_root_is_resolved_to_an_absolute_path(tmp_path):
+    nested = tmp_path / "ws" / "sub" / ".."
+    (tmp_path / "ws" / "sub").mkdir(parents=True)
+    assert Config.build(nested).workspace_root == (tmp_path / "ws").resolve()
+
+
+# -- config file discovery -------------------------------------------------
+
+
+def test_explicit_config_path_wins(tmp_path):
+    explicit = tmp_path / "custom.json"
+    explicit.write_text("{}")
+    (tmp_path / CONFIG_FILENAME).write_text("{}")
+
+    assert resolve_config_path(explicit, tmp_path, cwd=tmp_path) == explicit
+
+
+def test_missing_explicit_config_path_is_an_error(tmp_path):
+    with pytest.raises(FileNotFoundError, match="config file not found"):
+        resolve_config_path(tmp_path / "nope.json", tmp_path, cwd=tmp_path)
+
+
+def test_cwd_config_is_preferred_over_workspace_config(tmp_path):
+    cwd, ws = tmp_path / "cwd", tmp_path / "ws"
+    cwd.mkdir()
+    ws.mkdir()
+    (cwd / CONFIG_FILENAME).write_text("{}")
+    (ws / CONFIG_FILENAME).write_text("{}")
+
+    assert resolve_config_path(None, ws, cwd=cwd) == cwd / CONFIG_FILENAME
+
+
+def test_workspace_config_is_the_fallback(tmp_path):
+    cwd, ws = tmp_path / "cwd", tmp_path / "ws"
+    cwd.mkdir()
+    ws.mkdir()
+    (ws / CONFIG_FILENAME).write_text("{}")
+
+    assert resolve_config_path(None, ws, cwd=cwd) == ws / CONFIG_FILENAME
+
+
+def test_no_config_anywhere_is_not_an_error(tmp_path):
+    assert resolve_config_path(None, tmp_path, cwd=tmp_path) is None
+
+
+# -- CLI wiring ------------------------------------------------------------
+
+
+def cli(*argv):
+    from alissa.tools.github.reviewloop.__main__ import build_parser
+
+    return build_parser().parse_args(list(argv))
+
+
+def test_workspace_root_defaults_to_cwd(tmp_path, monkeypatch):
+    from alissa.tools.github.reviewloop.__main__ import resolve_config
+
+    monkeypatch.chdir(tmp_path)
+    assert resolve_config(cli()).workspace_root == tmp_path.resolve()
+
+
+def test_workspace_root_flag_beats_cwd(tmp_path, monkeypatch):
+    from alissa.tools.github.reviewloop.__main__ import resolve_config
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    cfg = resolve_config(cli("--workspace-root", str(ws)))
+    assert cfg.workspace_root == ws.resolve()
+
+
+def test_repeated_repo_flags_accumulate(tmp_path, monkeypatch):
+    from alissa.tools.github.reviewloop.__main__ import resolve_config
+
+    monkeypatch.chdir(tmp_path)
+    cfg = resolve_config(cli("--repo", "a/one", "--repo", "a/two"))
+    assert cfg.repos == ("a/one", "a/two")
+
+
+def test_cli_fills_in_over_a_discovered_config_file(tmp_path, monkeypatch):
     import json
 
-    path = tmp_path / "c.json"
-    path.write_text(json.dumps({"workspace_root": str(tmp_path), "round_cap": 0}))
-    with pytest.raises(ValueError, match="round_cap"):
-        Config.load(path)
+    from alissa.tools.github.reviewloop.__main__ import resolve_config
 
-    path.write_text(json.dumps({"workspace_root": str(tmp_path), "poll_interval": 2}))
-    with pytest.raises(ValueError, match="poll_interval"):
-        Config.load(path)
+    (tmp_path / CONFIG_FILENAME).write_text(
+        json.dumps({"poll_interval": 60, "round_cap": 3, "dry_run": True})
+    )
+    monkeypatch.chdir(tmp_path)
+
+    cfg = resolve_config(cli("--round-cap", "5"))
+    assert cfg.round_cap == 5, "CLI wins"
+    assert cfg.poll_interval == 60, "config fills in"
+    assert cfg.dry_run is True
+
+
+def test_no_dry_run_overrides_a_dry_run_config(tmp_path, monkeypatch):
+    import json
+
+    from alissa.tools.github.reviewloop.__main__ import resolve_config
+
+    (tmp_path / CONFIG_FILENAME).write_text(json.dumps({"dry_run": True}))
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_config(cli("--no-dry-run")).dry_run is False
+    assert resolve_config(cli()).dry_run is True
+
+
+def test_dry_run_flags_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        cli("--dry-run", "--no-dry-run")
+
+
+def test_workspace_root_in_config_file_is_a_clear_error(tmp_path, monkeypatch):
+    import json
+
+    from alissa.tools.github.reviewloop.__main__ import main
+
+    (tmp_path / CONFIG_FILENAME).write_text(
+        json.dumps({"workspace_root": str(tmp_path)})
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert main([]) == 2
+
+
+def test_missing_explicit_config_exits_with_config_error(tmp_path, monkeypatch):
+    from alissa.tools.github.reviewloop.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["--config-path", str(tmp_path / "nope.json")]) == 2

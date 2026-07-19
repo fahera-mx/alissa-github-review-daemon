@@ -90,7 +90,7 @@ class ReviewWatcher:
         self.config = config
         self.github = github or GitHub(config.reviewer_login)
         self.alissa = alissa or Alissa()
-        self.state = state or State(config.state_path)
+        self.state = state or State(config.state_db)
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -311,9 +311,8 @@ class ReviewWatcher:
         return results
 
     def run_forever(self) -> None:
-        for warning in self.preflight():
-            log.warning(warning)
-
+        # preflight() is the caller's responsibility -- the CLI runs it once for
+        # every mode, so calling it here too would double every check.
         backoff = self.config.poll_interval
         while True:
             try:

@@ -52,9 +52,8 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements-develop.txt
 pip install -e ./alissa-tools-github-reviewloop
 
-cp reviewloop.config.example.json reviewloop.config.json
-$EDITOR reviewloop.config.json          # set workspace_root at minimum
-alissa-reviewloop --once --dry-run -v
+cd <your-workspace>
+alissa-reviewloop --once --dry-run -v      # runs on defaults; no config needed
 ```
 
 `alissa worker` must be running or queued sessions never spawn — the daemon warns
@@ -64,18 +63,45 @@ at startup if it isn't.
 alissa-reviewloop         # foreground; tip: run it in its own tmux session
 ```
 
-### Config
+### Settings
 
-| key | default | meaning |
+Three layers, each winning over the one before: **defaults → config file → CLI**.
+
+`workspace_root` is **not** a config key — it is a property of the running
+process, given by `--workspace-root` and defaulting to the current directory.
+That is what lets one config file drive several daemons over different
+workspaces on the same machine:
+
+```sh
+alissa-reviewloop --workspace-root ~/ws/alpha --repo org/alpha-api &
+alissa-reviewloop --workspace-root ~/ws/beta  --repo org/beta-web &
+```
+
+Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
+the flag wins. `--repo` is repeatable and *replaces* the config list rather than
+extending it. `--dry-run` / `--no-dry-run` override the config in both directions.
+
+| key / flag | default | meaning |
 | --- | --- | --- |
-| `workspace_root` | *(required)* | root of the worktree-hub workspace |
+| `--workspace-root` | cwd | root of the worktree-hub workspace (**CLI only**) |
 | `hub_template` | `{root}/{repo}/main` | reviewer cwd — the pristine `main/` mirror (CR6: reviewers never write) |
 | `poll_interval` | `60` | seconds; must be ≥10 |
 | `round_cap` | `3` | CR9 cap; never queues round cap+1 |
 | `repos` | `[]` | allowlist of `owner/repo`; empty = all |
+| `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | resolved from `gh api user` when null |
+| `state_path` | `<workspace-root>/.reviewloop/state.db` | spawn ledger; per-workspace by default so parallel daemons never share one |
 | `on_missing_review_task` | `spawn_anyway` | `spawn_anyway` \| `warn_and_spawn` \| `skip` |
 | `on_missing_hub` | `skip` | `skip` \| `add` — see *Provisioning new repos* |
+
+### Config file discovery
+
+`--config-path PATH`, else `./reviewloop.config.json`, else
+`<workspace-root>/reviewloop.config.json`. If none exists the daemon runs on
+defaults plus CLI arguments — a config file is optional. An explicit
+`--config-path` that does not exist is an error rather than a silent fallback.
+
+Copy `reviewloop.config.example.json` to start from a documented template.
 
 ## Identity
 
@@ -159,7 +185,8 @@ bash check-style.sh alissa-tools-github-reviewloop
 bash check-types.sh alissa-tools-github-reviewloop
 ```
 
-26 tests cover the decision state machine with GitHub and Alissa faked.
+48 tests cover the decision state machine and the config layering, with GitHub
+and Alissa faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,
 `alissa task list` parsing, review-task title matching, worker detection, the
