@@ -18,7 +18,7 @@ OPEN_STATUSES = {"committed", "in_progress", "pending_validation", "todo"}
 
 @dataclass(frozen=True)
 class Task:
-    ref: str  # TASK-<seq>
+    ref: str  # TASK-<taskNumber>
     title: str
     status: str
 
@@ -40,12 +40,14 @@ class Alissa:
         data = run_json(["alissa", "task", "list", "--json"], timeout=90) or []
         tasks = []
         for row in data:
-            seq = row.get("taskSeq")
-            if seq is None:
+            # `taskNumber` is the ref the API resolves; `taskSeq` is a display
+            # ordinal and 404s as `TASK-<seq>`.
+            number = row.get("taskNumber")
+            if number is None:
                 continue
             tasks.append(
                 Task(
-                    ref=f"TASK-{seq}",
+                    ref=f"TASK-{number}",
                     title=row.get("title", ""),
                     status=row.get("status", ""),
                 )
