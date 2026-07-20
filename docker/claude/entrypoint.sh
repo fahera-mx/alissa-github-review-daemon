@@ -2,11 +2,11 @@
 # =============================================================================
 # Container entrypoint for the Alissa GitHub review daemon.
 #
-#   1. (optional) raise the egress firewall
-#   2. preflight the THREE identities the loop depends on (gh / alissa / claude)
-#   3. bootstrap the worktree-hub workspace + reviewloop config from a manifest
-#   4. start `alissa worker` (backgrounded) and wait until it is up
-#   5. run `alissa-reviewloop` in the foreground, stopping the worker on exit
+#   0. as root: fix the volume-mount ownership (+ firewall), then drop to alissa
+#   1. preflight the identities the loop depends on (gh / alissa / claude)
+#   2. bootstrap the worktree-hub workspace + reviewloop config from a manifest
+#   3. start `alissa worker` (backgrounded) and wait until it is up
+#   4. run `alissa-reviewloop` in the foreground, stopping the worker on exit
 #
 # The daemon is a thin poller; the worker is what actually spawns reviewers, so
 # the worker MUST be running first — the daemon only warns if it isn't.
@@ -18,18 +18,40 @@ die()  { printf '[entrypoint] FATAL: %s\n' "$*" >&2; exit 1; }
 
 WORKSPACE_ROOT="${ALISSA_WORKSPACE_ROOT:-/workspace}"
 WORKSPACE_NAME="${ALISSA_WORKSPACE:-alissa-review}"
+RUNTIME_USER=alissa
 
 # -----------------------------------------------------------------------------
-# 1. Optional egress firewall (needs --cap-add=NET_ADMIN)
+# 0. Privilege bootstrap (runs only on the first pass, as root)
+#
+# The container starts as root purely so we can make a platform-provided volume
+# writable: a persistent volume (e.g. Railway) mounts at WORKSPACE_ROOT owned by
+# root, and the daemon runs as an unprivileged user, so without this it cannot
+# even write the generated manifest. We chown the mount, raise the optional
+# firewall (which needs root anyway), then re-exec this script as `alissa`.
+#
+# claude refuses --dangerously-skip-permissions as root, so everything past this
+# point MUST run unprivileged — that is exactly what the drop guarantees.
 # -----------------------------------------------------------------------------
-if [ "${ALISSA_ENABLE_FIREWALL:-0}" = "1" ]; then
-  log "raising egress firewall (ALISSA_ENABLE_FIREWALL=1)"
-  sudo /usr/local/bin/init-firewall.sh \
-    || die "firewall init failed — did you pass --cap-add=NET_ADMIN?"
+if [ "$(id -u)" = "0" ]; then
+  mkdir -p "${WORKSPACE_ROOT}" "${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}"
+  # Fix ownership so the unprivileged user can write. -R because a restart may
+  # find files a previous root-mounted run left behind.
+  chown -R "${RUNTIME_USER}:${RUNTIME_USER}" \
+    "${WORKSPACE_ROOT}" "${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}" 2>/dev/null || true
+  log "workspace mount ${WORKSPACE_ROOT} owned by ${RUNTIME_USER}"
+
+  if [ "${ALISSA_ENABLE_FIREWALL:-0}" = "1" ]; then
+    log "raising egress firewall (ALISSA_ENABLE_FIREWALL=1)"
+    /usr/local/bin/init-firewall.sh \
+      || die "firewall init failed — did you pass --cap-add=NET_ADMIN?"
+  fi
+
+  log "dropping to ${RUNTIME_USER}"
+  exec gosu "${RUNTIME_USER}" "$0" "$@"
 fi
 
 # -----------------------------------------------------------------------------
-# 2. Preflight the three identities
+# 1. Preflight the three identities
 #
 # The daemon warns that an identity MISMATCH between the gh token and
 # reviewer_login is fatal — but that check lives in the daemon itself. Here we

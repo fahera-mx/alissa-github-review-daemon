@@ -160,11 +160,11 @@ Everything worth surviving a restart lives there:
 Nothing else needs a volume: the gh/alissa/claude auth is re-established from the
 env tokens on every boot, and tmux sockets are deliberately ephemeral.
 
-On Railway, set the volume's mount path to `/workspace`. A **named** Docker volume
-(what Railway uses) inherits the image's `alissa:alissa` (uid 1000) ownership
-automatically — verified writable. A **bind mount** (host directory) keeps the
-host's ownership instead, so make sure the host path is writable by uid 1000, or
-the entrypoint can't write the manifest.
+On Railway, set the volume's mount path to `/workspace`. Persistent platform
+volumes typically mount **root-owned**, so the container starts as root, the
+entrypoint `chown`s the mount to `alissa` (uid 1000), and then drops to that user
+(via `gosu`) for everything else — so a root-owned mount just works, no manual
+`chown` or init container needed. (claude still runs unprivileged, as it must.)
 
 ### Optional egress firewall
 
@@ -210,13 +210,15 @@ volumes:
 
 ## What the entrypoint does
 
-1. (optional) raise the egress firewall.
-2. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
+0. As root: `chown` the `/workspace` mount to `alissa`, (optionally) raise the
+   egress firewall, then drop to `alissa` via `gosu`. Everything below runs
+   unprivileged.
+1. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
    `gh auth setup-git`; `alissa auth login` (fatal if missing); check the claude
    credential (warn-only — the baked `agents.yaml` handles headless launch).
-3. Ensure a manifest + `reviewloop.config.json` exist (mount or generate).
-4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
+2. Ensure a manifest + `reviewloop.config.json` exist (mount or generate).
+3. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).
-5. Run `alissa-reviewloop` in the foreground; stop the worker on `SIGTERM`/`SIGINT`.
+4. Run `alissa-reviewloop` in the foreground; stop the worker on `SIGTERM`/`SIGINT`.
 
 `tini` is PID 1 to reap the tmux/node/claude child fan-out.

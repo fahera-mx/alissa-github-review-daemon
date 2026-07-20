@@ -40,12 +40,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # tmux  : the alissa worker manages tmux (ali-*) sessions
 # gh     : the daemon shells out to `gh api` for the review queue
 # tini   : PID 1 init — reaps the tmux/node/claude child fan-out
-# sudo   : only used by the optional firewall init (dropped priv otherwise)
+# gosu   : drop root -> alissa after the entrypoint fixes the volume mount
 # iptables/ipset : only used by the optional firewall init
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git tmux tini sudo \
+        ca-certificates curl gnupg git tmux tini gosu \
         iptables ipset procps jq less; \
     # GitHub CLI apt repo
     mkdir -p /etc/apt/keyrings; \
@@ -68,13 +68,12 @@ RUN npm install -g @anthropic-ai/claude-code \
 RUN pip install "alissa-tools-github-reviewloop==${REVIEWLOOP_VERSION}"
 
 # --- Non-root runtime user ----------------------------------------------------
-# Agents run unattended with three live tokens; don't run them as root. The
-# firewall init (optional) is the only thing that needs root, via a narrow
-# sudoers entry.
+# Agents run unattended with three live tokens, and claude refuses
+# --dangerously-skip-permissions as root, so the worker/daemon run as this user.
+# The container still STARTS as root (see the USER root before ENTRYPOINT): the
+# entrypoint fixes the /workspace mount ownership, then drops to `alissa` via
+# gosu. This is what makes a root-owned platform volume (e.g. Railway) writable.
 RUN useradd --create-home --shell /bin/bash --uid 1000 alissa \
-    && echo 'alissa ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh' \
-        > /etc/sudoers.d/alissa-firewall \
-    && chmod 0440 /etc/sudoers.d/alissa-firewall \
     && mkdir -p /workspace \
     && chown alissa:alissa /workspace
 
@@ -152,6 +151,11 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_WORKER_INTERVAL=${ALISSA_WORKER_INTERVAL} \
     ALISSA_ENABLE_FIREWALL=${ALISSA_ENABLE_FIREWALL} \
     ALISSA_FIREWALL_EXTRA=${ALISSA_FIREWALL_EXTRA}
+
+# Start as root so the entrypoint can chown a root-owned volume mount; it drops
+# to `alissa` (via gosu) before running anything else. All the build steps above
+# ran as `alissa`, so the CLI, agents.yaml and git config are already in place.
+USER root
 
 # tini reaps the worker/tmux/claude child fan-out; entrypoint does the rest.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

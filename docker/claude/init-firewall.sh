@@ -8,8 +8,9 @@
 # to the few hosts the loop actually needs limits the blast radius if a reviewed
 # PR tries to talk an agent into exfiltrating.
 #
-# Runs as root (via the narrow sudoers entry) and needs --cap-add=NET_ADMIN.
-# Gated behind ALISSA_ENABLE_FIREWALL=1 in the entrypoint — off by default.
+# Runs as root (the entrypoint invokes it during its root bootstrap, before it
+# drops to the unprivileged user) and needs --cap-add=NET_ADMIN. Gated behind
+# ALISSA_ENABLE_FIREWALL=1 — off by default.
 # =============================================================================
 set -euo pipefail
 
