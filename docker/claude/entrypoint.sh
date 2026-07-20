@@ -157,6 +157,40 @@ if [ ! -f "${CONFIG}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# 3a. Pre-trust the reviewer working directories.
+#
+# claude shows a per-directory "Is this a project you trust?" prompt the first
+# time it opens a folder, and --dangerously-skip-permissions does NOT suppress
+# it — so the reviewer TUI hangs there ("stuck — waiting at a prompt"). The
+# accept flag lives per-project in ~/.claude.json. Pre-set it for every hub
+# main/ the reviewer will cd into: each allowlisted repo (may not be cloned yet)
+# plus any hub already on disk. This runs before the worker, so the flag is in
+# place before any reviewer session starts.
+# -----------------------------------------------------------------------------
+python3 - "${WORKSPACE_ROOT}" <<'PY' || true
+import glob, json, os, sys
+root = sys.argv[1]
+cfg = os.path.expanduser("~/.claude.json")
+try:
+    data = json.load(open(cfg))
+except Exception:
+    data = {}
+projects = data.setdefault("projects", {})
+paths = set()
+# Allowlisted repos (basename of owner/repo), even before they are hub-ified.
+for r in os.environ.get("ALISSA_REVIEW_REPOS", "").replace("|", "\n").split():
+    r = r.strip()
+    if "/" in r:
+        paths.add(os.path.join(root, r.split("/")[-1], "main"))
+# Any hub main/ already present (covers --dir overrides and mounted workspaces).
+paths.update(glob.glob(os.path.join(root, "*", "main")))
+for p in sorted(paths):
+    projects.setdefault(p, {})["hasTrustDialogAccepted"] = True
+json.dump(data, open(cfg, "w"), indent=2)
+print(f"[entrypoint] pre-trusted {len(paths)} reviewer dir(s) in ~/.claude.json")
+PY
+
+# -----------------------------------------------------------------------------
 # 3b. Reset the stale in-flight ledger.
 #
 # The daemon's spawn ledger persists on the /workspace volume, but the tmux

@@ -65,12 +65,14 @@ credential has to be visible to that user. Two footguns:
   works with a Pro/Max subscription) in Railway. Prefer it over `ANTHROPIC_API_KEY`
   — in the interactive TUI the worker drives, a bare API key triggers claude's own
   "approve this key?" prompt, which hangs the same way.
-- **First-run dialogs are pre-seeded** into the image (`~/.claude.json` +
-  `~/.claude/settings.json` for `alissa`): `hasCompletedOnboarding`,
-  `hasSeenAutoModeEntryWarning`, `skipDangerousModePermissionPrompt`, and a theme.
-  Without these a fresh user hangs at claude's welcome / theme / bypass-mode
-  dialog and the worker logs *"agent UI not ready — a first-run/trust dialog needs
-  a human"* forever.
+- **First-run dialogs are pre-seeded.** The image bakes `~/.claude.json` +
+  `~/.claude/settings.json` for `alissa` (`hasCompletedOnboarding`,
+  `hasSeenAutoModeEntryWarning`, `skipDangerousModePermissionPrompt`, theme), and
+  the entrypoint additionally sets `projects["<hub>/main"].hasTrustDialogAccepted`
+  for every reviewer working directory. Without these a fresh user hangs at
+  claude's welcome / theme / bypass-mode / **"trust this folder?"** dialog and the
+  worker logs *"stuck — waiting at a prompt"* forever. The trust dialog in
+  particular is **not** suppressed by `--dangerously-skip-permissions`.
 
 So the setup is: two tokens in (gh + alissa) plus a claude credential by any
 means, and the container self-configures gh's git credential helper, the alissa
