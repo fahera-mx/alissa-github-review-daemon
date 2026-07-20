@@ -49,6 +49,7 @@ setup(
     entry_points={
         "console_scripts": [
             "alissa-reviewloop=alissa.tools.github.reviewloop.__main__:main",
+            "alissa-pr-review=alissa.tools.github.reviewloop.prreview:main",
         ]
     },
     install_requires=requirements,

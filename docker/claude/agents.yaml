@@ -1,0 +1,20 @@
+# Agent profiles for the alissa worker (~/.config/alissa/agents.yaml).
+#
+# The worker launches a reviewer with the profile named by ALISSA_AGENT_PROFILE
+# (default: claude). Without this file the worker falls back to a bare `claude`,
+# which stops on its first-run trust / permission prompt and hangs the reviewer.
+#
+# `--dangerously-skip-permissions --permission-mode acceptEdits` is what makes
+# claude run unattended. It requires a non-root user (claude refuses that flag as
+# root) — the image runs as uid 1000, which satisfies it. Reviewer posture (CR6:
+# reviewers never write) is enforced by the round directive, not by this profile.
+#
+# To pin a model or tweak flags, override the command below (edit this file
+# before build, or mount your own agents.yaml over it at runtime).
+claude:
+  command: claude --dangerously-skip-permissions --permission-mode acceptEdits
+  mode: interactive
+  quietSeconds: 30
+  promptPatterns:
+    - "Do you want to"
+    - "❯ 1\\. Yes"
