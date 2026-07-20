@@ -109,6 +109,25 @@ RUN curl -fsSL https://share.alissa.app/install | bash
 # prompt. Mount your own over this path at runtime to override.
 COPY --chown=alissa:alissa agents.yaml /home/alissa/.config/alissa/agents.yaml
 
+# --- claude first-run gates: pre-seed so the TUI starts READY, no human ------
+# A brand-new user hits claude's first-run dialogs (welcome/onboarding, theme
+# picker, and the one-time --dangerously-skip-permissions "bypass mode" warning)
+# and the worker hangs forever: "agent UI not ready — a first-run/trust dialog
+# needs a human". These are the exact keys the working host carries, split across
+# the two files claude reads:
+#   ~/.claude.json          — user state: onboarding completed, warnings seen
+#   ~/.claude/settings.json — settings: skip the bypass-mode prompt, theme, TUI
+# skipDangerousModePermissionPrompt is the key the public docs omit; it is what
+# lets `claude --dangerously-skip-permissions` come up without a keypress.
+# Auth is still required and stays in the env (CLAUDE_CODE_OAUTH_TOKEN preferred
+# — an interactive TUI would prompt to approve a bare ANTHROPIC_API_KEY).
+RUN mkdir -p /home/alissa/.claude \
+    && CLAUDE_VER="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" \
+    && printf '{\n  "hasCompletedOnboarding": true,\n  "hasSeenAutoModeEntryWarning": true,\n  "lastOnboardingVersion": "%s"\n}\n' "${CLAUDE_VER:-2.1.215}" \
+        > /home/alissa/.claude.json \
+    && printf '{\n  "skipDangerousModePermissionPrompt": true,\n  "theme": "dark",\n  "tui": "fullscreen"\n}\n' \
+        > /home/alissa/.claude/settings.json
+
 # A git identity so any git operation (e.g. the clone in hub-ify) has an author
 # and never drops into git's interactive "who are you" prompt. Reviewers are
 # read-only (CR6), so this is a safety default, not a committing identity.

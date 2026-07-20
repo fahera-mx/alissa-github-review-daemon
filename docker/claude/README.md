@@ -45,15 +45,32 @@ onboarding automatically, so you only supply tokens:
 | --- | --- | --- | --- |
 | `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | **yes** — fatal if missing | validates via `gh api user`; the image rewrites GitHub SSH URLs to HTTPS + wires gh as the git credential helper, so hub-ify's `git clone` authenticates with the token (no SSH key needed) |
 | `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | **yes** — fatal if missing | `alissa auth login --token` (stores + verifies) |
-| `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | claude | no — warns, continues | read by claude at spawn; the baked [`agents.yaml`](./agents.yaml) launches it headless (`--dangerously-skip-permissions --permission-mode acceptEdits`) |
+| `CLAUDE_CODE_OAUTH_TOKEN` *(preferred)* or `ANTHROPIC_API_KEY` | claude | no — warns, continues | read by claude at spawn; the baked [`agents.yaml`](./agents.yaml) launches it headless, and the image pre-seeds claude's first-run config so the TUI comes up with no prompts |
 
 `GH_TOKEN` and `ALISSA_API_TOKEN` are hard requirements — the daemon can't poll
 GitHub or reach the task queue without them. The **claude credential is not**: the
 daemon never calls claude directly (only the worker-spawned reviewer does), and
-claude can authenticate by other means — a mounted `~/.claude` credential, a token
-from `claude setup-token` (persist it on the `/workspace` volume), or Bedrock/
-Vertex env. If none of those is present the entrypoint just warns, and a reviewer
+claude can authenticate by other means — a mounted `~/.claude` credential or
+Bedrock/Vertex env. If none is present the entrypoint just warns, and a reviewer
 that genuinely has no credential fails on its own later.
+
+### claude must auth as the `alissa` user (headless)
+
+The worker spawns each reviewer as the **`alissa`** user, so the claude
+credential has to be visible to that user. Two footguns:
+
+- **Do not `claude login` as `root`.** It writes `/root/.claude/…`, which the
+  `alissa` reviewer never reads. Set the credential in the **env** instead (it is
+  visible to every user): put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`,
+  works with a Pro/Max subscription) in Railway. Prefer it over `ANTHROPIC_API_KEY`
+  — in the interactive TUI the worker drives, a bare API key triggers claude's own
+  "approve this key?" prompt, which hangs the same way.
+- **First-run dialogs are pre-seeded** into the image (`~/.claude.json` +
+  `~/.claude/settings.json` for `alissa`): `hasCompletedOnboarding`,
+  `hasSeenAutoModeEntryWarning`, `skipDangerousModePermissionPrompt`, and a theme.
+  Without these a fresh user hangs at claude's welcome / theme / bypass-mode
+  dialog and the worker logs *"agent UI not ready — a first-run/trust dialog needs
+  a human"* forever.
 
 So the setup is: two tokens in (gh + alissa) plus a claude credential by any
 means, and the container self-configures gh's git credential helper, the alissa
