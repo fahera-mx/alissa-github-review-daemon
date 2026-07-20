@@ -45,7 +45,7 @@ onboarding automatically, so you only supply tokens:
 | --- | --- | --- | --- |
 | `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | **yes** — fatal if missing | validates via `gh api user`; the image rewrites GitHub SSH URLs to HTTPS + wires gh as the git credential helper, so hub-ify's `git clone` authenticates with the token (no SSH key needed) |
 | `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | **yes** — fatal if missing | `alissa auth login --token` (stores + verifies) |
-| `CLAUDE_CODE_OAUTH_TOKEN` *(preferred)* or `ANTHROPIC_API_KEY` | claude | no — warns, continues | read by claude at spawn; the baked [`agents.yaml`](./agents.yaml) launches it headless, and the image pre-seeds claude's first-run config so the TUI comes up with no prompts |
+| a persisted `claude /login` *(recommended)*, or `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` in env | claude | no — warns, continues | credential persists on the volume via `CLAUDE_CONFIG_DIR`; the baked [`agents.yaml`](./agents.yaml) launches claude headless and the first-run config is pre-seeded (see below) |
 
 `GH_TOKEN` and `ALISSA_API_TOKEN` are hard requirements — the daemon can't poll
 GitHub or reach the task queue without them. The **claude credential is not**: the
@@ -54,30 +54,49 @@ claude can authenticate by other means — a mounted `~/.claude` credential or
 Bedrock/Vertex env. If none is present the entrypoint just warns, and a reviewer
 that genuinely has no credential fails on its own later.
 
-### claude must auth as the `alissa` user (headless)
+### claude auth: log in once, persisted on the volume (recommended)
 
-The worker spawns each reviewer as the **`alissa`** user, so the claude
-credential has to be visible to that user. Two footguns:
+The worker spawns each reviewer as the **`alissa`** user, so the credential has to
+be visible to that user *and* survive restarts. The durable answer is a one-time
+interactive `claude /login`: it stores a **refresh-token credential that
+auto-renews**, unlike a static `CLAUDE_CODE_OAUTH_TOKEN` (a `setup-token` is a
+fixed 1-year token that eventually returns `401 Invalid bearer token`).
 
-- **Do not `claude login` as `root`.** It writes `/root/.claude/…`, which the
-  `alissa` reviewer never reads. Set the credential in the **env** instead (it is
-  visible to every user): put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`,
-  works with a Pro/Max subscription) in Railway. Prefer it over `ANTHROPIC_API_KEY`
-  — in the interactive TUI the worker drives, a bare API key triggers claude's own
-  "approve this key?" prompt, which hangs the same way.
-- **First-run dialogs are pre-seeded.** The image bakes `~/.claude.json` +
-  `~/.claude/settings.json` for `alissa` (`hasCompletedOnboarding`,
-  `hasSeenAutoModeEntryWarning`, `skipDangerousModePermissionPrompt`, theme), and
-  the entrypoint additionally sets `projects["<hub>/main"].hasTrustDialogAccepted`
-  for every reviewer working directory. Without these a fresh user hangs at
-  claude's welcome / theme / bypass-mode / **"trust this folder?"** dialog and the
-  worker logs *"stuck — waiting at a prompt"* forever. The trust dialog in
-  particular is **not** suppressed by `--dangerously-skip-permissions`.
+The image sets **`CLAUDE_CONFIG_DIR=/workspace/.claude-config`** (on the persistent
+volume), which relocates claude's `.credentials.json` there — so the login
+survives restarts and redeploys. Log in once, as `alissa`, inside the container:
 
-So the setup is: two tokens in (gh + alissa) plus a claude credential by any
-means, and the container self-configures gh's git credential helper, the alissa
-session, and the headless claude profile. No `gh auth login`, no `claude`
-first-run trust prompt, no manual git config.
+```sh
+gosu alissa bash -lc 'claude /login'      # follow the URL, paste the code back
+```
+
+That writes `/workspace/.claude-config/.credentials.json`; every reviewer (and
+every future container) reuses and auto-renews it. claude ≥ 2.1.211 coordinates
+renewal across parallel sessions, so concurrent reviewers won't corrupt it.
+
+Two footguns:
+
+- **Don't `claude /login` as `root`** — it writes `/root/.claude/…`, which the
+  `alissa` reviewer never reads. Always `gosu alissa`.
+- **A static token in the env wins over the file and will keep 401'ing.** If you
+  set `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` and it's expired/invalid,
+  claude uses it instead of the good persisted login. Once you've done `/login`,
+  **remove those env vars** in Railway. (A valid env token still works if you
+  prefer it — but prefer `CLAUDE_CODE_OAUTH_TOKEN` over `ANTHROPIC_API_KEY`, since
+  a bare API key triggers claude's own "approve this key?" prompt in the TUI.)
+
+**First-run dialogs are pre-seeded** so the TUI never blocks: the image bakes the
+onboarding/settings flags (`hasCompletedOnboarding`, `hasSeenAutoModeEntryWarning`,
+`skipDangerousModePermissionPrompt`, theme) and the entrypoint sets
+`projects["<hub>/main"].hasTrustDialogAccepted` for every reviewer dir — into both
+`$HOME` and `$CLAUDE_CONFIG_DIR`. Without these a fresh user hangs at claude's
+welcome / theme / bypass-mode / **"trust this folder?"** dialog (`"stuck — waiting
+at a prompt"`); the trust dialog in particular is **not** suppressed by
+`--dangerously-skip-permissions`.
+
+So the setup is: two tokens in the env (gh + alissa), one `claude /login` on the
+volume, and the container self-configures git-over-HTTPS, the alissa session, and
+a headless claude. No `gh auth login`, no first-run prompts, no manual git config.
 
 A `reviewer_login` that disagrees with the `GH_TOKEN` is **fatal at the daemon's
 own startup** (every round would look like round 1 and respawn forever) — so keep
@@ -173,6 +192,8 @@ Everything worth surviving a restart lives there:
 - `alissa-workspace.yaml` + `reviewloop.config.json` (generated on first boot);
 - the cloned worktree hubs `<owner>/<repo>/main` — persisting them means a
   restart does **not** re-clone every repo;
+- `.claude-config/.credentials.json` — the persisted `claude /login` (see the
+  claude-auth section); this is why the login survives restarts;
 - `.reviewloop/state.db` — the spawn ledger. Its `escalations` (cap-out memory)
   are worth keeping so a restart doesn't re-escalate a capped PR.
 

@@ -138,8 +138,14 @@ RUN git config --global user.name  "alissa-review-daemon" \
 # Workspace root that the daemon and reviewers operate over. Mount a manifest
 # here, or let the entrypoint generate one from the config below (see README).
 # These are fixed internal paths, not meant to be reconfigured.
+#
+# CLAUDE_CONFIG_DIR points claude's config — crucially its OAuth credential file
+# `.credentials.json` — at a folder ON the /workspace volume, so a one-time
+# `claude /login` survives restarts and auto-renews (a static CLAUDE_CODE_OAUTH_
+# TOKEN expires and 401s). If you relocate the volume, move this with it.
 ENV ALISSA_WORKSPACE_ROOT=/workspace \
-    TMUX_TMPDIR=/home/alissa/.tmux
+    TMUX_TMPDIR=/home/alissa/.tmux \
+    CLAUDE_CONFIG_DIR=/workspace/.claude-config
 RUN mkdir -p /home/alissa/.tmux
 WORKDIR /workspace
 

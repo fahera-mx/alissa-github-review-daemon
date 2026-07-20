@@ -60,14 +60,18 @@ fi
 # -----------------------------------------------------------------------------
 
 # 2a. claude / Anthropic — the reviewer agent. NOT fatal: the daemon itself
-#     never calls claude (only the worker-spawned reviewer does), and claude may
-#     be authenticated by other means — a mounted ~/.claude credential, a token
-#     from `claude setup-token`, or Bedrock/Vertex env. So warn and continue; a
-#     reviewer with truly no credential fails loudly on its own later.
-if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  log "WARN: no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in env — relying on claude's own stored auth; reviewers will fail if none is configured"
+#     never calls claude (only the worker-spawned reviewer does). Auth can come
+#     from a persisted `claude /login` (the preferred, auto-renewing credential
+#     at $CLAUDE_CONFIG_DIR/.credentials.json on the volume), or from the env
+#     (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY — note a static setup-token
+#     expires and 401s). Warn only if NONE of these is present.
+CLAUDE_CRED_FILE="${CLAUDE_CONFIG_DIR:-/home/${RUNTIME_USER}/.claude}/.credentials.json"
+if [ -s "${CLAUDE_CRED_FILE}" ]; then
+  log "claude credential present (persisted login: ${CLAUDE_CRED_FILE})"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  log "claude credential present (from env)"
 else
-  log "claude credential present"
+  log "WARN: no persisted claude login and no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN — run 'claude /login' once (see README); reviewers will 401 until then"
 fi
 
 # 2b. gh — the review queue, round counting, PR comments. gh reads GH_TOKEN /
@@ -157,37 +161,66 @@ if [ ! -f "${CONFIG}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 3a. Pre-trust the reviewer working directories.
+# 3a. Seed claude's first-run config so reviewers start headless.
 #
-# claude shows a per-directory "Is this a project you trust?" prompt the first
-# time it opens a folder, and --dangerously-skip-permissions does NOT suppress
-# it — so the reviewer TUI hangs there ("stuck — waiting at a prompt"). The
-# accept flag lives per-project in ~/.claude.json. Pre-set it for every hub
-# main/ the reviewer will cd into: each allowlisted repo (may not be cloned yet)
-# plus any hub already on disk. This runs before the worker, so the flag is in
-# place before any reviewer session starts.
+# A fresh user hangs on claude's first-run gates (welcome/theme, the one-time
+# --dangerously-skip-permissions warning, and a per-directory "trust this
+# folder?" prompt that the flag does NOT suppress). We pre-set the flags so the
+# TUI comes up ready. Auth is separate — the persisted `claude /login` credential
+# lives in $CLAUDE_CONFIG_DIR/.credentials.json and is never touched here.
+#
+# CLAUDE_CONFIG_DIR reliably relocates only .credentials.json; whether it also
+# moves the state/settings files is undocumented, so we seed BOTH $HOME and
+# $CLAUDE_CONFIG_DIR — whichever claude reads, the flags are there. Merges are
+# load-then-update, so a persisted login (oauthAccount etc.) is preserved.
 # -----------------------------------------------------------------------------
 python3 - "${WORKSPACE_ROOT}" <<'PY' || true
 import glob, json, os, sys
 root = sys.argv[1]
-cfg = os.path.expanduser("~/.claude.json")
-try:
-    data = json.load(open(cfg))
-except Exception:
-    data = {}
-projects = data.setdefault("projects", {})
+home = os.path.expanduser("~")
+ccdir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+
+# Reviewer working dirs to pre-trust: allowlisted repos (basename of owner/repo,
+# even before hub-ified) plus any hub main/ already on disk.
 paths = set()
-# Allowlisted repos (basename of owner/repo), even before they are hub-ified.
 for r in os.environ.get("ALISSA_REVIEW_REPOS", "").replace("|", "\n").split():
     r = r.strip()
     if "/" in r:
         paths.add(os.path.join(root, r.split("/")[-1], "main"))
-# Any hub main/ already present (covers --dir overrides and mounted workspaces).
 paths.update(glob.glob(os.path.join(root, "*", "main")))
-for p in sorted(paths):
-    projects.setdefault(p, {})["hasTrustDialogAccepted"] = True
-json.dump(data, open(cfg, "w"), indent=2)
-print(f"[entrypoint] pre-trusted {len(paths)} reviewer dir(s) in ~/.claude.json")
+
+def merge(path, apply):
+    try:
+        d = json.load(open(path))
+    except Exception:
+        d = {}
+    apply(d)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(d, open(path, "w"), indent=2)
+
+def state(d):  # ~/.claude.json equivalent: onboarding + per-project trust
+    d["hasCompletedOnboarding"] = True
+    d["hasSeenAutoModeEntryWarning"] = True
+    d.setdefault("lastOnboardingVersion", "2.1.215")
+    pr = d.setdefault("projects", {})
+    for p in paths:
+        pr.setdefault(p, {})["hasTrustDialogAccepted"] = True
+
+def settings(d):  # settings.json: skip the bypass-mode prompt, theme, TUI
+    d["skipDangerousModePermissionPrompt"] = True
+    d.setdefault("theme", "dark")
+    d.setdefault("tui", "fullscreen")
+
+state_targets = [os.path.join(home, ".claude.json")]
+settings_targets = [os.path.join(home, ".claude", "settings.json")]
+if ccdir:
+    state_targets.append(os.path.join(ccdir, ".claude.json"))
+    settings_targets.append(os.path.join(ccdir, "settings.json"))
+for t in state_targets:
+    merge(t, state)
+for t in settings_targets:
+    merge(t, settings)
+print(f"[entrypoint] seeded claude first-run config; pre-trusted {len(paths)} reviewer dir(s)")
 PY
 
 # -----------------------------------------------------------------------------
