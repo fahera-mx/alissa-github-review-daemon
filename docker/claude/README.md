@@ -137,6 +137,26 @@ docker run -d --name alissa-review \
   alissa-review-daemon -v
 ```
 
+### Persistence — mount the volume at `/workspace`
+
+Mount your volume at **`/workspace`** (the value of `ALISSA_WORKSPACE_ROOT`).
+Everything worth surviving a restart lives there:
+
+- `alissa-workspace.yaml` + `reviewloop.config.json` (generated on first boot);
+- the cloned worktree hubs `<owner>/<repo>/main` — persisting them means a
+  restart does **not** re-clone every repo;
+- `.reviewloop/state.db` — the spawn ledger (which round is in-flight, which
+  cap-outs were escalated). Losing it can double-spawn a reviewer or re-escalate.
+
+Nothing else needs a volume: the gh/alissa/claude auth is re-established from the
+env tokens on every boot, and tmux sockets are deliberately ephemeral.
+
+On Railway, set the volume's mount path to `/workspace`. A **named** Docker volume
+(what Railway uses) inherits the image's `alissa:alissa` (uid 1000) ownership
+automatically — verified writable. A **bind mount** (host directory) keeps the
+host's ownership instead, so make sure the host path is writable by uid 1000, or
+the entrypoint can't write the manifest.
+
 ### Optional egress firewall
 
 For unattended runs, lock egress to the hosts the loop needs (GitHub, Anthropic,
