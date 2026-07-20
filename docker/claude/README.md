@@ -43,7 +43,7 @@ onboarding automatically, so you only supply tokens:
 
 | env var | identity | required? | what the entrypoint does |
 | --- | --- | --- | --- |
-| `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | **yes** — fatal if missing | validates via `gh api user`, then `gh auth setup-git` so `git clone`/fetch of private repos authenticates |
+| `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | **yes** — fatal if missing | validates via `gh api user`; the image rewrites GitHub SSH URLs to HTTPS + wires gh as the git credential helper, so hub-ify's `git clone` authenticates with the token (no SSH key needed) |
 | `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | **yes** — fatal if missing | `alissa auth login --token` (stores + verifies) |
 | `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | claude | no — warns, continues | read by claude at spawn; the baked [`agents.yaml`](./agents.yaml) launches it headless (`--dangerously-skip-permissions --permission-mode acceptEdits`) |
 

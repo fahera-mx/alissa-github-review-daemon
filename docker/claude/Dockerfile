@@ -77,6 +77,20 @@ RUN useradd --create-home --shell /bin/bash --uid 1000 alissa \
     && mkdir -p /workspace \
     && chown alissa:alissa /workspace
 
+# --- git: force GitHub over HTTPS with the gh token (no SSH key in a container)
+# `alissa code workspace add` clones over SSH by default (git@github.com:…), and
+# the daemon's on_missing_hub:add path calls it WITHOUT --https — so there is no
+# flag to flip. Rewrite every GitHub SSH URL to HTTPS system-wide and wire gh in
+# as the credential helper (gh reads GH_TOKEN from the env). This makes the clone
+# authenticate for both the unprivileged daemon and any manual shell (root).
+# NB: --add on the second insteadOf — a plain `git config` replaces the single
+# value, so without it only the last rewrite survives (and git@github.com: is the
+# form the alissa CLI actually emits).
+RUN git config --system url."https://github.com/".insteadOf "git@github.com:" \
+    && git config --system --add url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && git config --system credential."https://github.com".helper "" \
+    && git config --system --add credential."https://github.com".helper "!gh auth git-credential"
+
 # --- Entrypoint + optional firewall ------------------------------------------
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
