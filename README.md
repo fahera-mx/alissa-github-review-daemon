@@ -63,6 +63,12 @@ at startup if it isn't.
 alissa-reviewloop         # foreground; tip: run it in its own tmux session
 ```
 
+### In a container
+
+To run the whole loop unattended in Docker — the poller, an `alissa worker`, and
+the `claude` reviewer it spawns, bundled in one image — see
+[`docker/claude/`](./docker/claude/README.md).
+
 ### Settings
 
 Three layers, each winning over the one before: **defaults → config file → CLI**.
