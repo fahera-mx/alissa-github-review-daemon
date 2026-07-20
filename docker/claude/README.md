@@ -150,9 +150,15 @@ refuses to hub-ify unattended without one.
 Reviewers `cd` into `{root}/{repo}/main` worktree hubs. This image is
 self-contained: with `on_missing_hub: add` the daemon hub-ifies each repo itself
 on the first review request, so **you do not pre-clone anything**. The entrypoint
-only guarantees a manifest and a `reviewloop.config.json` exist under
-`ALISSA_WORKSPACE_ROOT` (`/workspace`, fixed). Either can be mounted; otherwise
-both are generated from the config above.
+guarantees a manifest and a `reviewloop.config.json` exist under
+`ALISSA_WORKSPACE_ROOT` (`/workspace`, fixed).
+
+**When `ALISSA_REVIEW_REPOS` is set it is authoritative**: the entrypoint
+regenerates both files from it on **every boot**, so changing the allowlist (or
+`ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`, …) and redeploying just applies — the
+files persist on the volume, so a "generate only if absent" rule would otherwise
+pin them to the first boot's values forever. Leave `ALISSA_REVIEW_REPOS` **unset**
+to instead run against a workspace you've mounted at `/workspace` as-is.
 
 ## Run
 
@@ -189,7 +195,8 @@ docker run -d --name alissa-review \
 Mount your volume at **`/workspace`** (the value of `ALISSA_WORKSPACE_ROOT`).
 Everything worth surviving a restart lives there:
 
-- `alissa-workspace.yaml` + `reviewloop.config.json` (generated on first boot);
+- `alissa-workspace.yaml` + `reviewloop.config.json` (regenerated from
+  `ALISSA_REVIEW_REPOS` each boot when it's set, else whatever you mounted);
 - the cloned worktree hubs `<owner>/<repo>/main` — persisting them means a
   restart does **not** re-clone every repo;
 - `.claude-config/.credentials.json` — the persisted `claude /login` (see the

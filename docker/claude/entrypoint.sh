@@ -121,12 +121,17 @@ repos_lines() {
     | grep -v '^$'
 }
 
-if [ ! -f "${MANIFEST}" ]; then
-  # Required to generate a manifest, and required by on_missing_hub:add anyway
-  # (the daemon refuses "add" with an empty allowlist).
-  [ -n "$(repos_lines)" ] \
-    || die "no alissa-workspace.yaml mounted and ALISSA_REVIEW_REPOS is empty — nothing to review"
-  log "generating ${MANIFEST} from ALISSA_REVIEW_REPOS"
+CONFIG="${WORKSPACE_ROOT}/reviewloop.config.json"
+
+if [ -n "$(repos_lines)" ]; then
+  # ENV-DRIVEN MODE: ALISSA_REVIEW_REPOS is authoritative, so (re)generate the
+  # manifest + config on EVERY boot. The files persist on the /workspace volume,
+  # so "generate only if absent" would pin them to the first boot's value and a
+  # later Railway env change would silently never apply. Regenerating is safe:
+  # the allowlist is the full set of repos the daemon may touch (on_missing_hub
+  # only hub-ifies repos already in it), and the cloned hub dirs on the volume
+  # are untouched by rewriting this text.
+  log "generating ${MANIFEST} + reviewloop.config.json from ALISSA_REVIEW_REPOS"
   {
     printf 'name: %s\n' "${WORKSPACE_NAME}"
     printf 'description: Containerized Alissa review daemon workspace\n'
@@ -138,12 +143,7 @@ if [ ! -f "${MANIFEST}" ]; then
     printf 'skills:\n  - alissa-code-workspace\n'
     printf 'attributes: {}\n'
   } > "${MANIFEST}"
-fi
 
-CONFIG="${WORKSPACE_ROOT}/reviewloop.config.json"
-if [ ! -f "${CONFIG}" ]; then
-  log "generating ${CONFIG} (on_missing_hub: add)"
-  # Build the repos JSON array from the same allowlist.
   repos_json="$(repos_lines | jq -R . | jq -s -c .)"
   jq -n \
     --argjson repos "${repos_json}" \
@@ -158,6 +158,11 @@ if [ ! -f "${CONFIG}" ]; then
        agent_profile: $agent,
        on_missing_hub: $hub
      }' > "${CONFIG}"
+else
+  # MOUNTED MODE: no allowlist in the env — respect a mounted workspace as-is.
+  [ -f "${MANIFEST}" ] \
+    || die "no alissa-workspace.yaml mounted and ALISSA_REVIEW_REPOS is empty — nothing to review"
+  log "using mounted workspace at ${WORKSPACE_ROOT} (ALISSA_REVIEW_REPOS unset)"
 fi
 
 # -----------------------------------------------------------------------------
