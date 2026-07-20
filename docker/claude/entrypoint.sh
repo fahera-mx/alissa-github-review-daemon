@@ -71,18 +71,27 @@ log "alissa authenticated"
 mkdir -p "${WORKSPACE_ROOT}"
 
 MANIFEST="${WORKSPACE_ROOT}/alissa-workspace.yaml"
+# ALISSA_REVIEW_REPOS: "|"-separated owner/repo allowlist ("|" because repo
+# slugs contain "/"); a single repo needs no separator. Whitespace around
+# entries is stripped. This helper prints one repo per line.
+repos_lines() {
+  printf '%s' "${ALISSA_REVIEW_REPOS:-}" \
+    | tr '|' '\n' \
+    | sed 's/[[:space:]]//g' \
+    | grep -v '^$'
+}
+
 if [ ! -f "${MANIFEST}" ]; then
-  # ALISSA_REVIEW_REPOS: whitespace/comma separated owner/repo allowlist.
   # Required to generate a manifest, and required by on_missing_hub:add anyway
   # (the daemon refuses "add" with an empty allowlist).
-  [ -n "${ALISSA_REVIEW_REPOS:-}" ] \
+  [ -n "$(repos_lines)" ] \
     || die "no alissa-workspace.yaml mounted and ALISSA_REVIEW_REPOS is empty — nothing to review"
   log "generating ${MANIFEST} from ALISSA_REVIEW_REPOS"
   {
     printf 'name: %s\n' "${WORKSPACE_NAME}"
     printf 'description: Containerized Alissa review daemon workspace\n'
     printf 'repos:\n'
-    for r in $(printf '%s' "${ALISSA_REVIEW_REPOS//,/ }" | tr ' ' '\n' | grep -v '^$'); do
+    repos_lines | while IFS= read -r r; do
       printf '  - repo: %s\n' "${r}"
     done
     printf 'reviewers: []\n'
@@ -95,12 +104,7 @@ CONFIG="${WORKSPACE_ROOT}/reviewloop.config.json"
 if [ ! -f "${CONFIG}" ]; then
   log "generating ${CONFIG} (on_missing_hub: add)"
   # Build the repos JSON array from the same allowlist.
-  repos_json="[]"
-  if [ -n "${ALISSA_REVIEW_REPOS:-}" ]; then
-    repos_json="$(printf '%s' "${ALISSA_REVIEW_REPOS//,/ }" \
-      | tr ' ' '\n' | grep -v '^$' \
-      | jq -R . | jq -s -c .)"
-  fi
+  repos_json="$(repos_lines | jq -R . | jq -s -c .)"
   jq -n \
     --argjson repos "${repos_json}" \
     --argjson poll   "${ALISSA_POLL_INTERVAL:-60}" \

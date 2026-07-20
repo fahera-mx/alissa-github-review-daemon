@@ -92,12 +92,54 @@ ENV PATH="/home/alissa/.local/bin:${PATH}"
 RUN curl -fsSL https://share.alissa.app/install | bash
 
 # Workspace root that the daemon and reviewers operate over. Mount a manifest
-# here, or let the entrypoint generate one from env (see README).
+# here, or let the entrypoint generate one from the config below (see README).
+# These are fixed internal paths, not meant to be reconfigured.
 ENV ALISSA_WORKSPACE_ROOT=/workspace \
-    ALISSA_WORKSPACE=alissa-review \
     TMUX_TMPDIR=/home/alissa/.tmux
 RUN mkdir -p /home/alissa/.tmux
 WORKDIR /workspace
+
+# --- Build-time configuration (Railway-friendly) -----------------------------
+# Railway's Dockerfile builds only expose service variables that are declared as
+# ARG here — runtime ENV set in the dashboard does NOT reach a from-Dockerfile
+# build's config. So every non-secret knob is an ARG whose value is baked into
+# an ENV of the same name. A runtime `-e VAR=...` still overrides the baked
+# default, so both paths work.
+#
+# Kept LAST on purpose: changing any of these rebuilds only these tiny trailing
+# layers, never the apt/npm/pip layers above.
+#
+# NOT here (by design): GH_TOKEN, ALISSA_API_TOKEN, ANTHROPIC_API_KEY /
+# CLAUDE_CODE_OAUTH_TOKEN. Secrets baked via ARG leak into `docker history` and
+# every image layer — inject them as runtime env instead (Railway provides
+# service variables to the container at runtime).
+
+# Allowlist of repos to watch, as a single string separated by "|" (a single
+# repo needs no separator). "|" is used because repo slugs contain "/".
+#   e.g. "fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app"
+ARG ALISSA_REVIEW_REPOS=""
+# Workspace name recorded in the generated manifest.
+ARG ALISSA_WORKSPACE="alissa-review"
+# Daemon knobs (see the daemon README's settings table).
+ARG ALISSA_POLL_INTERVAL="60"
+ARG ALISSA_ROUND_CAP="3"
+ARG ALISSA_AGENT_PROFILE="claude"
+ARG ALISSA_ON_MISSING_HUB="add"
+# Worker reconcile tick, seconds.
+ARG ALISSA_WORKER_INTERVAL="2"
+# Optional egress firewall (needs --cap-add=NET_ADMIN at runtime).
+ARG ALISSA_ENABLE_FIREWALL="0"
+ARG ALISSA_FIREWALL_EXTRA=""
+
+ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
+    ALISSA_WORKSPACE=${ALISSA_WORKSPACE} \
+    ALISSA_POLL_INTERVAL=${ALISSA_POLL_INTERVAL} \
+    ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
+    ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \
+    ALISSA_ON_MISSING_HUB=${ALISSA_ON_MISSING_HUB} \
+    ALISSA_WORKER_INTERVAL=${ALISSA_WORKER_INTERVAL} \
+    ALISSA_ENABLE_FIREWALL=${ALISSA_ENABLE_FIREWALL} \
+    ALISSA_FIREWALL_EXTRA=${ALISSA_FIREWALL_EXTRA}
 
 # tini reaps the worker/tmux/claude child fan-out; entrypoint does the rest.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
