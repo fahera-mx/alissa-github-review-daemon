@@ -91,6 +91,18 @@ WORKDIR /home/alissa
 ENV PATH="/home/alissa/.local/bin:${PATH}"
 RUN curl -fsSL https://share.alissa.app/install | bash
 
+# Agent profile the worker uses to launch reviewers non-interactively. Without
+# this, worker-spawned claude sessions stop on the first-run trust/permission
+# prompt. Mount your own over this path at runtime to override.
+COPY --chown=alissa:alissa agents.yaml /home/alissa/.config/alissa/agents.yaml
+
+# A git identity so any git operation (e.g. the clone in hub-ify) has an author
+# and never drops into git's interactive "who are you" prompt. Reviewers are
+# read-only (CR6), so this is a safety default, not a committing identity.
+RUN git config --global user.name  "alissa-review-daemon" \
+    && git config --global user.email "support@alissa.app" \
+    && git config --global advice.detachedHead false
+
 # Workspace root that the daemon and reviewers operate over. Mount a manifest
 # here, or let the entrypoint generate one from the config below (see README).
 # These are fixed internal paths, not meant to be reconfigured.

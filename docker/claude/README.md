@@ -35,21 +35,30 @@ ENV. Set the three **secrets** (`GH_TOKEN`, `ALISSA_API_TOKEN`,
 `ANTHROPIC_API_KEY`) as service variables too; those are read at runtime and
 must NOT be baked in.
 
-## The three identities
+## The three identities (self-onboarding)
 
-The loop depends on three independent identities. All are injected at runtime as
-env vars — **never bake them into the image**. The entrypoint preflights all
-three and fails fast if any is missing or rejected.
+The loop depends on three independent identities. Provide all three as **runtime
+env** (secrets — never baked into the image); the entrypoint does the rest of the
+onboarding automatically, so you only supply tokens:
 
-| env var | identity | used for |
-| --- | --- | --- |
-| `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | review queue, round counting, PR comments |
-| `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | tasks, session queue, verdicts |
-| `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | claude | the reviewer agent |
+| env var | identity | used for | what the entrypoint does |
+| --- | --- | --- | --- |
+| `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | review queue, round counting, PR comments | validates via `gh api user`, then `gh auth setup-git` so `git clone`/fetch of private repos authenticates |
+| `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | tasks, session queue, verdicts | `alissa auth login --token` (stores + verifies) |
+| `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | claude | the reviewer agent | read by claude at spawn; the baked [`agents.yaml`](./agents.yaml) launches it headless (`--dangerously-skip-permissions --permission-mode acceptEdits`) |
+
+That is the whole setup: three tokens in, and the container self-configures gh's
+git credential helper, the alissa session, and the headless claude profile. No
+`gh auth login`, no `claude` first-run trust prompt, no manual git config.
 
 A `reviewer_login` that disagrees with the `GH_TOKEN` is **fatal at the daemon's
 own startup** (every round would look like round 1 and respawn forever) — so keep
 the token and any configured login in sync.
+
+The reviewer's claude launch command lives in [`agents.yaml`](./agents.yaml)
+(pin a model or change flags there, or mount your own over
+`/home/alissa/.config/alissa/agents.yaml`). The image runs as a non-root user
+because claude refuses `--dangerously-skip-permissions` as root.
 
 ## Configuration (build ARGs — Railway-friendly)
 
@@ -173,7 +182,9 @@ volumes:
 ## What the entrypoint does
 
 1. (optional) raise the egress firewall.
-2. Preflight `gh`, `alissa`, and `claude` — fail fast if any is missing/rejected.
+2. Preflight + onboard the three identities — fail fast if any is missing/rejected:
+   validate `gh` and run `gh auth setup-git`; `alissa auth login`; check the claude
+   credential (the baked `agents.yaml` handles headless launch).
 3. Ensure a manifest + `reviewloop.config.json` exist (mount or generate).
 4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).

@@ -52,6 +52,15 @@ GH_LOGIN="$(gh api user -q .login 2>/dev/null)" \
   || die "gh token rejected by GitHub (gh api user failed)"
 log "gh authenticated as: ${GH_LOGIN}"
 
+# The API token above is enough for `gh api` calls, but NOT for git itself:
+# hub-ifying a repo (on_missing_hub:add) does a `git clone`, which needs a git
+# credential helper. Wire gh in as that helper so https clones/fetches of
+# private repos authenticate with the same token. Non-fatal: an SSH-based or
+# public-only setup does not need it.
+gh auth setup-git 2>/dev/null \
+  && log "git credential helper configured (gh)" \
+  || log "WARN: gh auth setup-git failed — private-repo clone/fetch may not authenticate"
+
 # 2c. alissa — tasks, session queue, verdicts. The CLI reads ALISSA_API_TOKEN,
 #     but `auth login` also stores + verifies it, which is the real preflight.
 [ -n "${ALISSA_API_TOKEN:-}" ] \
