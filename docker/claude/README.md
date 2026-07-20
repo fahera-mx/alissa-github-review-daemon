@@ -41,15 +41,24 @@ The loop depends on three independent identities. Provide all three as **runtime
 env** (secrets — never baked into the image); the entrypoint does the rest of the
 onboarding automatically, so you only supply tokens:
 
-| env var | identity | used for | what the entrypoint does |
+| env var | identity | required? | what the entrypoint does |
 | --- | --- | --- | --- |
-| `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | review queue, round counting, PR comments | validates via `gh api user`, then `gh auth setup-git` so `git clone`/fetch of private repos authenticates |
-| `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | tasks, session queue, verdicts | `alissa auth login --token` (stores + verifies) |
-| `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | claude | the reviewer agent | read by claude at spawn; the baked [`agents.yaml`](./agents.yaml) launches it headless (`--dangerously-skip-permissions --permission-mode acceptEdits`) |
+| `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | **yes** — fatal if missing | validates via `gh api user`, then `gh auth setup-git` so `git clone`/fetch of private repos authenticates |
+| `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | **yes** — fatal if missing | `alissa auth login --token` (stores + verifies) |
+| `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | claude | no — warns, continues | read by claude at spawn; the baked [`agents.yaml`](./agents.yaml) launches it headless (`--dangerously-skip-permissions --permission-mode acceptEdits`) |
 
-That is the whole setup: three tokens in, and the container self-configures gh's
-git credential helper, the alissa session, and the headless claude profile. No
-`gh auth login`, no `claude` first-run trust prompt, no manual git config.
+`GH_TOKEN` and `ALISSA_API_TOKEN` are hard requirements — the daemon can't poll
+GitHub or reach the task queue without them. The **claude credential is not**: the
+daemon never calls claude directly (only the worker-spawned reviewer does), and
+claude can authenticate by other means — a mounted `~/.claude` credential, a token
+from `claude setup-token` (persist it on the `/workspace` volume), or Bedrock/
+Vertex env. If none of those is present the entrypoint just warns, and a reviewer
+that genuinely has no credential fails on its own later.
+
+So the setup is: two tokens in (gh + alissa) plus a claude credential by any
+means, and the container self-configures gh's git credential helper, the alissa
+session, and the headless claude profile. No `gh auth login`, no `claude`
+first-run trust prompt, no manual git config.
 
 A `reviewer_login` that disagrees with the `GH_TOKEN` is **fatal at the daemon's
 own startup** (every round would look like round 1 and respawn forever) — so keep
@@ -202,9 +211,9 @@ volumes:
 ## What the entrypoint does
 
 1. (optional) raise the egress firewall.
-2. Preflight + onboard the three identities — fail fast if any is missing/rejected:
-   validate `gh` and run `gh auth setup-git`; `alissa auth login`; check the claude
-   credential (the baked `agents.yaml` handles headless launch).
+2. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
+   `gh auth setup-git`; `alissa auth login` (fatal if missing); check the claude
+   credential (warn-only — the baked `agents.yaml` handles headless launch).
 3. Ensure a manifest + `reviewloop.config.json` exist (mount or generate).
 4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).

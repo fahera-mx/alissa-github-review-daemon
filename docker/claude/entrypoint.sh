@@ -37,11 +37,16 @@ fi
 # enforce the mismatch guard at its own startup.
 # -----------------------------------------------------------------------------
 
-# 2a. claude / Anthropic — the reviewer agent.
+# 2a. claude / Anthropic — the reviewer agent. NOT fatal: the daemon itself
+#     never calls claude (only the worker-spawned reviewer does), and claude may
+#     be authenticated by other means — a mounted ~/.claude credential, a token
+#     from `claude setup-token`, or Bedrock/Vertex env. So warn and continue; a
+#     reviewer with truly no credential fails loudly on its own later.
 if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  die "no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN — the claude reviewer agent cannot run"
+  log "WARN: no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in env — relying on claude's own stored auth; reviewers will fail if none is configured"
+else
+  log "claude credential present"
 fi
-log "claude credential present"
 
 # 2b. gh — the review queue, round counting, PR comments. gh reads GH_TOKEN /
 #     GITHUB_TOKEN from the environment automatically.
