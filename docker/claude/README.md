@@ -122,6 +122,7 @@ automatically; locally pass `--build-arg`):
 | --- | --- | --- |
 | `ALISSA_REVIEW_REPOS` | *(required if no manifest mounted)* | allowlist as one `\|`-separated string (see below) |
 | `ALISSA_WORKSPACE` | `alissa-review` | workspace name in the generated manifest |
+| `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
 | `ALISSA_POLL_INTERVAL` | `60` | seconds between polls (≥10) |
 | `ALISSA_ROUND_CAP` | `3` | CR9 round cap |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches |

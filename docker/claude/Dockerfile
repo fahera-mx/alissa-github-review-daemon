@@ -170,6 +170,13 @@ WORKDIR /workspace
 ARG ALISSA_REVIEW_REPOS=""
 # Workspace name recorded in the generated manifest.
 ARG ALISSA_WORKSPACE="alissa-review"
+# Skills installed into every reviewer session (manifest `skills:`), "|"-separated.
+# alissa-code-review is the review protocol the reviewer directive loads; the
+# workspace skill is for navigating the hubs. alissa-session/-skills-usage are
+# auto-installed by `alissa code`, so they need not be listed. Deliberately NOT
+# alissa-code-orchestration (reviewers must not spawn ali-* sessions) or
+# alissa-code-git (read-only reviewers never commit).
+ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 # Daemon knobs (see the daemon README's settings table).
 ARG ALISSA_POLL_INTERVAL="60"
 ARG ALISSA_ROUND_CAP="3"
@@ -183,6 +190,7 @@ ARG ALISSA_FIREWALL_EXTRA=""
 
 ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_WORKSPACE=${ALISSA_WORKSPACE} \
+    ALISSA_REVIEW_SKILLS=${ALISSA_REVIEW_SKILLS} \
     ALISSA_POLL_INTERVAL=${ALISSA_POLL_INTERVAL} \
     ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \

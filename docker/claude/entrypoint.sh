@@ -121,6 +121,17 @@ repos_lines() {
     | grep -v '^$'
 }
 
+# Skills installed into every reviewer session (manifest `skills:`). Same
+# "|"-separated convention. Defaults to the workspace + review skills; override
+# with ALISSA_REVIEW_SKILLS. alissa-session / alissa-skills-usage are installed
+# by `alissa code` automatically, so they need not be listed.
+skills_lines() {
+  printf '%s' "${ALISSA_REVIEW_SKILLS:-alissa-code-workspace|alissa-code-review}" \
+    | tr '|' '\n' \
+    | sed 's/[[:space:]]//g' \
+    | grep -v '^$'
+}
+
 CONFIG="${WORKSPACE_ROOT}/reviewloop.config.json"
 
 if [ -n "$(repos_lines)" ]; then
@@ -140,7 +151,10 @@ if [ -n "$(repos_lines)" ]; then
       printf '  - repo: %s\n' "${r}"
     done
     printf 'reviewers: []\n'
-    printf 'skills:\n  - alissa-code-workspace\n'
+    printf 'skills:\n'
+    skills_lines | while IFS= read -r s; do
+      printf '  - %s\n' "${s}"
+    done
     printf 'attributes: {}\n'
   } > "${MANIFEST}"
 
