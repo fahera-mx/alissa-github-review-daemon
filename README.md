@@ -166,10 +166,65 @@ still advance.
 
 ## Scope
 
-This is the **reviewer side**. It reacts to review requests and spawns reviewers.
-The implementer side of the loop — triaging findings (CR8), fixing, re-requesting
-— stays with the implementer per `procedures/run-the-review-loop.md`. From here,
-each re-request is simply the next round.
+The daemon (`alissa-reviewloop`) is the **reviewer side**. It reacts to review
+requests and spawns reviewers; it never pushes, merges, or changes PR state — it
+only enqueues reviewers and, on cap-out, comments. Reviewer posture (CR6) is
+enforced in every directive.
+
+The **implementer side** — triaging findings (CR8), fixing, re-requesting — stays
+with the implementer per the `alissa-code-review` skill's
+`procedures/run-the-review-loop.md`. The `alissa-pr-review` command below is a
+thin driver for it.
+
+## Closing the loop: `alissa-pr-review` (implementer side)
+
+The daemon closes the *reviewer* half autonomously, but nothing tells the **dev**
+when a review lands. `alissa-pr-review` is the counterpart the dev session runs
+after finishing the work: it fires the trigger and blocks on the verdict, so the
+loop closes without a second always-on daemon.
+
+```sh
+alissa-pr-review --reviewer alissa-app --branch TASK-123-FIX-THING --timeout 2700
+```
+
+One invocation = **one round**:
+
+1. resolve the PR from the branch (or the current branch);
+2. flip it **ready-for-review** (from draft);
+3. **request the reviewer** — this is exactly the daemon's `review-requested:@me`
+   edge-trigger, so the reviewer daemon takes it from here;
+4. block until a new review round lands, then read the verdict — from the **review
+   task envelope**, never GitHub's review state (reviewers comment-mode, so the
+   state is always `COMMENTED`). It reuses the daemon's `latest_verdict` /
+   round-counting, so the two halves can't disagree.
+
+Exit codes drive the loop: **`0` approve** (converged), **`1` request_changes**,
+**`2` timeout / no verdict**, **`3` usage or setup error** (including the
+self-review guard — GitHub forbids requesting review from the PR author, so the
+dev's `gh` account must differ from `--reviewer`).
+
+### The loop (HOW-TO)
+
+The command is one round; the loop and the cap live around it:
+
+```sh
+CAP=3
+for round in $(seq 1 "$CAP"); do
+  alissa-pr-review --reviewer alissa-app --branch "$(git branch --show-current)"
+  case $? in
+    0) echo "converged (approve)"; break ;;
+    1) # triage every finding on its PR thread ([triage:pursue|ignore|later|answer],
+       # reasoning mandatory), fix the pursued ones, commit, push — then loop.
+       echo "round $round: request_changes — triage, fix, push, re-enter" ;;
+    2) echo "no verdict yet (timeout) — reviewer may be slow; re-run or check the worker"; break ;;
+    *) echo "setup error"; break ;;
+  esac
+done
+```
+
+The `2700`s (45 min) timeout is shorter than the daemon's 90-min stall
+re-enqueue, so a timeout means *"no verdict yet,"* not *"failed."* The triage
+taxonomy and cap-out escalation are defined in the `alissa-code-review` skill.
 
 The daemon never pushes, merges, or changes PR state; it only enqueues reviewers
 and, on cap-out, comments. Reviewer posture (CR6) is enforced in every directive.
@@ -191,8 +246,8 @@ bash check-style.sh alissa-tools-github-reviewloop
 bash check-types.sh alissa-tools-github-reviewloop
 ```
 
-48 tests cover the decision state machine and the config layering, with GitHub
-and Alissa faked.
+82 tests cover the decision state machine, the config layering, and the
+`alissa-pr-review` round/verdict/timeout logic, with GitHub and Alissa faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,
 `alissa task list` parsing, review-task title matching, worker detection, the
