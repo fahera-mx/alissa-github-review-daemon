@@ -29,12 +29,27 @@ log = logging.getLogger(__name__)
 # (skill failure mode: "reviewer session stalls"). The round is re-enqueued.
 STALE_ROUND_SECONDS = 90 * 60
 
+# The closing contract is spelled out in both directives (not just the skill)
+# because it is the reviewer's most-skipped step: on re-review, sessions produce
+# findings but never register the review on the PR, or stop without a verdict.
+_CLOSE_THE_ROUND = (
+    "CLOSE THE ROUND — both are mandatory or the round does not count: "
+    "(1) SUBMIT your review so it lands as one registered review record ON the "
+    "PR (gh pr review / the reviews API) and confirm it with "
+    "`gh api repos/<org>/<repo>/pulls/<n>/reviews` — findings left only in your "
+    "session do not exist; (2) end with a decisive verdict — approve OR "
+    "request_changes, never neither, never comment-only. You are read-only: "
+    "never commit or fix, even a one-character typo — a needed fix IS "
+    "request_changes. "
+)
+
 ROUND_1_DIRECTIVE = (
     "You are a PR REVIEWER, not an implementer. {assignment} "
     "Load the alissa-code-review skill and follow procedures/review-a-pr.md: "
     "hydrate the task and the PR it names, review per the rubric, post "
     "severity-tagged comments via gh pr review, record the verdict evidence, "
     "move the task to pending_validation. "
+    + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions."
 )
@@ -46,6 +61,7 @@ ROUND_K_DIRECTIVE = (
     "including its round-k section: verify the triage of every prior finding, "
     "verify the fixes, sweep the new diff with the full rubric, record a "
     "round-{round} verdict envelope, move the task to pending_validation. "
+    + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions."
 )
