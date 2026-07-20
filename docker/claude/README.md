@@ -150,7 +150,7 @@ docker run --rm -it \
 Everything after the image name is passed straight to `alissa-reviewloop`, so
 `--once`, `--dry-run`, `-v` all work.
 
-Unattended, persisting the workspace (hubs + the spawn ledger) across restarts:
+Unattended, persisting the workspace (the cloned hubs) across restarts:
 
 ```sh
 docker run -d --name alissa-review \
@@ -171,8 +171,15 @@ Everything worth surviving a restart lives there:
 - `alissa-workspace.yaml` + `reviewloop.config.json` (generated on first boot);
 - the cloned worktree hubs `<owner>/<repo>/main` — persisting them means a
   restart does **not** re-clone every repo;
-- `.reviewloop/state.db` — the spawn ledger (which round is in-flight, which
-  cap-outs were escalated). Losing it can double-spawn a reviewer or re-escalate.
+- `.reviewloop/state.db` — the spawn ledger. Its `escalations` (cap-out memory)
+  are worth keeping so a restart doesn't re-escalate a capped PR.
+
+The ledger's **in-flight `spawns` are cleared on every boot** by the entrypoint:
+the tmux server, its reviewer sessions, and the worker queue all live in the
+ephemeral home and are gone on restart, so a persisted "round N in-flight" would
+otherwise be stale and stall re-enqueue for 90 min. A fresh container has no
+reviewer running by definition, so clearing them is safe and the daemon
+re-enqueues any still-pending round on its first poll.
 
 Nothing else needs a volume: the gh/alissa/claude auth is re-established from the
 env tokens on every boot, and tmux sockets are deliberately ephemeral.

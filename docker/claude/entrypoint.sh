@@ -157,6 +157,34 @@ if [ ! -f "${CONFIG}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# 3b. Reset the stale in-flight ledger.
+#
+# The daemon's spawn ledger persists on the /workspace volume, but the tmux
+# server, its sessions, and the worker queue all live in the ephemeral home and
+# are gone on every (re)start. So after a redeploy the ledger still says round N
+# is "in-flight" for sessions that no longer exist, and the daemon waits the full
+# 90-min stall before re-enqueuing — nothing reviews in the meantime.
+#
+# A fresh container has no reviewer running by definition (tmux server is down),
+# so every `spawns` row is stale: clear them and the daemon re-enqueues on its
+# first poll. `escalations` is kept, so capped-out PRs are not re-escalated.
+STATE_DB="${WORKSPACE_ROOT}/.reviewloop/state.db"
+if [ -f "${STATE_DB}" ]; then
+  python3 - "${STATE_DB}" <<'PY' || true
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+try:
+    n = db.execute("DELETE FROM spawns").rowcount
+    db.commit()
+    print(f"[entrypoint] cleared {n} stale in-flight spawn record(s) from the ledger")
+except sqlite3.OperationalError:
+    pass  # table not created yet — nothing to clear
+finally:
+    db.close()
+PY
+fi
+
+# -----------------------------------------------------------------------------
 # 4. Start the worker, wait until it reports running.
 # -----------------------------------------------------------------------------
 mkdir -p "${TMUX_TMPDIR:-/home/alissa/.tmux}"
