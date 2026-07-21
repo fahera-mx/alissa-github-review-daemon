@@ -50,9 +50,10 @@ class FakeGitHub:
 
 
 class FakeAlissa:
-    def __init__(self, task=None, verdict=None):
+    def __init__(self, task=None, verdict=None, verdict_count=0):
         self.task = task
         self.verdict = verdict  # newest CR6 envelope verdict, or None
+        self.verdict_count = verdict_count  # envelopes on the task = rounds done
         self.enqueued: list[dict] = []
         self.added: list[tuple] = []
         self.killed: list[str] = []
@@ -63,6 +64,9 @@ class FakeAlissa:
 
     def latest_verdict(self, task_ref):
         return self.verdict
+
+    def count_verdicts(self, task_ref):
+        return self.verdict_count
 
     def enqueue_reviewer(self, **kwargs):
         self.enqueued.append(kwargs)
@@ -129,9 +133,16 @@ def config(tmp_path):
     )
 
 
-def watcher(config, pr, reviews, task=FakeTask(), state=None, verdict=None):
+def watcher(config, pr, reviews, task=FakeTask(), state=None, verdict=None, verdict_count=None):
+    # Default the review task's envelope count to the number of substantive
+    # GitHub reviews, so a scenario's rounds are consistent across both signals.
+    # Tests that exercise github-vs-envelope divergence pass verdict_count.
     gh = FakeGitHub(pr, reviews)
-    al = FakeAlissa(task, verdict=verdict)
+    default_count = sum(1 for r in reviews if r.is_substantive)
+    al = FakeAlissa(
+        task, verdict=verdict,
+        verdict_count=default_count if verdict_count is None else verdict_count,
+    )
     w = ReviewWatcher(config, github=gh, alissa=al, state=state or State(config.state_db))
     return w, gh, al
 
@@ -145,7 +156,7 @@ def test_pending_request_with_no_prior_review_spawns_round_1(config):
 
     assert d.action is Action.SPAWNED
     assert d.round == 1
-    assert al.enqueued[0]["session"] == "review-widgets-pr7-r1"
+    assert al.enqueued[0]["session"].startswith("review-widgets-pr7-r1-")
     assert al.enqueued[0]["task_ref"] == "TASK-500"
     directive = al.enqueued[0]["directive"]
     assert "TASK-500" in directive
@@ -211,7 +222,7 @@ def test_second_request_after_changes_requested_spawns_round_2(config):
 
     assert d.action is Action.SPAWNED
     assert d.round == 2
-    assert al.enqueued[0]["session"] == "review-widgets-pr7-r2"
+    assert al.enqueued[0]["session"].startswith("review-widgets-pr7-r2-")
     directive = al.enqueued[0]["directive"]
     assert "round 2 of a review loop (cap 3)" in directive
     assert "verify the triage of every prior finding" in directive
@@ -273,7 +284,7 @@ def test_a_zero_body_record_alone_does_not_close_round_1(config):
     d = w.evaluate(OWNER, REPO, NUMBER)
 
     assert d.round == 1, "an inline-comment artifact is not a completed round"
-    assert al.enqueued[0]["session"] == "review-widgets-pr7-r1"
+    assert al.enqueued[0]["session"].startswith("review-widgets-pr7-r1-")
 
 
 def test_whitespace_only_body_is_not_substantive(config):
@@ -560,10 +571,13 @@ def test_dry_run_never_enqueues_or_records(config):
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
 
 
-def test_session_names_are_tmux_safe_and_unique():
+def test_session_names_are_tmux_safe_round_scoped_and_unique():
     pr = make_pr()
-    assert session_name(pr, 1) == "review-widgets-pr7-r1"
-    assert session_name(pr, 2) == "review-widgets-pr7-r2"
+    # Round-scoped, human-readable prefix...
+    assert session_name(pr, 1).startswith("review-widgets-pr7-r1-")
+    assert session_name(pr, 2).startswith("review-widgets-pr7-r2-")
+    # ...but a unique nonce, so re-spawning the SAME round never collides.
+    assert session_name(pr, 1) != session_name(pr, 1)
 
     dotted = PullRequest(
         owner="acme",
@@ -576,8 +590,10 @@ def test_session_names_are_tmux_safe_and_unique():
         url="",
     )
     name = session_name(dotted, 1)
-    assert name == "review-widgets-app-pr7-r1"
-    assert ":" not in name and "." not in name
+    assert name.startswith("review-widgets-app-pr7-r1-")
+    # tmux-safe: only [A-Za-z0-9-]
+    import re as _re
+    assert _re.fullmatch(r"[A-Za-z0-9-]+", name)
 
 
 def test_config_rejects_bad_values(tmp_path):
@@ -915,10 +931,13 @@ def test_task_without_a_number_is_skipped(monkeypatch):
 # -- reaping finished sessions (backstop) ----------------------------------
 
 def _record(w, pr, round_):
+    """Record a spawn and return the (now nonce'd, unique) session name it used."""
+    name = session_name(pr, round_)
     w.state.record_spawn(
         repo=f"{OWNER}/{REPO}", number=NUMBER, round_=round_, head_sha="abc123",
-        session=session_name(pr, round_), task_ref="TASK-9",
+        session=name, task_ref="TASK-9",
     )
+    return name
 
 
 def test_reaps_sessions_of_completed_rounds(config):
@@ -926,37 +945,37 @@ def test_reaps_sessions_of_completed_rounds(config):
     # two substantive reviews landed → rounds 1 and 2 are done
     reviews = [review(), review(at="2026-07-18T11:00:00Z")]
     w, _, al = watcher(config, pr, reviews)
-    _record(w, pr, 1)
-    _record(w, pr, 2)
+    s1 = _record(w, pr, 1)
+    s2 = _record(w, pr, 2)
 
     w.evaluate(OWNER, REPO, NUMBER)
 
-    assert al.killed == [session_name(pr, 1), session_name(pr, 2)]
-    assert w.state.is_reaped(session_name(pr, 1))
-    assert w.state.is_reaped(session_name(pr, 2))
+    assert al.killed == [s1, s2]
+    assert w.state.is_reaped(s1)
+    assert w.state.is_reaped(s2)
 
 
 def test_reap_is_idempotent_across_polls(config):
     pr = make_pr()
     w, _, al = watcher(config, pr, [review()])  # one round done
-    _record(w, pr, 1)
+    s1 = _record(w, pr, 1)
 
     w.evaluate(OWNER, REPO, NUMBER)
     w.evaluate(OWNER, REPO, NUMBER)  # second poll must not kill it again
 
-    assert al.killed == [session_name(pr, 1)]
+    assert al.killed == [s1]
 
 
 def test_reap_leaves_the_in_flight_round_alone(config):
     pr = make_pr()
     # zero reviews yet: round 1 is in flight, not done → not reaped
     w, _, al = watcher(config, pr, [])
-    _record(w, pr, 1)
+    s1 = _record(w, pr, 1)
 
     w.evaluate(OWNER, REPO, NUMBER)
 
     assert al.killed == []
-    assert not w.state.is_reaped(session_name(pr, 1))
+    assert not w.state.is_reaped(s1)
 
 
 def test_reap_skipped_in_dry_run(config):
@@ -968,3 +987,54 @@ def test_reap_skipped_in_dry_run(config):
     w.evaluate(OWNER, REPO, NUMBER)
 
     assert al.killed == []
+
+
+# -- round number from verdict envelopes, not GitHub body-presence ----------
+
+def test_round_number_comes_from_envelopes_when_github_overcounts(config):
+    # Two substantive GitHub reviews landed in one cycle (overcount), but the
+    # task holds ONE verdict envelope -> this is round 2, not round 3, and the
+    # session name is r2 (no reuse/collision).
+    pr = make_pr()
+    reviews = [review(), review(at="2026-07-18T10:03:00Z")]
+    w, _, al = watcher(config, pr, reviews, verdict_count=1)
+    d = w.evaluate(OWNER, REPO, NUMBER)
+    assert d.action is Action.SPAWNED
+    assert d.round == 2
+    assert al.enqueued[-1]["session"].startswith("review-widgets-pr7-r2-")
+
+
+def test_empty_body_round_still_counts_via_envelope(config):
+    # The prior round's GitHub review had an empty body (is_substantive False),
+    # so github shows 0 reviews -- but its verdict envelope was recorded. Without
+    # the envelope count the daemon would repeat round 1 (name collision -> stuck);
+    # with it, the next round is correctly round 2.
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [], verdict_count=1)
+    d = w.evaluate(OWNER, REPO, NUMBER)
+    assert d.action is Action.SPAWNED
+    assert d.round == 2
+
+
+def test_falls_back_to_github_count_when_no_review_task(config):
+    # Round 1, before any review task exists: fall back to the github count.
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [], task=None, verdict_count=0)
+    d = w.evaluate(OWNER, REPO, NUMBER)
+    assert d.round == 1
+
+
+def test_count_verdicts_counts_only_envelope_evidence():
+    from alissa.tools.github.reviewloop.alissa import Alissa
+    payload = {
+        "evidence": [
+            {"title": "Review verdict: acme/widgets#7 — request_changes (round 1)"},
+            {"markdownContent": "# Review verdict: acme/widgets#7 — approve\n\n..."},
+            {"title": "Design note", "markdownContent": "not a verdict"},
+            {"title": None, "markdownContent": None},
+        ]
+    }
+    assert Alissa._count_verdicts(payload) == 2
+    assert Alissa._count_verdicts({}) == 0
+    assert Alissa._count_verdicts({"evidence": "nope"}) == 0
+    assert Alissa._count_verdicts("garbage") == 0

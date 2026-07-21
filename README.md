@@ -23,27 +23,39 @@ One poll pass:
 ```
 gh api search/issues            →  PRs awaiting my review (draft:false → CR1)
   ↓
-gh api …/pulls/N/reviews        →  how many rounds have I completed?
-  ↓
 alissa task list                →  find the review task (CR2 dedupe)
+  ↓
+alissa task get  (its verdicts) →  how many rounds are done? → round k
   ↓
 alissa tmux queue add           →  fresh reviewer, round k (CR3)
 ```
 
-## The key design decision: rounds come from GitHub, not local state
+## The key design decision: GitHub triggers, the task counts
 
 GitHub **clears** a pending review request the moment you submit a review, and
 **re-adds** it when the implementer re-requests after fixes. So
 `review-requested:@me` is already an edge-trigger for CR9 rounds — no webhook and
-no diffing needed.
+no diffing needed. That is what fires a round.
 
-Round number is derived: `round = (my submitted reviews on this PR) + 1`. That
-makes GitHub the source of truth. The local SQLite ledger holds only two things
-it cannot: which round is currently *in flight* (so a 60s poll doesn't spawn the
-same reviewer twice), and which cap-outs were already escalated.
+The round *number* is derived from the **review task's verdict envelopes** — one
+append-only envelope per round (CR7), the authoritative round record:
+`round = (verdict envelopes on the review task) + 1`. Before the review task
+exists (round 1) it falls back to the GitHub substantive-review count.
+
+> Earlier this counted GitHub reviews directly (`round = substantive reviews + 1`).
+> That is a fragile proxy: a round whose review has an empty top-level body
+> undercounts (the round number *repeats* → the session name collides → the worker
+> wedges), and two reviews in one cycle overcount. The verdict envelope is exactly
+> one-per-round, so counting it can't drift.
+
+The local SQLite ledger holds only what neither can: which round is currently *in
+flight* (so a 60s poll doesn't spawn the same reviewer twice), which cap-outs were
+escalated, and which finished sessions were reaped.
 
 CR3's "fresh instance per round" falls out for free — each trigger spawns a new
-`ali-*` session, named `review-<repo>-pr<n>-r<k>`.
+`ali-*` session, named `review-<repo>-pr<n>-r<k>-<nonce>`. The `<nonce>` makes the
+name unique per spawn, so even a miscounted round can never collide with a
+still-live session.
 
 ## Setup
 
@@ -264,7 +276,7 @@ bash check-style.sh alissa-tools-github-reviewloop
 bash check-types.sh alissa-tools-github-reviewloop
 ```
 
-90 tests cover the decision state machine, the config layering, and the
+94 tests cover the decision state machine, the config layering, and the
 `alissa-pr-review` round/verdict/timeout logic, with GitHub and Alissa faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,

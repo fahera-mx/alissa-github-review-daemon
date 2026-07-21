@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -105,9 +106,17 @@ class Decision:
 
 
 def session_name(pr: PullRequest, round_: int) -> str:
-    """tmux-safe, unique per (repo, pr, round)."""
+    """A tmux-safe reviewer session name, unique per spawn.
+
+    The `review-<repo>-pr<n>-r<round>` prefix stays human-readable, but a short
+    random nonce is appended so a re-used or miscounted round number can never
+    collide with a still-live session (a collision wedges the worker -- the
+    original 'stuck' failure). Safe to be non-deterministic: the generated name
+    is recorded in the spawn ledger and is what gets reaped / self-killed, so the
+    daemon never re-derives it.
+    """
     repo = re.sub(r"[^A-Za-z0-9-]", "-", pr.repo).strip("-").lower()
-    return f"review-{repo}-pr{pr.number}-r{round_}"
+    return f"review-{repo}-pr{pr.number}-r{round_}-{secrets.token_hex(3)}"
 
 
 class ReviewWatcher:
@@ -143,16 +152,25 @@ class ReviewWatcher:
             )
 
         my_reviews = self.github.my_reviews(owner, repo, number)
-        completed = len(my_reviews)
+
+        # The review task (CR2) is the round record: one verdict envelope per
+        # round (CR7), so counting envelopes is the authoritative "rounds
+        # completed" -- immune to the GitHub heuristics that drift. A round whose
+        # review has an empty body undercounts (round_ repeats -> the session name
+        # collides -> the worker wedges); two reviews in one cycle overcount.
+        # Fall back to the substantive-review count only before the review task
+        # exists (round 1). Looked up here (not in _spawn) because both the count
+        # and convergence need it.
+        task = self.alissa.find_review_task(owner, repo, number)
+        completed = (
+            self.alissa.count_verdicts(task.ref) if task is not None
+            else len(my_reviews)
+        )
 
         # Backstop: reap the sessions of rounds that have already landed a review
         # (the fast path is the reviewer self-killing, but it may forget). A round
         # <= completed is done; its session, if we still have it, can be killed.
         self._reap_finished(pr.full_name, number, completed)
-
-        # Looked up here rather than inside _spawn: convergence needs the ref
-        # too. _spawn still handles `task is None` exactly as before.
-        task = self.alissa.find_review_task(owner, repo, number)
 
         converged = self._convergence_reason(my_reviews, task)
         if converged is not None:
