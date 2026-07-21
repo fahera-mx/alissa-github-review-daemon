@@ -166,7 +166,8 @@ Leave it on `skip` unless you want unattended clones.
 | round already enqueued | in-flight, no-op |
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
 | a round's review has landed | its reviewer session is reaped (freed) — see below |
-| last review is `APPROVED` | converged, no-op |
+| approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
+| approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | `round_cap` reviews, no approve | comment cap-out on the PR, escalate, stop |
 | new commits after a cap-out | re-escalate (head moved, decision is about the new state) |
 | PR is a draft | skip (CR1) |
@@ -276,7 +277,7 @@ bash check-style.sh alissa-tools-github-reviewloop
 bash check-types.sh alissa-tools-github-reviewloop
 ```
 
-94 tests cover the decision state machine, the config layering, and the
+96 tests cover the decision state machine, the config layering, and the
 `alissa-pr-review` round/verdict/timeout logic, with GitHub and Alissa faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,
