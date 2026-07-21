@@ -132,7 +132,7 @@ Your two identities are independent and nothing keeps them in sync:
 
 | | identity | used for |
 | --- | --- | --- |
-| `gh` | `alissa-app` | the review queue, PR comments, round counting |
+| `gh` | `alissa-app` | the review queue, PR comments, the GitHub-side convergence signal |
 | `alissa` | Alissa by Fahera | tasks, session queue, verdicts |
 
 Because of that, a `reviewer_login` that disagrees with the token is **fatal at
