@@ -55,6 +55,7 @@ class FakeAlissa:
         self.verdict = verdict  # newest CR6 envelope verdict, or None
         self.enqueued: list[dict] = []
         self.added: list[tuple] = []
+        self.killed: list[str] = []
         self.on_add = None  # optional side effect: actually create the hub
 
     def find_review_task(self, owner, repo, number):
@@ -65,6 +66,9 @@ class FakeAlissa:
 
     def enqueue_reviewer(self, **kwargs):
         self.enqueued.append(kwargs)
+
+    def kill_session(self, session, *, dry_run=False):
+        self.killed.append(session)
 
     def add_repo_to_workspace(self, owner, repo, workspace_root, *, dry_run=False):
         self.added.append((owner, repo, workspace_root))
@@ -906,3 +910,61 @@ def test_task_without_a_number_is_skipped(monkeypatch):
     monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: [row])
 
     assert alissa_mod.Alissa().find_review_task(OWNER, REPO, NUMBER) is None
+
+
+# -- reaping finished sessions (backstop) ----------------------------------
+
+def _record(w, pr, round_):
+    w.state.record_spawn(
+        repo=f"{OWNER}/{REPO}", number=NUMBER, round_=round_, head_sha="abc123",
+        session=session_name(pr, round_), task_ref="TASK-9",
+    )
+
+
+def test_reaps_sessions_of_completed_rounds(config):
+    pr = make_pr()
+    # two substantive reviews landed → rounds 1 and 2 are done
+    reviews = [review(), review(at="2026-07-18T11:00:00Z")]
+    w, _, al = watcher(config, pr, reviews)
+    _record(w, pr, 1)
+    _record(w, pr, 2)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert al.killed == [session_name(pr, 1), session_name(pr, 2)]
+    assert w.state.is_reaped(session_name(pr, 1))
+    assert w.state.is_reaped(session_name(pr, 2))
+
+
+def test_reap_is_idempotent_across_polls(config):
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])  # one round done
+    _record(w, pr, 1)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+    w.evaluate(OWNER, REPO, NUMBER)  # second poll must not kill it again
+
+    assert al.killed == [session_name(pr, 1)]
+
+
+def test_reap_leaves_the_in_flight_round_alone(config):
+    pr = make_pr()
+    # zero reviews yet: round 1 is in flight, not done → not reaped
+    w, _, al = watcher(config, pr, [])
+    _record(w, pr, 1)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert al.killed == []
+    assert not w.state.is_reaped(session_name(pr, 1))
+
+
+def test_reap_skipped_in_dry_run(config):
+    from dataclasses import replace
+    pr = make_pr()
+    w, _, al = watcher(replace(config, dry_run=True), pr, [review()])
+    _record(w, pr, 1)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert al.killed == []
