@@ -154,6 +154,48 @@ class Alissa:
         # lost its timestamp.
         return max(found, key=lambda pair: pair[0])[1]
 
+    def count_verdicts(self, task_ref: str) -> int:
+        """How many CR6 verdict envelopes are on the review task.
+
+        One envelope per completed round (CR7, append-only), so this is the
+        authoritative round count -- unlike the GitHub review count it cannot be
+        thrown off by an empty-bodied review or two reviews in one cycle. Never
+        raises: absent, empty, or malformed evidence degrades to 0 (round 1)
+        rather than taking the loop down.
+        """
+        try:
+            data = run_json(["alissa", "task", "get", task_ref, "--json"], timeout=90)
+        except CommandError as exc:
+            log.warning("could not read verdict evidence for %s: %s", task_ref, exc)
+            return 0
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("unexpected failure reading verdict evidence for %s", task_ref)
+            return 0
+        try:
+            return self._count_verdicts(data)
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("could not count verdict evidence for %s", task_ref)
+            return 0
+
+    @staticmethod
+    def _count_verdicts(payload: object) -> int:
+        """Count evidence items carrying a verdict envelope. Mirrors
+        `_newest_verdict`'s tolerant parsing -- one match per item at most."""
+        if not isinstance(payload, dict):
+            return 0
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, list):
+            return 0
+        count = 0
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            for blob in (item.get("title"), item.get("markdownContent")):
+                if isinstance(blob, str) and _VERDICT_RE.search(blob):
+                    count += 1
+                    break
+        return count
+
     def enqueue_reviewer(
         self,
         *,
