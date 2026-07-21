@@ -364,6 +364,29 @@ def test_convergence_is_skipped_when_there_is_no_review_task(config):
     assert al.enqueued[0]["task_ref"] is None
 
 
+def test_stale_approve_envelope_does_not_converge_after_new_commits(config):
+    """#227: round 1 approved an old commit; the implementer then pushed new
+    code and re-requested. The approve envelope is about the old head, so the
+    loop must NOT latch converged -- round 2 is owed."""
+    pr = make_pr(sha="fd500fc")                      # current head
+    reviews = [review("COMMENTED", sha="fa304de")]   # round 1 reviewed the OLD head
+    w, _, al = watcher(config, pr, reviews, verdict="approve")
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 2
+
+
+def test_stale_github_approve_does_not_converge_after_new_commits(config):
+    """The GitHub APPROVED signal is head-bound too: an approve on an earlier
+    commit doesn't converge once the head has moved."""
+    pr = make_pr(sha="new")
+    reviews = [review("APPROVED", sha="old")]
+    w, _, al = watcher(config, pr, reviews, verdict=None)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+
+
 def test_cap_out_escalates_and_never_spawns_round_four(config):
     reviews = [review("CHANGES_REQUESTED", at=f"2026-07-18T1{i}:00:00Z") for i in range(3)]
     w, gh, al = watcher(config, make_pr(), reviews)

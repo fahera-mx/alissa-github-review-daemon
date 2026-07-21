@@ -172,7 +172,7 @@ class ReviewWatcher:
         # <= completed is done; its session, if we still have it, can be killed.
         self._reap_finished(pr.full_name, number, completed)
 
-        converged = self._convergence_reason(my_reviews, task)
+        converged = self._convergence_reason(my_reviews, task, pr.head_sha)
         if converged is not None:
             return Decision(Action.CONVERGED, converged, completed)
 
@@ -199,7 +199,9 @@ class ReviewWatcher:
 
         return self._spawn(pr, round_, task)
 
-    def _convergence_reason(self, my_reviews: list[Review], task: Task | None) -> str | None:
+    def _convergence_reason(
+        self, my_reviews: list[Review], task: Task | None, head_sha: str
+    ) -> str | None:
         """Why the loop is done, or None if it is not.
 
         Two independent signals, because neither alone is sufficient:
@@ -213,8 +215,26 @@ class ReviewWatcher:
           declares this the verdict of record, and unlike the GitHub state it
           can actually express approval, so it is the signal that closes the
           loop in practice.
+
+        BOTH are bound to the current head. An approval means "this code is
+        good", so once the implementer pushes past the reviewed commit it is
+        about old code and the next round is owed. Without this bind a stale
+        approve latches the loop shut forever -- #227: round 1 approved
+        `fa304de`, the implementer pushed `fd500fc` and re-requested (and even
+        dismissed the approve), yet the envelope still read approve and no round
+        2 was ever queued.
         """
-        if my_reviews and my_reviews[-1].state == "APPROVED":
+        if not my_reviews:
+            return None
+
+        # New commits since the newest review -> its verdict is about old code.
+        # A falsy commit_id (older records lack one) can't be checked, so it
+        # falls through rather than blocking convergence.
+        newest = my_reviews[-1]
+        if newest.commit_id and newest.commit_id != head_sha:
+            return None
+
+        if newest.state == "APPROVED":
             return "last GitHub review state is APPROVED"
 
         # Only checkable once a review task exists; before that there is
