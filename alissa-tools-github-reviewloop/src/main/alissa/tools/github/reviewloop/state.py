@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS escalations (
     escalated_at INTEGER NOT NULL,
     PRIMARY KEY (repo, number, head_sha)
 );
+
+CREATE TABLE IF NOT EXISTS reaps (
+    session   TEXT    NOT NULL PRIMARY KEY,
+    reaped_at INTEGER NOT NULL
+);
 """
 
 
@@ -78,6 +83,19 @@ class State:
             "(repo, number, round, head_sha, session, task_ref, spawned_at) "
             "VALUES (?,?,?,?,?,?,?)",
             (repo, number, round_, head_sha, session, task_ref, int(time.time())),
+        )
+        self._db.commit()
+
+    def is_reaped(self, session: str) -> bool:
+        row = self._db.execute(
+            "SELECT 1 FROM reaps WHERE session=?", (session,)
+        ).fetchone()
+        return row is not None
+
+    def record_reap(self, session: str) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO reaps (session, reaped_at) VALUES (?,?)",
+            (session, int(time.time())),
         )
         self._db.commit()
 

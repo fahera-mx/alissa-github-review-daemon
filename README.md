@@ -153,6 +153,7 @@ Leave it on `skip` unless you want unattended clones.
 | pending request, k−1 reviews submitted | spawn round k (round-k directive: verify triage, verify fixes, sweep delta) |
 | round already enqueued | in-flight, no-op |
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
+| a round's review has landed | its reviewer session is reaped (freed) — see below |
 | last review is `APPROVED` | converged, no-op |
 | `round_cap` reviews, no approve | comment cap-out on the PR, escalate, stop |
 | new commits after a cap-out | re-escalate (head moved, decision is about the new state) |
@@ -163,6 +164,23 @@ Leave it on `skip` unless you want unattended clones.
 `COMMENTED` reviews close a round, not just `APPROVED`/`CHANGES_REQUESTED` —
 single-operator workspaces post comment-mode reviews per CR5, and the loop must
 still advance.
+
+### Reaping finished reviewer sessions
+
+Reviewers are one-shot per round (CR3), but a finished `claude` sits idle at its
+prompt — the session is not *empty*, so `alissa tmux cleanup` (which only reaps
+empty sessions after a long idle) never frees it, and slots pile up. Two things
+prevent that:
+
+- **Fast path — the reviewer self-kills.** Its directive's final action, once the
+  round is fully closed, is `alissa tmux kill <its own session>`.
+- **Backstop — the daemon reaps.** On each poll it kills the session of any round
+  whose review has already landed (round ≤ submitted-review count), idempotently
+  (a per-session `reaps` ledger), skipped in `--dry-run`. This covers the case
+  where the reviewer forgets to self-kill.
+
+`enqueue_reviewer` sets the reviewer queue's `respawn off`, so a kill (from either
+path) can never trigger a respawn loop.
 
 ## Scope
 
@@ -246,7 +264,7 @@ bash check-style.sh alissa-tools-github-reviewloop
 bash check-types.sh alissa-tools-github-reviewloop
 ```
 
-82 tests cover the decision state machine, the config layering, and the
+90 tests cover the decision state machine, the config layering, and the
 `alissa-pr-review` round/verdict/timeout logic, with GitHub and Alissa faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,

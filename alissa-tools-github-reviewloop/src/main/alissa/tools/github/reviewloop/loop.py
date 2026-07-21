@@ -43,6 +43,16 @@ _CLOSE_THE_ROUND = (
     "request_changes. "
 )
 
+# Reviewers are one-shot per round (CR3), so a finished session should not linger
+# holding a worker slot. The daemon reaps it as a backstop, but the fast path is
+# the reviewer releasing its own slot as its very last action. {session} is the
+# reviewer's own managed session name, injected at spawn.
+_RELEASE_SLOT = (
+    "FINALLY, and only once the round is fully closed above (review registered "
+    "AND verdict recorded), release your worker slot as your last action: run "
+    "`alissa tmux kill {session}`. Do nothing after it."
+)
+
 ROUND_1_DIRECTIVE = (
     "You are a PR REVIEWER, not an implementer. {assignment} "
     "Load the alissa-code-review skill and follow procedures/review-a-pr.md: "
@@ -51,7 +61,8 @@ ROUND_1_DIRECTIVE = (
     "move the task to pending_validation. "
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
-    "Do NOT create further ali-* sessions."
+    "Do NOT create further ali-* sessions. "
+    + _RELEASE_SLOT
 )
 
 ROUND_K_DIRECTIVE = (
@@ -63,7 +74,8 @@ ROUND_K_DIRECTIVE = (
     "round-{round} verdict envelope, move the task to pending_validation. "
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
-    "Do NOT create further ali-* sessions."
+    "Do NOT create further ali-* sessions. "
+    + _RELEASE_SLOT
 )
 
 ESCALATION_COMMENT = (
@@ -133,6 +145,11 @@ class ReviewWatcher:
         my_reviews = self.github.my_reviews(owner, repo, number)
         completed = len(my_reviews)
 
+        # Backstop: reap the sessions of rounds that have already landed a review
+        # (the fast path is the reviewer self-killing, but it may forget). A round
+        # <= completed is done; its session, if we still have it, can be killed.
+        self._reap_finished(pr.full_name, number, completed)
+
         # Looked up here rather than inside _spawn: convergence needs the ref
         # too. _spawn still handles `task is None` exactly as before.
         task = self.alissa.find_review_task(owner, repo, number)
@@ -189,6 +206,31 @@ class ReviewWatcher:
 
         return None
 
+    def _reap_finished(self, repo: str, number: int, completed: int) -> None:
+        """Kill the managed session of every round whose review has landed.
+
+        A round `<= completed` is done (its review was submitted), so its session
+        is finished and should not hold a worker slot. The reviewer self-kills as
+        the fast path; this is the backstop for when it forgets. Idempotent — each
+        session is killed at most once (recorded in the ledger) — never runs in
+        dry-run, and best-effort: a reap failure (or an already-gone session) must
+        not take the poll down.
+        """
+        if self.config.dry_run or completed < 1:
+            return
+        for round_ in range(1, completed + 1):
+            row = self.state.get_spawn(repo, number, round_)
+            if row is None or self.state.is_reaped(row["session"]):
+                continue
+            session = row["session"]
+            try:
+                self.alissa.kill_session(session)
+            except Exception:  # pragma: no cover - defence in depth
+                log.exception("failed to reap session %s", session)
+                continue
+            self.state.record_reap(session)
+            log.info("reaped finished reviewer session %s (round %d done)", session, round_)
+
     # -- actions -----------------------------------------------------------
 
     def _spawn(self, pr: PullRequest, round_: int, task: Task | None) -> Decision:
@@ -210,16 +252,16 @@ class ReviewWatcher:
         else:
             assignment = f"You've been assigned Alissa review task {task.ref}."
 
+        name = session_name(pr, round_)
         template = ROUND_1_DIRECTIVE if round_ == 1 else ROUND_K_DIRECTIVE
         directive = template.format(
-            assignment=assignment, round=round_, cap=self.config.round_cap
+            assignment=assignment, round=round_, cap=self.config.round_cap, session=name
         )
 
         hub, problem = self._ensure_hub(pr)
         if problem is not None:
             return Decision(Action.SKIPPED, problem, round_)
 
-        name = session_name(pr, round_)
         self.alissa.enqueue_reviewer(
             session=name,
             directive=directive,

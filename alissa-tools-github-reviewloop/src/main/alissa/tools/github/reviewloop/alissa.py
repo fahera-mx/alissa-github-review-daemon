@@ -185,6 +185,27 @@ class Alissa:
 
         run(argv, timeout=60)
 
+        # Reviewers are one-shot per round (CR3): once the session finishes and is
+        # reaped, it must never be respawned. Make that explicit so a self-kill or
+        # a daemon reap can't trigger a respawn loop. Best-effort — an older CLI
+        # without `queue set` should not fail the enqueue.
+        try:
+            run(["alissa", "tmux", "queue", "set", session, "respawn", "off"],
+                timeout=30, check=False)
+        except CommandError:  # pragma: no cover - defence in depth
+            log.warning("could not set respawn off for %s", session)
+
+    def kill_session(self, session: str, *, dry_run: bool = False) -> None:
+        """Kill a finished reviewer's managed session to free its worker slot.
+
+        Best-effort and idempotent-friendly: the session may already be gone (the
+        reviewer self-killed), so a non-zero exit is not an error here.
+        """
+        if dry_run:
+            log.info("[dry-run] would kill session %s", session)
+            return
+        run(["alissa", "tmux", "kill", session], timeout=30, check=False)
+
     def add_repo_to_workspace(
         self, owner: str, repo: str, workspace_root: Path, *, dry_run: bool = False
     ) -> None:
