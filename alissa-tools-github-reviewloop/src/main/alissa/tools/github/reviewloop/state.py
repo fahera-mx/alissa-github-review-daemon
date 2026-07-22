@@ -15,7 +15,8 @@ import sqlite3
 import time
 from pathlib import Path
 
-SCHEMA = """
+# Shared between SCHEMA and the migration so the two can never drift.
+_SPAWNS_TABLE = """
 CREATE TABLE IF NOT EXISTS spawns (
     repo       TEXT    NOT NULL,
     number     INTEGER NOT NULL,
@@ -24,7 +25,10 @@ CREATE TABLE IF NOT EXISTS spawns (
     session    TEXT    NOT NULL PRIMARY KEY,
     task_ref   TEXT,
     spawned_at INTEGER NOT NULL
-);
+)"""
+
+SCHEMA = f"""
+{_SPAWNS_TABLE};
 
 CREATE INDEX IF NOT EXISTS spawns_by_round ON spawns (repo, number, round);
 
@@ -49,11 +53,25 @@ class State:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(path))
         self._db.row_factory = sqlite3.Row
-        stale = self._spawns_keyed_by_round()
-        if stale:
-            self._db.execute("ALTER TABLE spawns RENAME TO spawns_v0")
+        if self._spawns_keyed_by_round():
+            self._migrate_spawns()
         self._db.executescript(SCHEMA)
-        if stale:
+        self._db.commit()
+
+    def _migrate_spawns(self) -> None:
+        """Re-key an old round-keyed `spawns` by session, in ONE transaction.
+
+        Deliberately not executescript (it COMMITs the open transaction before
+        running): a crash between the rename and the copy would otherwise
+        leave an empty new `spawns` that no longer looks stale, stranding
+        every row in spawns_v0 — an empty ledger makes the sweep spare every
+        live session as "not ours". All-or-nothing instead: any failure rolls
+        back to the untouched old table and the next open retries.
+        """
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute("ALTER TABLE spawns RENAME TO spawns_v0")
+            self._db.execute(_SPAWNS_TABLE)
             self._db.execute(
                 "INSERT OR REPLACE INTO spawns "
                 "(repo, number, round, head_sha, session, task_ref, spawned_at) "
@@ -61,7 +79,10 @@ class State:
                 "FROM spawns_v0"
             )
             self._db.execute("DROP TABLE spawns_v0")
-        self._db.commit()
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        self._db.execute("COMMIT")
 
     def _spawns_keyed_by_round(self) -> bool:
         """True when `spawns` still has the pre-0.8 (repo, number, round) key.

@@ -263,10 +263,11 @@ class ReviewWatcher:
         into the evaluate() path.
 
         Every-poll cost, honestly: one `alissa tmux ls` when no review-*
-        session is live; otherwise, per distinct PR with a live idle quiet
-        session, one PR fetch plus exactly one of `alissa task get <ref>`
-        (the ledger row carries a task ref) or the reviews fetch (it does
-        not). The ledger ref is used deliberately instead of
+        session is live; otherwise one PR fetch per distinct PR with a live
+        idle quiet session, plus -- per distinct (PR, task ref) among its
+        rows -- exactly one of `alissa task get <ref>` (the row carries a
+        task ref) or the reviews fetch (it does not). The ledger ref is used
+        deliberately instead of
         find_review_task: that would fetch the actor's ENTIRE task list per
         PR, and its open-status filter would drop a human-validated review
         task back onto the racier GitHub-count fallback. Only individual
@@ -280,8 +281,11 @@ class ReviewWatcher:
             log.warning("reap sweep skipped: could not list sessions: %s", exc)
             return
 
-        # Rounds completed per PR, resolved once per sweep (several rounds of
-        # one PR can be live at once). None = undecidable this pass.
+        # Per-sweep memos. The PR fetch is keyed per distinct PR; the round
+        # count additionally keys on the task ref, because two spawns of one
+        # PR can disagree on it (a round-1 row recorded before the review
+        # task existed carries None). None = undecidable this pass.
+        prs: dict[tuple[str, int], PullRequest | None] = {}
         completed_cache: dict[tuple[str, int, str | None], float | None] = {}
 
         for ses in sessions:
@@ -299,9 +303,15 @@ class ReviewWatcher:
                 # Not in our ledger: another workspace's daemon (or a human)
                 # owns it. Not ours to judge.
                 continue
+            pr_key = (row["repo"], row["number"])
+            if pr_key not in prs:
+                prs[pr_key] = self._sweep_pr(row["repo"], row["number"])
+            pr = prs[pr_key]
+            if pr is None:
+                continue  # fetch failed -- spare everything on this PR
             key = (row["repo"], row["number"], row["task_ref"])
             if key not in completed_cache:
-                completed_cache[key] = self._completed_rounds(*key)
+                completed_cache[key] = self._completed_rounds(pr, row["task_ref"])
             completed = completed_cache[key]
             if completed is None or row["round"] > completed:
                 continue  # undecidable, or the round is still in flight
@@ -325,9 +335,23 @@ class ReviewWatcher:
                 ses.name, row["round"],
             )
 
-    def _completed_rounds(
-        self, repo_slug: str, number: int, task_ref: str | None
-    ) -> float | None:
+    def _sweep_pr(self, repo_slug: str, number: int) -> PullRequest | None:
+        """One PR fetch for the sweep; the caller memoizes per distinct PR.
+
+        None = the fetch failed -- every session on that PR is spared this
+        pass and looked at again next poll. RateLimited propagates so
+        run_forever backs off instead of hammering the API once per session.
+        """
+        owner, _, repo = repo_slug.partition("/")
+        try:
+            return self.github.pull_request(owner, repo, number)
+        except RateLimited:
+            raise
+        except CommandError as exc:
+            log.warning("reap sweep: could not fetch %s#%d: %s", repo_slug, number, exc)
+            return None
+
+    def _completed_rounds(self, pr: PullRequest, task_ref: str | None) -> float | None:
         """How many rounds of this PR are over, judged from GitHub/task state.
 
         A closed or merged PR terminates every round, so it reports infinity.
@@ -337,22 +361,20 @@ class ReviewWatcher:
         whole task list and whose open-status filter loses validated tasks.
         The substantive-review count is the fallback only for spawns recorded
         before any review task existed. None means "could not tell" -- the
-        sweep spares the session and retries next poll. RateLimited
-        propagates so run_forever backs off instead of hammering the API once
-        per session.
+        sweep spares the session and retries next poll.
         """
-        owner, _, repo = repo_slug.partition("/")
+        if pr.is_terminal:
+            return float("inf")
+        if task_ref:
+            # count_verdicts never raises; unreadable evidence degrades to 0,
+            # which spares the session (round >= 1 > 0).
+            return self.alissa.count_verdicts(task_ref)
         try:
-            pr = self.github.pull_request(owner, repo, number)
-            if pr.is_terminal:
-                return float("inf")
-            if task_ref:
-                return self.alissa.count_verdicts(task_ref)
-            return len(self.github.my_reviews(owner, repo, number))
+            return len(self.github.my_reviews(pr.owner, pr.repo, pr.number))
         except RateLimited:
             raise
         except CommandError as exc:
-            log.warning("reap sweep: could not size up %s#%d: %s", repo_slug, number, exc)
+            log.warning("reap sweep: could not count reviews on %s: %s", pr.slug, exc)
             return None
 
     # -- actions -----------------------------------------------------------

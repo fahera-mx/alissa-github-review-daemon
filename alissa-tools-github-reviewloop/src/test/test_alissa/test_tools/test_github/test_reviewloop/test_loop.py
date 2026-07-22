@@ -19,7 +19,13 @@ from alissa.tools.github.reviewloop.config import (
 )
 from alissa.tools.github.reviewloop.alissa import ManagedSession
 from alissa.tools.github.reviewloop.ghclient import GitHub, IdentityMismatch, PullRequest, Review
-from alissa.tools.github.reviewloop.loop import STALE_ROUND_SECONDS, Action, ReviewWatcher, session_name
+from alissa.tools.github.reviewloop.loop import (
+    REAP_QUIET_SECONDS,
+    STALE_ROUND_SECONDS,
+    Action,
+    ReviewWatcher,
+    session_name,
+)
 from alissa.tools.github.reviewloop.state import State
 
 OWNER, REPO, NUMBER = "acme", "widgets", 7
@@ -33,8 +39,10 @@ class FakeGitHub:
         self._reviews = reviews
         self.comments: list[str] = []
         self.requests = [(OWNER, REPO, NUMBER)]
+        self.pr_fetches = 0
 
     def pull_request(self, owner, repo, number):
+        self.pr_fetches += 1
         return self._pr
 
     def my_reviews(self, owner, repo, number):
@@ -1207,7 +1215,7 @@ def test_sweep_waits_out_recent_activity(config):
     assert al.killed == []
 
     al.sessions = []
-    _live(al, s1, last_activity=time.time() - STALE_ROUND_SECONDS)  # long quiet
+    _live(al, s1, last_activity=time.time() - REAP_QUIET_SECONDS * 2)  # long quiet
     w.sweep_sessions()
     assert al.killed == [s1]
 
@@ -1226,6 +1234,67 @@ def test_sweep_counts_rounds_via_the_ledger_task_ref(config):
     w.sweep_sessions()
 
     assert al.killed == [s1]
+
+
+def test_sweep_fetches_each_pr_once_even_across_task_refs(config):
+    """The docstring promises one PR fetch per distinct PR. Two live sessions
+    of one PR whose rows disagree on task_ref (a pre-task round-1 spawn next
+    to a later ref-carrying one) must share the fetch, even though the round
+    count is keyed on the full (repo, number, task_ref) triple."""
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()], verdict_count=1)
+    s1 = _record(w, pr, 1, task_ref=None)
+    s2 = _record(w, pr, 2, task_ref="TASK-500")  # round 2 in flight (2 > 1)
+    _live(al, s1)
+    _live(al, s2)
+
+    w.sweep_sessions()
+
+    assert gh.pr_fetches == 1
+    assert al.killed == [s1]
+
+
+def test_interrupted_migration_leaves_the_old_ledger_migratable(tmp_path):
+    """The migration is one transaction: if any statement fails, the
+    round-keyed table must come back untouched (still detected as stale) and
+    a retry must carry every row across — never a committed empty `spawns`
+    with the rows stranded in spawns_v0."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE spawns (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, round INTEGER NOT NULL,
+            head_sha TEXT NOT NULL, session TEXT NOT NULL, task_ref TEXT,
+            spawned_at INTEGER NOT NULL, PRIMARY KEY (repo, number, round)
+        );
+        CREATE TABLE spawns_v0 (blocker INTEGER);  -- makes the RENAME fail
+        """
+    )
+    conn.execute(
+        "INSERT INTO spawns VALUES (?,?,?,?,?,?,?)",
+        (SLUG, NUMBER, 1, "abc123", "review-widgets-pr7-r1-old123", "TASK-500", 1000),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        State(db)
+
+    # The failure rolled back: the old table is intact and still stale.
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("SELECT COUNT(*) FROM spawns").fetchone()[0] == 1
+    pk = [r["name"] for r in conn.execute("PRAGMA table_info(spawns)") if r["pk"]]
+    assert pk == ["repo", "number", "round"]
+    conn.execute("DROP TABLE spawns_v0")  # clear the obstruction
+    conn.commit()
+    conn.close()
+
+    st = State(db)  # the retry migrates for real
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-old123") is not None
 
 
 def test_sweep_falls_back_to_review_count_without_a_task_ref(config):
