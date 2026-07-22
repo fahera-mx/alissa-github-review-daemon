@@ -22,9 +22,11 @@ from alissa.tools.github.reviewloop.ghclient import GitHub, IdentityMismatch, Pu
 from alissa.tools.github.reviewloop.loop import (
     REAP_QUIET_SECONDS,
     STALE_ROUND_SECONDS,
+    STALLED_DEFER_MULTIPLE,
     Action,
     ReviewWatcher,
     session_name,
+    stalled_kind,
 )
 from alissa.tools.github.reviewloop.state import State
 
@@ -1308,6 +1310,213 @@ def test_sweep_falls_back_to_review_count_without_a_task_ref(config):
     w.sweep_sessions()
 
     assert al.killed == [s1]
+
+
+# -- stale rounds: two-signal staleness (timer + liveness) + floor -----------
+
+def _backdate(st, seconds):
+    """Age every spawn on the ledger so the stale timer has fired."""
+    st._db.execute(
+        "UPDATE spawns SET spawned_at=?", (int(time.time()) - int(seconds),)
+    )
+    st._db.commit()
+
+
+PAST_STALE = STALE_ROUND_SECONDS + 60
+PAST_FLOOR = STALLED_DEFER_MULTIPLE * STALE_ROUND_SECONDS + 60
+
+
+def test_stale_round_with_busy_session_defers_not_respawns(config):
+    """THE double-spend this exists to stop (double round-2 approves on
+    devloop#11, double approves on #19 of this repo): the stale timer fired
+    but the round's session is still busy reviewing. A timer-only re-enqueue
+    spawns a second reviewer over the first; both submit. This test fails if
+    the liveness probe is removed from the stale path."""
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    session = al.enqueued[0]["session"]
+    _live(al, session, status="busy")
+    _backdate(st, PAST_STALE)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert len(al.enqueued) == 1, "must not spawn a second reviewer over a live one"
+    assert session in d.reason
+
+
+def test_stale_round_with_dead_session_respawns(config):
+    """Timer fired AND the session is gone from the live list: both signals
+    agree the round is dead — re-enqueue as before."""
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    _backdate(st, PAST_STALE)  # session never added to the live list
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert len(al.enqueued) == 2
+
+
+def test_stale_round_with_idle_finished_session_respawns(config):
+    """Idle past the quiet period without ever submitting = the session died
+    at its prompt. That is not liveness; respawn."""
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    _live(al, al.enqueued[0]["session"],
+          last_activity=time.time() - REAP_QUIET_SECONDS * 2)
+    _backdate(st, PAST_STALE)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert len(al.enqueued) == 2
+
+
+def test_stale_round_with_recently_active_idle_session_defers(config):
+    """Idle-but-recent is how a claude session looks between turns; the same
+    quiet-period doctrine as the reap sweep applies before respawning over it."""
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    _live(al, al.enqueued[0]["session"], last_activity=time.time())
+    _backdate(st, PAST_STALE)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert len(al.enqueued) == 1
+
+
+def test_unprobeable_session_list_defers_the_respawn(config):
+    """No liveness evidence is not evidence of death: respawning blind is
+    exactly the double-spend, so a failed `alissa tmux ls` defers one poll."""
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    _backdate(st, PAST_STALE)
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no tmux server")
+
+    al.list_review_sessions = boom
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert len(al.enqueued) == 1
+
+
+def test_floor_pings_the_operator_once_per_episode(config):
+    """Past STALLED_DEFER_MULTIPLE stale windows with the session still busy,
+    the deferral gets a floor: one operator comment, then keep deferring —
+    a second poll in the same episode must not comment again."""
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    session = al.enqueued[0]["session"]
+    _live(al, session, status="busy")
+    _backdate(st, PAST_FLOOR)
+
+    first = w.evaluate(OWNER, REPO, NUMBER)
+    second = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert first.action is Action.IN_FLIGHT
+    assert second.action is Action.IN_FLIGHT
+    assert len(al.enqueued) == 1, "the floor pings, it never respawns"
+    assert len(gh.comments) == 1, "one ping per deferral episode"
+    assert "stalled" in gh.comments[0].lower()
+    assert session in gh.comments[0]
+    assert st.pinged(f"{OWNER}/{REPO}", NUMBER, stalled_kind(session))
+
+
+def test_deferral_below_the_floor_does_not_ping(config):
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    _live(al, al.enqueued[0]["session"], status="busy")
+    _backdate(st, PAST_STALE)  # stale, but inside the first extra window
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert gh.comments == []
+
+
+def test_a_new_deferral_episode_pings_again(config):
+    """Episode-keyed dedupe: after the wedged session is killed and the round
+    re-enqueued, the NEW session stalling must ping again — keyed on the bare
+    kind, the second episode would defer silently forever."""
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    s1 = al.enqueued[0]["session"]
+    _live(al, s1, status="busy")
+    _backdate(st, PAST_FLOOR)
+    w.evaluate(OWNER, REPO, NUMBER)  # episode 1's ping
+    assert len(gh.comments) == 1
+
+    al.sessions = []  # the operator killed the wedged session
+    w.evaluate(OWNER, REPO, NUMBER)  # stale + dead -> respawn (episode 2)
+    s2 = al.enqueued[1]["session"]
+    assert s2 != s1
+    _live(al, s2, status="busy")
+    _backdate(st, PAST_FLOOR)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert len(gh.comments) == 2, "a fresh episode must ping again"
+
+
+def test_floor_ping_dry_run_is_silent(config):
+    """Dry-run must neither comment nor burn the episode's ledger row (a
+    later real run still owes the operator the ping)."""
+    from dataclasses import replace
+
+    cfg = replace(config, dry_run=True)
+    st = State(cfg.state_db)
+    w, gh, al = watcher(cfg, make_pr(), [], state=st)
+    pr = make_pr()
+    session = _record(w, pr, 1)  # a real run recorded this spawn earlier
+    _live(al, session, status="busy")
+    _backdate(st, PAST_FLOOR)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert gh.comments == []
+    assert not st.pinged(f"{OWNER}/{REPO}", NUMBER, stalled_kind(session))
+    assert al.enqueued == []
+
+
+def test_failed_ping_comment_retries_next_poll(config):
+    """The ping is the operator's only signal for the episode: the ledger row
+    lands only after the comment posts, so a transient failure retries."""
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    _live(al, al.enqueued[0]["session"], status="busy")
+    _backdate(st, PAST_FLOOR)
+
+    calls = []
+
+    def flaky(owner, repo, number, body):
+        calls.append(body)
+        if len(calls) == 1:
+            raise CommandError(["gh", "api"], 1, "boom")
+
+    gh.comment = flaky
+    w.evaluate(OWNER, REPO, NUMBER)  # ping fails -> episode not recorded
+    w.evaluate(OWNER, REPO, NUMBER)  # retried and lands
+    w.evaluate(OWNER, REPO, NUMBER)  # now deduped
+
+    assert len(calls) == 2
 
 
 # -- run_forever ------------------------------------------------------------

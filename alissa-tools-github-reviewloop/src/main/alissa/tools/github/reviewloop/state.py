@@ -44,6 +44,14 @@ CREATE TABLE IF NOT EXISTS reaps (
     session   TEXT    NOT NULL PRIMARY KEY,
     reaped_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pings (
+    repo      TEXT    NOT NULL,
+    number    INTEGER NOT NULL,
+    kind      TEXT    NOT NULL,
+    pinged_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, number, kind)
+);
 """
 
 
@@ -165,6 +173,32 @@ class State:
         self._db.execute(
             "INSERT OR REPLACE INTO reaps (session, reaped_at) VALUES (?,?)",
             (session, int(time.time())),
+        )
+        self._db.commit()
+
+    def pinged(self, repo: str, number: int, kind: str) -> bool:
+        """Whether this KIND of operator ping already went out for the PR.
+
+        Kind is free-form TEXT (devloop's escalation-kind pattern): a caller
+        narrows a kind's dedupe scope by folding identity into the string --
+        e.g. one stalled ping per deferral episode, "stalled:<session>" (see
+        loop.stalled_kind). Kept apart from `escalations`, whose key is
+        (repo, number, head_sha) and whose rows page terminal states.
+        """
+        row = self._db.execute(
+            "SELECT 1 FROM pings WHERE repo=? AND number=? AND kind=?",
+            (repo, number, kind),
+        ).fetchone()
+        return row is not None
+
+    def record_ping(self, repo: str, number: int, kind: str) -> None:
+        """Idempotent per kind: OR IGNORE keeps the FIRST ping's timestamp,
+        so `pinged_at` is an audit field for when the episode was first
+        raised, not the most recent re-raise."""
+        self._db.execute(
+            "INSERT OR IGNORE INTO pings (repo, number, kind, pinged_at) "
+            "VALUES (?,?,?,?)",
+            (repo, number, kind, int(time.time())),
         )
         self._db.commit()
 

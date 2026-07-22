@@ -27,8 +27,24 @@ from .state import State
 log = logging.getLogger(__name__)
 
 # A reviewer session that has not submitted after this long is presumed dead
-# (skill failure mode: "reviewer session stalls"). The round is re-enqueued.
+# (skill failure mode: "reviewer session stalls"). The round is re-enqueued --
+# but only with a second signal agreeing: the timer alone cannot tell a dead
+# session from a slow one, and a timer-only re-enqueue double-spends the round
+# (two sessions review it, both submit -- observed live twice: double round-2
+# approves on devloop's PR #11, double approves on this repo's PR #19). See
+# _defer_stale_round for the liveness signal.
 STALE_ROUND_SECONDS = 90 * 60
+
+# The floor under the liveness deferral: a live session defers the stale
+# respawn indefinitely -- correct for a genuinely slow round, silent forever
+# for a session that is wedged but still registers tmux activity. Once the
+# newest spawn's age reaches this multiple of STALE_ROUND_SECONDS, the loop
+# posts one "stalled" operator comment per deferral episode (stalled_kind)
+# and keeps deferring. 2 means the deferral itself has lasted a full extra
+# stale window beyond the point the timer first fired -- long enough that a
+# healthy round has almost always submitted by then, early enough that a
+# wedged one surfaces the same day.
+STALLED_DEFER_MULTIPLE = 2
 
 # The sweep only reaps a session that has been idle AND quiet this long. The
 # GitHub review count increments the moment a review is submitted, but the
@@ -95,6 +111,38 @@ ESCALATION_COMMENT = (
     "fresh cap, or park it).\n\n"
     "Last verdict: `{last_state}` at `{sha}`."
 )
+
+STALLED_COMMENT = (
+    "**Review round stalled?** — round {round} has been in flight {minutes} min "
+    "(stale window: {stale} min), but its reviewer session `{session}` still "
+    "shows signs of life, so the daemon keeps deferring the respawn — "
+    "respawning over a live session double-spends the round: two reviewers "
+    "work it, both submit. Is that session actually making progress? Operator "
+    "options: inspect it (`alissa tmux ls`) and, if it is wedged, kill it "
+    "(`alissa tmux kill {session}`) so the respawn proceeds next poll, or "
+    "finish the round by hand."
+)
+
+# The ping-ledger kind prefix for the stalled-deferral operator ping. Unlike
+# the cap-out escalation (terminal per head), a stall can recur, so the kind
+# is narrowed per episode -- see stalled_kind.
+ESCALATION_STALLED = "stalled"
+
+
+def stalled_kind(session: str) -> str:
+    """The ping-ledger kind that dedupes ONE deferral episode's operator ping.
+
+    Devloop's stalled_kind reasoning, transposed: a stall can recur -- every
+    spawn of every round can wedge mid-flight, and episode k's ping must not
+    silence episode k+1's. Keyed on the bare kind (or even on the round), the
+    re-enqueue of a round that wedges AGAIN would defer silently forever. The
+    session name already IS the episode identity -- nonce-unique per spawn
+    (see session_name) -- so it folds into the key. Delivery contract: the
+    ledger row lands only AFTER the comment posts (see _escalate_stalled), so
+    a transient comment failure retries next poll and the ping lands exactly
+    once per episode.
+    """
+    return f"{ESCALATION_STALLED}:{session}"
 
 
 class Action(str, Enum):
@@ -192,15 +240,83 @@ class ReviewWatcher:
         if age is not None and age < STALE_ROUND_SECONDS:
             return Decision(Action.IN_FLIGHT, f"round {round_} enqueued {int(age)}s ago", round_)
         if age is not None:
+            deferred = self._defer_stale_round(pr, round_, age)
+            if deferred is not None:
+                return deferred
             log.warning(
                 "%s round %d has been in flight %.0f min with no submitted review "
-                "— re-enqueuing (reviewer session presumed stalled)",
+                "and its session is gone or finished — re-enqueuing (reviewer "
+                "session presumed dead)",
                 pr.slug,
                 round_,
                 age / 60,
             )
 
         return self._spawn(pr, round_, task)
+
+    def _defer_stale_round(self, pr: PullRequest, round_: int, age: float) -> Decision | None:
+        """The liveness signal under the stale timer: a deferral, or None to
+        respawn.
+
+        Staleness needs TWO signals, not one: the ledger timer says the
+        newest spawn is old, but elapsed time alone cannot tell a dead
+        session from a slow one -- a thorough round can outlast
+        STALE_ROUND_SECONDS, and a timer-only re-enqueue respawns a reviewer
+        over the still-working first one; two sessions review the same
+        round and both submit. So before respawning, consult external
+        evidence of life: the round's recorded session in the live list
+        (the reap sweep's own probe). Busy, or idle without a real quiet
+        period (mid-close-out between turns; see REAP_QUIET_SECONDS) -> the
+        round is alive, defer with a reason. Gone, or idle-finished -> dead,
+        respawn (the sweep separately handles any corpse). An unprobeable
+        live list defers too: respawning on missing evidence is exactly the
+        double-spend, and the probe retries next poll.
+
+        The deferral is floored, not unbounded: past STALLED_DEFER_MULTIPLE
+        stale windows with the session still alive, one operator ping per
+        deferral episode (stalled_kind) -- then keep deferring. This method
+        never respawns over a live session; only the operator killing the
+        session (or it finishing/dying) unblocks the respawn.
+        """
+        row = self.state.get_spawn(pr.full_name, pr.number, round_)
+        if row is None:  # age came from this row; belt and braces
+            return None
+        session = row["session"]
+        try:
+            live = {s.name: s for s in self.alissa.list_review_sessions()}
+        except CommandError as exc:
+            log.warning(
+                "%s round %d is stale but the session list is unavailable (%s) "
+                "— deferring the respawn rather than risking a double-spawned "
+                "round; the probe retries next poll",
+                pr.slug,
+                round_,
+                exc,
+            )
+            return Decision(
+                Action.IN_FLIGHT,
+                f"round {round_} is stale but liveness is unprobeable — deferring",
+                round_,
+            )
+
+        ses = live.get(session)
+        if ses is None:
+            return None  # session gone -> presumed dead -> respawn
+        if ses.is_idle and time.time() - ses.last_activity >= REAP_QUIET_SECONDS:
+            return None  # idle-finished: it died without submitting -> respawn
+
+        if (
+            age >= STALLED_DEFER_MULTIPLE * STALE_ROUND_SECONDS
+            and not self.state.pinged(pr.full_name, pr.number, stalled_kind(session))
+        ):
+            self._escalate_stalled(pr, round_, session, age)
+        return Decision(
+            Action.IN_FLIGHT,
+            f"round {round_} is stale ({int(age / 60)} min) but session "
+            f"{session} is still {'active' if ses.is_idle else 'busy'} — not "
+            f"respawning over a live reviewer",
+            round_,
+        )
 
     def _convergence_reason(
         self, my_reviews: list[Review], task: Task | None, head_sha: str
@@ -504,6 +620,51 @@ class ReviewWatcher:
             )
 
         return warnings
+
+    def _escalate_stalled(
+        self, pr: PullRequest, round_: int, session: str, age: float
+    ) -> None:
+        """Operator ping when the liveness deferral itself runs long: the
+        session showing life is the only thing holding the respawn back, so
+        a human must check whether it is progressing or wedged. Posted once
+        per deferral EPISODE (the ping ledger row is keyed
+        stalled_kind(session); a re-enqueued round that stalls again is a
+        new session, so it pings again), and the row is recorded only AFTER
+        the comment posts: this ping is the operator's only signal for the
+        episode, so a transient comment failure must retry next poll --
+        exactly-once delivered, unlike the cap-out page (a terminal state,
+        recorded despite failure). The decision stays a deferral either way
+        -- this comments, it never respawns."""
+        body = STALLED_COMMENT.format(
+            round=round_,
+            minutes=int(age / 60),
+            stale=STALE_ROUND_SECONDS // 60,
+            session=session,
+        )
+        log.warning(
+            "STALLED %s round %d has been deferred %.0f min behind live session "
+            "%s — escalating to operator (once per episode)",
+            pr.slug,
+            round_,
+            age / 60,
+            session,
+        )
+
+        if self.config.dry_run:
+            log.info("[dry-run] would comment on %s:\n%s", pr.slug, body)
+            return
+
+        try:
+            self.github.comment(pr.owner, pr.repo, pr.number, body)
+        except CommandError as exc:
+            log.error(
+                "could not post the stalled-round comment on %s: %s — not "
+                "recording the episode; the ping retries next poll",
+                pr.slug,
+                exc,
+            )
+            return
+        self.state.record_ping(pr.full_name, pr.number, stalled_kind(session))
 
     def _escalate(self, pr: PullRequest, last_state: str, rounds: int) -> None:
         body = ESCALATION_COMMENT.format(
