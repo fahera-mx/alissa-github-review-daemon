@@ -17,8 +17,15 @@ from alissa.tools.github.reviewloop.config import (
     Config,
     resolve_config_path,
 )
+from alissa.tools.github.reviewloop.alissa import ManagedSession
 from alissa.tools.github.reviewloop.ghclient import GitHub, IdentityMismatch, PullRequest, Review
-from alissa.tools.github.reviewloop.loop import STALE_ROUND_SECONDS, Action, ReviewWatcher, session_name
+from alissa.tools.github.reviewloop.loop import (
+    REAP_QUIET_SECONDS,
+    STALE_ROUND_SECONDS,
+    Action,
+    ReviewWatcher,
+    session_name,
+)
 from alissa.tools.github.reviewloop.state import State
 
 OWNER, REPO, NUMBER = "acme", "widgets", 7
@@ -31,8 +38,11 @@ class FakeGitHub:
         self._pr = pr
         self._reviews = reviews
         self.comments: list[str] = []
+        self.requests = [(OWNER, REPO, NUMBER)]
+        self.pr_fetches = 0
 
     def pull_request(self, owner, repo, number):
+        self.pr_fetches += 1
         return self._pr
 
     def my_reviews(self, owner, repo, number):
@@ -46,7 +56,9 @@ class FakeGitHub:
         self.comments.append(body)
 
     def review_requests(self, repos=()):
-        return [(OWNER, REPO, NUMBER)]
+        # The starved case the sweep exists for is a PR ABSENT from this
+        # search; sweep tests empty it out.
+        return list(self.requests)
 
 
 class FakeAlissa:
@@ -58,6 +70,7 @@ class FakeAlissa:
         self.added: list[tuple] = []
         self.killed: list[str] = []
         self.on_add = None  # optional side effect: actually create the hub
+        self.sessions: list = []  # live ManagedSessions, as `alissa tmux ls` sees them
 
     def find_review_task(self, owner, repo, number):
         return self.task
@@ -71,8 +84,13 @@ class FakeAlissa:
     def enqueue_reviewer(self, **kwargs):
         self.enqueued.append(kwargs)
 
-    def kill_session(self, session, *, dry_run=False):
+    def list_review_sessions(self):
+        return [s for s in self.sessions if s.name.startswith("review-")]
+
+    def kill_session(self, session):
         self.killed.append(session)
+        # A killed session drops off the live list, like real tmux.
+        self.sessions = [s for s in self.sessions if s.name != session]
 
     def add_repo_to_workspace(self, owner, repo, workspace_root, *, dry_run=False):
         self.added.append((owner, repo, workspace_root))
@@ -90,7 +108,7 @@ class FakeTask:
     is_open = True
 
 
-def make_pr(*, draft=False, author="teammate", sha="abc123") -> PullRequest:
+def make_pr(*, draft=False, author="teammate", sha="abc123", state="open", merged=False) -> PullRequest:
     return PullRequest(
         owner=OWNER,
         repo=REPO,
@@ -100,6 +118,8 @@ def make_pr(*, draft=False, author="teammate", sha="abc123") -> PullRequest:
         head_sha=sha,
         draft=draft,
         url=f"https://github.com/{SLUG}/pull/{NUMBER}",
+        state=state,
+        merged=merged,
     )
 
 
@@ -951,65 +971,365 @@ def test_task_without_a_number_is_skipped(monkeypatch):
     assert alissa_mod.Alissa().find_review_task(OWNER, REPO, NUMBER) is None
 
 
-# -- reaping finished sessions (backstop) ----------------------------------
+# -- the reap sweep (search-independent backstop) ---------------------------
 
-def _record(w, pr, round_):
+def _record(w, pr, round_, task_ref="TASK-500"):
     """Record a spawn and return the (now nonce'd, unique) session name it used."""
     name = session_name(pr, round_)
     w.state.record_spawn(
         repo=f"{OWNER}/{REPO}", number=NUMBER, round_=round_, head_sha="abc123",
-        session=name, task_ref="TASK-9",
+        session=name, task_ref=task_ref,
     )
     return name
 
 
-def test_reaps_sessions_of_completed_rounds(config):
+def _live(al, name, status="idle", last_activity=0.0):
+    # last_activity=0 means "quiet for ages" — past REAP_QUIET_SECONDS.
+    al.sessions.append(
+        ManagedSession(name=name, status=status, last_activity=last_activity)
+    )
+
+
+def test_sweep_reaps_converged_pr_absent_from_the_search(config):
+    """THE starved case. Submitting a review CLEARS the review request, so a
+    finished round's PR vanishes from the review-requested:@me search at
+    exactly the moment its session becomes reapable — a reap living inside
+    the search-fed evaluate() path is unreachable then. poll_once() must
+    reap it with the search returning nothing at all."""
     pr = make_pr()
-    # two substantive reviews landed → rounds 1 and 2 are done
+    w, gh, al = watcher(config, pr, [review("APPROVED")])
+    gh.requests = []  # approved → the pending request is gone
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    w.poll_once()
+
+    assert al.killed == [s1]
+    assert w.state.is_reaped(s1)
+
+
+def test_sweep_reaps_the_terminal_approved_round(config):
+    """An approved round is terminal: the loop converged, no re-request will
+    ever surface this PR again, so nothing but the sweep can free the slot."""
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review("APPROVED")], verdict="approve")
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    results = w.poll_once()
+
+    assert al.killed == [s1]
+    assert [d.action for _, d in results] == [Action.CONVERGED]
+
+
+def test_sweep_reaps_sessions_of_closed_or_merged_prs(config):
+    # Closed mid-round: no review was ever submitted, but the PR is over.
+    pr = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(config, pr, [])
+    gh.requests = []
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    w.poll_once()
+
+    assert al.killed == [s1]
+
+
+def test_sweep_reaps_every_completed_round(config):
+    pr = make_pr()
+    # two verdict envelopes on the task → rounds 1 and 2 are done
     reviews = [review(), review(at="2026-07-18T11:00:00Z")]
     w, _, al = watcher(config, pr, reviews)
     s1 = _record(w, pr, 1)
     s2 = _record(w, pr, 2)
+    _live(al, s1)
+    _live(al, s2)
 
-    w.evaluate(OWNER, REPO, NUMBER)
+    w.sweep_sessions()
 
     assert al.killed == [s1, s2]
     assert w.state.is_reaped(s1)
     assert w.state.is_reaped(s2)
 
 
-def test_reap_is_idempotent_across_polls(config):
+def test_sweep_spares_the_in_flight_round(config):
     pr = make_pr()
-    w, _, al = watcher(config, pr, [review()])  # one round done
-    s1 = _record(w, pr, 1)
-
-    w.evaluate(OWNER, REPO, NUMBER)
-    w.evaluate(OWNER, REPO, NUMBER)  # second poll must not kill it again
-
-    assert al.killed == [s1]
-
-
-def test_reap_leaves_the_in_flight_round_alone(config):
-    pr = make_pr()
-    # zero reviews yet: round 1 is in flight, not done → not reaped
+    # zero completed rounds: round 1 is in flight, not done → not reaped
     w, _, al = watcher(config, pr, [])
     s1 = _record(w, pr, 1)
+    _live(al, s1)
 
-    w.evaluate(OWNER, REPO, NUMBER)
+    w.sweep_sessions()
 
     assert al.killed == []
     assert not w.state.is_reaped(s1)
 
 
-def test_reap_skipped_in_dry_run(config):
+def test_sweep_never_yanks_a_busy_session(config):
+    # Round 1's review has landed, but the session is still busy (recording
+    # evidence, moving its task) — spare it until the worker reports idle.
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1, status="busy")
+
+    w.sweep_sessions()
+
+    assert al.killed == []
+
+
+def test_sweep_spares_sessions_it_did_not_spawn(config):
+    # A review-* session with no ledger row belongs to another workspace's
+    # daemon (or a human) — not ours to judge.
+    w, _, al = watcher(config, make_pr(), [review()])
+    _live(al, "review-widgets-pr9-r1-abc123")
+
+    w.sweep_sessions()
+
+    assert al.killed == []
+
+
+def test_sweep_dry_run_logs_only(config):
     from dataclasses import replace
     pr = make_pr()
     w, _, al = watcher(replace(config, dry_run=True), pr, [review()])
-    _record(w, pr, 1)
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
 
-    w.evaluate(OWNER, REPO, NUMBER)
+    w.sweep_sessions()
 
     assert al.killed == []
+    assert not w.state.is_reaped(s1)
+    assert [s.name for s in al.sessions] == [s1], "dry-run must leave the session live"
+
+
+def test_sweep_is_idempotent_across_polls(config):
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    w.sweep_sessions()
+    w.sweep_sessions()  # s1 is gone from the live list now — no second kill
+
+    assert al.killed == [s1]
+
+
+def test_sweep_survives_a_session_list_failure(config):
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    w, _, al = watcher(config, make_pr(), [review()])
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no tmux server")
+
+    al.list_review_sessions = boom
+    w.sweep_sessions()  # must not raise — retried next poll
+
+    assert al.killed == []
+
+
+def test_sweep_spares_when_github_is_undecidable(config):
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    def boom(owner, repo, number):
+        raise CommandError(["gh", "api"], 1, "boom")
+
+    gh.pull_request = boom
+    w.sweep_sessions()
+
+    assert al.killed == []
+    assert not w.state.is_reaped(s1)
+
+
+def test_sweep_reaps_both_sessions_of_a_twice_spawned_round(config):
+    """A stalled round gets re-enqueued with a fresh session name. The ledger
+    must keep BOTH spawns (keyed by session, not round) — with the old
+    (repo, number, round) key the re-spawn overwrote the row and the original
+    still-live session was spared forever as 'not ours'."""
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])  # round 1 is done
+    s_old = _record(w, pr, 1)
+    s_new = _record(w, pr, 1)  # the re-enqueue of the same round
+    _live(al, s_old)
+    _live(al, s_new)
+
+    w.sweep_sessions()
+
+    assert sorted(al.killed) == sorted([s_old, s_new])
+    assert w.state.is_reaped(s_old) and w.state.is_reaped(s_new)
+
+
+def test_old_round_keyed_ledger_is_migrated_on_open(tmp_path):
+    """Deployed daemons carry a state.db keyed by (repo, number, round); on
+    open it must be re-keyed by session with every row preserved, and a
+    second spawn of the same round must then be recordable."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE spawns (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, round INTEGER NOT NULL,
+            head_sha TEXT NOT NULL, session TEXT NOT NULL, task_ref TEXT,
+            spawned_at INTEGER NOT NULL, PRIMARY KEY (repo, number, round)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO spawns VALUES (?,?,?,?,?,?,?)",
+        (SLUG, NUMBER, 1, "abc123", "review-widgets-pr7-r1-old123", "TASK-500", 1000),
+    )
+    conn.commit()
+    conn.close()
+
+    st = State(db)
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-old123") is not None
+    st.record_spawn(
+        repo=SLUG, number=NUMBER, round_=1, head_sha="abc123",
+        session="review-widgets-pr7-r1-new456", task_ref="TASK-500",
+    )
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-old123") is not None
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-new456") is not None
+    # get_spawn ages the NEWEST attempt, matching the in-flight semantics.
+    assert st.get_spawn(SLUG, NUMBER, 1)["session"] == "review-widgets-pr7-r1-new456"
+
+
+def test_sweep_waits_out_recent_activity(config):
+    """The GitHub review count increments before the reviewer finishes its
+    close-out (CR6 envelope, task move), and a claude session between turns
+    reports 'idle' — so an idle-but-recently-active session is spared until
+    it has been quiet for REAP_QUIET_SECONDS."""
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1, last_activity=time.time())  # just did something
+
+    w.sweep_sessions()
+    assert al.killed == []
+
+    al.sessions = []
+    _live(al, s1, last_activity=time.time() - REAP_QUIET_SECONDS * 2)  # long quiet
+    w.sweep_sessions()
+    assert al.killed == [s1]
+
+
+def test_sweep_counts_rounds_via_the_ledger_task_ref(config):
+    """The sweep reads the task ref off the spawn row, not find_review_task:
+    the live lookup fetches the whole task list, and its open-status filter
+    drops a validated review task back onto the GitHub-count fallback."""
+    pr = make_pr()
+    # find_review_task would say None (task validated/gone), GitHub shows no
+    # reviews — but the envelope on the ledger-referenced task closed round 1.
+    w, _, al = watcher(config, pr, [], task=None, verdict_count=1)
+    s1 = _record(w, pr, 1, task_ref="TASK-500")
+    _live(al, s1)
+
+    w.sweep_sessions()
+
+    assert al.killed == [s1]
+
+
+def test_sweep_fetches_each_pr_once_even_across_task_refs(config):
+    """The docstring promises one PR fetch per distinct PR. Two live sessions
+    of one PR whose rows disagree on task_ref (a pre-task round-1 spawn next
+    to a later ref-carrying one) must share the fetch, even though the round
+    count is keyed on the full (repo, number, task_ref) triple."""
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()], verdict_count=1)
+    s1 = _record(w, pr, 1, task_ref=None)
+    s2 = _record(w, pr, 2, task_ref="TASK-500")  # round 2 in flight (2 > 1)
+    _live(al, s1)
+    _live(al, s2)
+
+    w.sweep_sessions()
+
+    assert gh.pr_fetches == 1
+    assert al.killed == [s1]
+
+
+def test_interrupted_migration_leaves_the_old_ledger_migratable(tmp_path):
+    """The migration is one transaction: if any statement fails, the
+    round-keyed table must come back untouched (still detected as stale) and
+    a retry must carry every row across — never a committed empty `spawns`
+    with the rows stranded in spawns_v0."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE spawns (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, round INTEGER NOT NULL,
+            head_sha TEXT NOT NULL, session TEXT NOT NULL, task_ref TEXT,
+            spawned_at INTEGER NOT NULL, PRIMARY KEY (repo, number, round)
+        );
+        CREATE TABLE spawns_v0 (blocker INTEGER);  -- makes the RENAME fail
+        """
+    )
+    conn.execute(
+        "INSERT INTO spawns VALUES (?,?,?,?,?,?,?)",
+        (SLUG, NUMBER, 1, "abc123", "review-widgets-pr7-r1-old123", "TASK-500", 1000),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        State(db)
+
+    # The failure rolled back: the old table is intact and still stale.
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("SELECT COUNT(*) FROM spawns").fetchone()[0] == 1
+    pk = [r["name"] for r in conn.execute("PRAGMA table_info(spawns)") if r["pk"]]
+    assert pk == ["repo", "number", "round"]
+    conn.execute("DROP TABLE spawns_v0")  # clear the obstruction
+    conn.commit()
+    conn.close()
+
+    st = State(db)  # the retry migrates for real
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-old123") is not None
+
+
+def test_sweep_falls_back_to_review_count_without_a_task_ref(config):
+    # Spawn recorded before any review task existed: the GitHub substantive-
+    # review count is the only signal left.
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()], task=None)
+    s1 = _record(w, pr, 1, task_ref=None)
+    _live(al, s1)
+
+    w.sweep_sessions()
+
+    assert al.killed == [s1]
+
+
+# -- run_forever ------------------------------------------------------------
+
+def test_run_forever_exits_cleanly_on_interrupt_during_sleep(config, monkeypatch):
+    """The dominant real case: with a 60s poll interval (up to 900s backing
+    off) the loop spends nearly all its wall-clock inside time.sleep, so
+    Ctrl-C almost always lands there — it must hit the same clean-exit path,
+    not traceback out of run_forever."""
+    from alissa.tools.github.reviewloop import loop as loop_mod
+
+    w, _, _ = watcher(config, make_pr(), [])
+    polls = []
+    w.poll_once = lambda: polls.append(1)
+
+    def interrupt(seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(loop_mod.time, "sleep", interrupt)
+    w.run_forever()  # must return cleanly, not propagate KeyboardInterrupt
+
+    assert polls == [1], "the interrupt landed in the sleep after one poll"
 
 
 # -- round number from verdict envelopes, not GitHub body-presence ----------

@@ -28,6 +28,9 @@ class PullRequest:
     head_sha: str
     draft: bool
     url: str
+    # "open" or "closed"; merged PRs report state "closed" AND merged True.
+    state: str = "open"
+    merged: bool = False
 
     @property
     def full_name(self) -> str:
@@ -36,6 +39,11 @@ class PullRequest:
     @property
     def slug(self) -> str:
         return f"{self.owner}/{self.repo}#{self.number}"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Closed or merged: no round can ever be owed on this PR again."""
+        return self.merged or self.state != "open"
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,8 @@ class GitHub:
             head_sha=(data.get("head") or {}).get("sha", ""),
             draft=bool(data.get("draft")),
             url=data.get("html_url", ""),
+            state=data.get("state") or "open",
+            merged=bool(data.get("merged")),
         )
 
     def reviews(self, owner: str, repo: str, number: int) -> list[Review]:
