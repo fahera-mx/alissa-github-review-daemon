@@ -44,6 +44,21 @@ class Task:
         return self.status in OPEN_STATUSES
 
 
+# The namespace loop.session_name() spawns reviewers into; the reap sweep only
+# ever considers sessions under it.
+REVIEW_SESSION_PREFIX = "review-"
+
+
+@dataclass(frozen=True)
+class ManagedSession:
+    name: str
+    status: str  # the worker's view: "idle", "busy", ...
+
+    @property
+    def is_idle(self) -> bool:
+        return self.status == "idle"
+
+
 def _title_pattern(owner: str, repo: str, number: int) -> re.Pattern[str]:
     """CR2 title convention: `Review PR <org>/<repo>#<n> (TASK-<origin>)`."""
     return re.compile(
@@ -236,6 +251,28 @@ class Alissa:
                 timeout=30, check=False)
         except CommandError:  # pragma: no cover - defence in depth
             log.warning("could not set respawn off for %s", session)
+
+    def list_review_sessions(self) -> list[ManagedSession]:
+        """The live `review-*` managed sessions, from `alissa tmux ls`.
+
+        The reap sweep's starting point. Unlike the review-requested search,
+        the live session list cannot lose a finished session, so every reap
+        candidate is reachable from here. `--live` because a session that is
+        already gone (self-killed, or killed by an operator) holds no worker
+        slot and needs no reap. Raises CommandError upward -- the sweep skips
+        this pass and tries again next poll.
+        """
+        data = run_json(["alissa", "tmux", "ls", "--json", "--live"], timeout=60) or []
+        sessions = []
+        for row in data if isinstance(data, list) else []:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("name")
+            if isinstance(name, str) and name.startswith(REVIEW_SESSION_PREFIX):
+                sessions.append(
+                    ManagedSession(name=name, status=str(row.get("status") or ""))
+                )
+        return sessions
 
     def kill_session(self, session: str, *, dry_run: bool = False) -> None:
         """Kill a finished reviewer's managed session to free its worker slot.

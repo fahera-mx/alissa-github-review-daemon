@@ -2,8 +2,11 @@
 
 Deliberately thin: GitHub is the source of truth for how many rounds have run
 (one submitted review per round). This table exists only to stop the daemon
-double-spawning a reviewer while a round is still in flight, and to remember
-that a cap-out was already escalated.
+double-spawning a reviewer while a round is still in flight, to map a live
+session name back to the round it was spawned for (so the reap sweep can tell
+a finished round's session from an in-flight one), and to remember that a
+cap-out was already escalated. The ledger tolerates sessions dying or being
+killed behind its back: a reap record is bookkeeping, never a precondition.
 """
 
 from __future__ import annotations
@@ -61,6 +64,18 @@ class State:
         return self._db.execute(
             "SELECT * FROM spawns WHERE repo=? AND number=? AND round=?",
             (repo, number, round_),
+        ).fetchone()
+
+    def find_spawn_by_session(self, session: str) -> sqlite3.Row | None:
+        """The spawn a live session name belongs to, or None if it is not ours.
+
+        Session names carry a random nonce, so a name maps to at most one
+        spawn. The reap sweep starts from live tmux state and uses this to
+        recover (repo, number, round); a session with no row (another
+        workspace's daemon, or a hand-started one) is not ours to judge.
+        """
+        return self._db.execute(
+            "SELECT * FROM spawns WHERE session=?", (session,)
         ).fetchone()
 
     def spawn_age(self, repo: str, number: int, round_: int) -> float | None:

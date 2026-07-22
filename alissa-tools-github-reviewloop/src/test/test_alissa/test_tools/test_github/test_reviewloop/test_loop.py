@@ -17,6 +17,7 @@ from alissa.tools.github.reviewloop.config import (
     Config,
     resolve_config_path,
 )
+from alissa.tools.github.reviewloop.alissa import ManagedSession
 from alissa.tools.github.reviewloop.ghclient import GitHub, IdentityMismatch, PullRequest, Review
 from alissa.tools.github.reviewloop.loop import STALE_ROUND_SECONDS, Action, ReviewWatcher, session_name
 from alissa.tools.github.reviewloop.state import State
@@ -31,6 +32,7 @@ class FakeGitHub:
         self._pr = pr
         self._reviews = reviews
         self.comments: list[str] = []
+        self.requests = [(OWNER, REPO, NUMBER)]
 
     def pull_request(self, owner, repo, number):
         return self._pr
@@ -46,7 +48,9 @@ class FakeGitHub:
         self.comments.append(body)
 
     def review_requests(self, repos=()):
-        return [(OWNER, REPO, NUMBER)]
+        # The starved case the sweep exists for is a PR ABSENT from this
+        # search; sweep tests empty it out.
+        return list(self.requests)
 
 
 class FakeAlissa:
@@ -58,6 +62,7 @@ class FakeAlissa:
         self.added: list[tuple] = []
         self.killed: list[str] = []
         self.on_add = None  # optional side effect: actually create the hub
+        self.sessions: list = []  # live ManagedSessions, as `alissa tmux ls` sees them
 
     def find_review_task(self, owner, repo, number):
         return self.task
@@ -71,8 +76,13 @@ class FakeAlissa:
     def enqueue_reviewer(self, **kwargs):
         self.enqueued.append(kwargs)
 
+    def list_review_sessions(self):
+        return [s for s in self.sessions if s.name.startswith("review-")]
+
     def kill_session(self, session, *, dry_run=False):
         self.killed.append(session)
+        # A killed session drops off the live list, like real tmux.
+        self.sessions = [s for s in self.sessions if s.name != session]
 
     def add_repo_to_workspace(self, owner, repo, workspace_root, *, dry_run=False):
         self.added.append((owner, repo, workspace_root))
@@ -90,7 +100,7 @@ class FakeTask:
     is_open = True
 
 
-def make_pr(*, draft=False, author="teammate", sha="abc123") -> PullRequest:
+def make_pr(*, draft=False, author="teammate", sha="abc123", state="open", merged=False) -> PullRequest:
     return PullRequest(
         owner=OWNER,
         repo=REPO,
@@ -100,6 +110,8 @@ def make_pr(*, draft=False, author="teammate", sha="abc123") -> PullRequest:
         head_sha=sha,
         draft=draft,
         url=f"https://github.com/{SLUG}/pull/{NUMBER}",
+        state=state,
+        merged=merged,
     )
 
 
@@ -951,65 +963,199 @@ def test_task_without_a_number_is_skipped(monkeypatch):
     assert alissa_mod.Alissa().find_review_task(OWNER, REPO, NUMBER) is None
 
 
-# -- reaping finished sessions (backstop) ----------------------------------
+# -- the reap sweep (search-independent backstop) ---------------------------
 
-def _record(w, pr, round_):
+def _record(w, pr, round_, task_ref="TASK-500"):
     """Record a spawn and return the (now nonce'd, unique) session name it used."""
     name = session_name(pr, round_)
     w.state.record_spawn(
         repo=f"{OWNER}/{REPO}", number=NUMBER, round_=round_, head_sha="abc123",
-        session=name, task_ref="TASK-9",
+        session=name, task_ref=task_ref,
     )
     return name
 
 
-def test_reaps_sessions_of_completed_rounds(config):
+def _live(al, name, status="idle"):
+    al.sessions.append(ManagedSession(name=name, status=status))
+
+
+def test_sweep_reaps_converged_pr_absent_from_the_search(config):
+    """THE starved case. Submitting a review CLEARS the review request, so a
+    finished round's PR vanishes from the review-requested:@me search at
+    exactly the moment its session becomes reapable — a reap living inside
+    the search-fed evaluate() path is unreachable then. poll_once() must
+    reap it with the search returning nothing at all."""
     pr = make_pr()
-    # two substantive reviews landed → rounds 1 and 2 are done
+    w, gh, al = watcher(config, pr, [review("APPROVED")])
+    gh.requests = []  # approved → the pending request is gone
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    w.poll_once()
+
+    assert al.killed == [s1]
+    assert w.state.is_reaped(s1)
+
+
+def test_sweep_reaps_the_terminal_approved_round(config):
+    """An approved round is terminal: the loop converged, no re-request will
+    ever surface this PR again, so nothing but the sweep can free the slot."""
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review("APPROVED")], verdict="approve")
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    results = w.poll_once()
+
+    assert al.killed == [s1]
+    assert [d.action for _, d in results] == [Action.CONVERGED]
+
+
+def test_sweep_reaps_sessions_of_closed_or_merged_prs(config):
+    # Closed mid-round: no review was ever submitted, but the PR is over.
+    pr = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(config, pr, [])
+    gh.requests = []
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    w.poll_once()
+
+    assert al.killed == [s1]
+
+
+def test_sweep_reaps_every_completed_round(config):
+    pr = make_pr()
+    # two verdict envelopes on the task → rounds 1 and 2 are done
     reviews = [review(), review(at="2026-07-18T11:00:00Z")]
     w, _, al = watcher(config, pr, reviews)
     s1 = _record(w, pr, 1)
     s2 = _record(w, pr, 2)
+    _live(al, s1)
+    _live(al, s2)
 
-    w.evaluate(OWNER, REPO, NUMBER)
+    w.sweep_sessions()
 
     assert al.killed == [s1, s2]
     assert w.state.is_reaped(s1)
     assert w.state.is_reaped(s2)
 
 
-def test_reap_is_idempotent_across_polls(config):
+def test_sweep_spares_the_in_flight_round(config):
     pr = make_pr()
-    w, _, al = watcher(config, pr, [review()])  # one round done
-    s1 = _record(w, pr, 1)
-
-    w.evaluate(OWNER, REPO, NUMBER)
-    w.evaluate(OWNER, REPO, NUMBER)  # second poll must not kill it again
-
-    assert al.killed == [s1]
-
-
-def test_reap_leaves_the_in_flight_round_alone(config):
-    pr = make_pr()
-    # zero reviews yet: round 1 is in flight, not done → not reaped
+    # zero completed rounds: round 1 is in flight, not done → not reaped
     w, _, al = watcher(config, pr, [])
     s1 = _record(w, pr, 1)
+    _live(al, s1)
 
-    w.evaluate(OWNER, REPO, NUMBER)
+    w.sweep_sessions()
 
     assert al.killed == []
     assert not w.state.is_reaped(s1)
 
 
-def test_reap_skipped_in_dry_run(config):
+def test_sweep_never_yanks_a_busy_session(config):
+    # Round 1's review has landed, but the session is still busy (recording
+    # evidence, moving its task) — spare it until the worker reports idle.
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1, status="busy")
+
+    w.sweep_sessions()
+
+    assert al.killed == []
+
+
+def test_sweep_spares_sessions_it_did_not_spawn(config):
+    # A review-* session with no ledger row belongs to another workspace's
+    # daemon (or a human) — not ours to judge.
+    w, _, al = watcher(config, make_pr(), [review()])
+    _live(al, "review-widgets-pr9-r1-abc123")
+
+    w.sweep_sessions()
+
+    assert al.killed == []
+
+
+def test_sweep_dry_run_logs_only(config):
     from dataclasses import replace
     pr = make_pr()
     w, _, al = watcher(replace(config, dry_run=True), pr, [review()])
-    _record(w, pr, 1)
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
 
-    w.evaluate(OWNER, REPO, NUMBER)
+    w.sweep_sessions()
 
     assert al.killed == []
+    assert not w.state.is_reaped(s1)
+    assert [s.name for s in al.sessions] == [s1], "dry-run must leave the session live"
+
+
+def test_sweep_is_idempotent_across_polls(config):
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    w.sweep_sessions()
+    w.sweep_sessions()  # s1 is gone from the live list now — no second kill
+
+    assert al.killed == [s1]
+
+
+def test_sweep_survives_a_session_list_failure(config):
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    w, _, al = watcher(config, make_pr(), [review()])
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no tmux server")
+
+    al.list_review_sessions = boom
+    w.sweep_sessions()  # must not raise — retried next poll
+
+    assert al.killed == []
+
+
+def test_sweep_spares_when_github_is_undecidable(config):
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+
+    def boom(owner, repo, number):
+        raise CommandError(["gh", "api"], 1, "boom")
+
+    gh.pull_request = boom
+    w.sweep_sessions()
+
+    assert al.killed == []
+    assert not w.state.is_reaped(s1)
+
+
+# -- run_forever ------------------------------------------------------------
+
+def test_run_forever_exits_cleanly_on_interrupt_during_sleep(config, monkeypatch):
+    """The dominant real case: with a 60s poll interval (up to 900s backing
+    off) the loop spends nearly all its wall-clock inside time.sleep, so
+    Ctrl-C almost always lands there — it must hit the same clean-exit path,
+    not traceback out of run_forever."""
+    from alissa.tools.github.reviewloop import loop as loop_mod
+
+    w, _, _ = watcher(config, make_pr(), [])
+    polls = []
+    w.poll_once = lambda: polls.append(1)
+
+    def interrupt(seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(loop_mod.time, "sleep", interrupt)
+    w.run_forever()  # must return cleanly, not propagate KeyboardInterrupt
+
+    assert polls == [1], "the interrupt landed in the sleep after one poll"
 
 
 # -- round number from verdict envelopes, not GitHub body-presence ----------
