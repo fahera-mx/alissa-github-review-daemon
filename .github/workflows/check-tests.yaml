@@ -1,6 +1,11 @@
 name: Check Unit-Tests and Simple Coverage Report
 on: [pull_request]
 
+# Least privilege: these jobs only read the checkout (back-ported from the
+# devloop repo, review finding on its PR #11).
+permissions:
+  contents: read
+
 jobs:
   python-unit-testing:
     strategy:

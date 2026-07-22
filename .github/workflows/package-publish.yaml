@@ -1,9 +1,11 @@
 name: Python Package Publish
 
 # Publishing is irreversible: a version number, once on PyPI, can never be
-# reused even if the release is deleted. The version file is therefore the
-# release trigger -- merging a PR that does not bump it publishes nothing,
-# and twine's --skip-existing keeps a re-run from failing the workflow.
+# reused even if the release is deleted. ANY merged PR touching the dist
+# subtree (or this file) runs the full build and upload; what prevents a
+# duplicate release is twine's --skip-existing on the upload, which lets
+# PyPI reject versions it already has. To release, bump the version file and
+# merge; to merge without releasing, touch nothing under the dist subtree.
 
 on:
   pull_request:
@@ -14,6 +16,12 @@ on:
       - closed
     branches:
       - main
+
+# Least privilege: PyPI auth is TWINE_* env secrets, not the GitHub token, so
+# this job never needs write scope (back-ported from the devloop repo, review
+# finding on its PR #11).
+permissions:
+  contents: read
 
 jobs:
   python-publish:
@@ -46,5 +54,4 @@ jobs:
         env:
           TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-          GH_BRANCH: ${{ github.ref }}
         run: twine upload --verbose --skip-existing ${{ matrix.path }}/dist/*
