@@ -1,6 +1,11 @@
 name: Check Creation of Wheel Package
 on: [pull_request]
 
+# Least privilege: these jobs only read the checkout (back-ported from the
+# devloop repo, review finding on its PR #11).
+permissions:
+  contents: read
+
 jobs:
   python-wheel-check:
     strategy:
@@ -28,5 +33,5 @@ jobs:
         run: python -m pip install ${{ matrix.path }}/dist/*.whl
       - name: Execute Simple Command to Verify Installation
         run: |
-          python -c "from alissa.tools.github.reviewloop.version import version; print(version)"
+          python -c "from alissa.tools.github.reviewloop.version import version; assert version.value != '0.0.0', version; print(version)"
           alissa-reviewloop --help
