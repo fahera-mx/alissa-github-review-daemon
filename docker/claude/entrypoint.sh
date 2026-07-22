@@ -271,6 +271,24 @@ PY
 fi
 
 # -----------------------------------------------------------------------------
+# 3c. Materialize the worktree hubs the manifest declares.
+#
+# The manifest lists every allowlisted repo, but the hub directories
+# (bare clone + main/ worktree) don't exist until something creates them. The
+# daemon's on_missing_hub:add uses `alissa code workspace add`, which is
+# idempotent BY MANIFEST ENTRY -- for a repo already listed it no-ops, leaving an
+# empty folder and no main/, and the daemon then loops forever hub-ifying a hub
+# that never completes. `workspace sync` is the reconcile operation: it creates
+# the missing/half-built hubs (and fetches existing ones) to match the manifest.
+# Run it here (auth is wired, the manifest exists) so every hub is real before
+# the daemon polls -- exactly the manual `sync` an operator would otherwise run.
+if [ -f "${MANIFEST}" ]; then
+  log "syncing worktree hubs to the manifest (alissa code workspace sync)"
+  ( cd "${WORKSPACE_ROOT}" && alissa code workspace sync ) \
+    || log "WARN: workspace sync did not fully complete — the daemon will retry per-repo, but check for clone/auth errors above"
+fi
+
+# -----------------------------------------------------------------------------
 # 4. Start the worker, wait until it reports running.
 # -----------------------------------------------------------------------------
 mkdir -p "${TMUX_TMPDIR:-/home/alissa/.tmux}"

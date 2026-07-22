@@ -272,8 +272,13 @@ volumes:
    `gh auth setup-git`; `alissa auth login` (fatal if missing); check the claude
    credential (warn-only — the baked `agents.yaml` handles headless launch).
 2. Ensure a manifest + `reviewloop.config.json` exist (mount or generate).
-3. Start `alissa worker --daemon`, wait until it reports running (the daemon only
+3. **`alissa code workspace sync`** — materialize the worktree hubs the manifest
+   declares (create missing/half-built ones, fetch existing). Without this the
+   daemon's on-demand `alissa code workspace add` no-ops on a repo already listed
+   in the manifest, leaving an empty folder and looping forever hub-ifying a hub
+   that never completes.
+4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).
-4. Run `alissa-reviewloop` in the foreground; stop the worker on `SIGTERM`/`SIGINT`.
+5. Run `alissa-reviewloop` in the foreground; stop the worker on `SIGTERM`/`SIGINT`.
 
 `tini` is PID 1 to reap the tmux/node/claude child fan-out.
