@@ -79,7 +79,7 @@ class FakeAlissa:
     def list_review_sessions(self):
         return [s for s in self.sessions if s.name.startswith("review-")]
 
-    def kill_session(self, session, *, dry_run=False):
+    def kill_session(self, session):
         self.killed.append(session)
         # A killed session drops off the live list, like real tmux.
         self.sessions = [s for s in self.sessions if s.name != session]
@@ -975,8 +975,11 @@ def _record(w, pr, round_, task_ref="TASK-500"):
     return name
 
 
-def _live(al, name, status="idle"):
-    al.sessions.append(ManagedSession(name=name, status=status))
+def _live(al, name, status="idle", last_activity=0.0):
+    # last_activity=0 means "quiet for ages" — past REAP_QUIET_SECONDS.
+    al.sessions.append(
+        ManagedSession(name=name, status=status, last_activity=last_activity)
+    )
 
 
 def test_sweep_reaps_converged_pr_absent_from_the_search(config):
@@ -1134,6 +1137,108 @@ def test_sweep_spares_when_github_is_undecidable(config):
 
     assert al.killed == []
     assert not w.state.is_reaped(s1)
+
+
+def test_sweep_reaps_both_sessions_of_a_twice_spawned_round(config):
+    """A stalled round gets re-enqueued with a fresh session name. The ledger
+    must keep BOTH spawns (keyed by session, not round) — with the old
+    (repo, number, round) key the re-spawn overwrote the row and the original
+    still-live session was spared forever as 'not ours'."""
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])  # round 1 is done
+    s_old = _record(w, pr, 1)
+    s_new = _record(w, pr, 1)  # the re-enqueue of the same round
+    _live(al, s_old)
+    _live(al, s_new)
+
+    w.sweep_sessions()
+
+    assert sorted(al.killed) == sorted([s_old, s_new])
+    assert w.state.is_reaped(s_old) and w.state.is_reaped(s_new)
+
+
+def test_old_round_keyed_ledger_is_migrated_on_open(tmp_path):
+    """Deployed daemons carry a state.db keyed by (repo, number, round); on
+    open it must be re-keyed by session with every row preserved, and a
+    second spawn of the same round must then be recordable."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE spawns (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, round INTEGER NOT NULL,
+            head_sha TEXT NOT NULL, session TEXT NOT NULL, task_ref TEXT,
+            spawned_at INTEGER NOT NULL, PRIMARY KEY (repo, number, round)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO spawns VALUES (?,?,?,?,?,?,?)",
+        (SLUG, NUMBER, 1, "abc123", "review-widgets-pr7-r1-old123", "TASK-500", 1000),
+    )
+    conn.commit()
+    conn.close()
+
+    st = State(db)
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-old123") is not None
+    st.record_spawn(
+        repo=SLUG, number=NUMBER, round_=1, head_sha="abc123",
+        session="review-widgets-pr7-r1-new456", task_ref="TASK-500",
+    )
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-old123") is not None
+    assert st.find_spawn_by_session("review-widgets-pr7-r1-new456") is not None
+    # get_spawn ages the NEWEST attempt, matching the in-flight semantics.
+    assert st.get_spawn(SLUG, NUMBER, 1)["session"] == "review-widgets-pr7-r1-new456"
+
+
+def test_sweep_waits_out_recent_activity(config):
+    """The GitHub review count increments before the reviewer finishes its
+    close-out (CR6 envelope, task move), and a claude session between turns
+    reports 'idle' — so an idle-but-recently-active session is spared until
+    it has been quiet for REAP_QUIET_SECONDS."""
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1, last_activity=time.time())  # just did something
+
+    w.sweep_sessions()
+    assert al.killed == []
+
+    al.sessions = []
+    _live(al, s1, last_activity=time.time() - STALE_ROUND_SECONDS)  # long quiet
+    w.sweep_sessions()
+    assert al.killed == [s1]
+
+
+def test_sweep_counts_rounds_via_the_ledger_task_ref(config):
+    """The sweep reads the task ref off the spawn row, not find_review_task:
+    the live lookup fetches the whole task list, and its open-status filter
+    drops a validated review task back onto the GitHub-count fallback."""
+    pr = make_pr()
+    # find_review_task would say None (task validated/gone), GitHub shows no
+    # reviews — but the envelope on the ledger-referenced task closed round 1.
+    w, _, al = watcher(config, pr, [], task=None, verdict_count=1)
+    s1 = _record(w, pr, 1, task_ref="TASK-500")
+    _live(al, s1)
+
+    w.sweep_sessions()
+
+    assert al.killed == [s1]
+
+
+def test_sweep_falls_back_to_review_count_without_a_task_ref(config):
+    # Spawn recorded before any review task existed: the GitHub substantive-
+    # review count is the only signal left.
+    pr = make_pr()
+    w, _, al = watcher(config, pr, [review()], task=None)
+    s1 = _record(w, pr, 1, task_ref=None)
+    _live(al, s1)
+
+    w.sweep_sessions()
+
+    assert al.killed == [s1]
 
 
 # -- run_forever ------------------------------------------------------------

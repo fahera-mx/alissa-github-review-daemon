@@ -21,11 +21,12 @@ CREATE TABLE IF NOT EXISTS spawns (
     number     INTEGER NOT NULL,
     round      INTEGER NOT NULL,
     head_sha   TEXT    NOT NULL,
-    session    TEXT    NOT NULL,
+    session    TEXT    NOT NULL PRIMARY KEY,
     task_ref   TEXT,
-    spawned_at INTEGER NOT NULL,
-    PRIMARY KEY (repo, number, round)
+    spawned_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS spawns_by_round ON spawns (repo, number, round);
 
 CREATE TABLE IF NOT EXISTS escalations (
     repo         TEXT    NOT NULL,
@@ -48,8 +49,34 @@ class State:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(path))
         self._db.row_factory = sqlite3.Row
+        stale = self._spawns_keyed_by_round()
+        if stale:
+            self._db.execute("ALTER TABLE spawns RENAME TO spawns_v0")
         self._db.executescript(SCHEMA)
+        if stale:
+            self._db.execute(
+                "INSERT OR REPLACE INTO spawns "
+                "(repo, number, round, head_sha, session, task_ref, spawned_at) "
+                "SELECT repo, number, round, head_sha, session, task_ref, spawned_at "
+                "FROM spawns_v0"
+            )
+            self._db.execute("DROP TABLE spawns_v0")
         self._db.commit()
+
+    def _spawns_keyed_by_round(self) -> bool:
+        """True when `spawns` still has the pre-0.8 (repo, number, round) key.
+
+        That key made `record_spawn` overwrite the row when a stalled round
+        was re-enqueued, orphaning the original -- possibly still-live --
+        session so the reap sweep spared it forever as "not ours". The key is
+        now the session name (unique per spawn, thanks to the nonce). SQLite
+        cannot alter a primary key in place, so an old table is renamed and
+        copied over exactly once on open.
+        """
+        info = self._db.execute("PRAGMA table_info(spawns)").fetchall()
+        if not info:
+            return False  # fresh database, nothing to migrate
+        return [r["name"] for r in info if r["pk"]] != ["session"]
 
     def close(self) -> None:
         self._db.close()
@@ -61,8 +88,14 @@ class State:
         self.close()
 
     def get_spawn(self, repo: str, number: int, round_: int) -> sqlite3.Row | None:
+        """The NEWEST spawn recorded for this round, or None.
+
+        A stalled round can be re-enqueued, so one round may have several
+        spawns; aging and the in-flight check are about the latest attempt.
+        """
         return self._db.execute(
-            "SELECT * FROM spawns WHERE repo=? AND number=? AND round=?",
+            "SELECT * FROM spawns WHERE repo=? AND number=? AND round=? "
+            "ORDER BY spawned_at DESC, rowid DESC LIMIT 1",
             (repo, number, round_),
         ).fetchone()
 

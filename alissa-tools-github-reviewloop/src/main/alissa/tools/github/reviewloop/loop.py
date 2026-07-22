@@ -30,6 +30,14 @@ log = logging.getLogger(__name__)
 # (skill failure mode: "reviewer session stalls"). The round is re-enqueued.
 STALE_ROUND_SECONDS = 90 * 60
 
+# The sweep only reaps a session that has been idle AND quiet this long. The
+# GitHub review count increments the moment a review is submitted, but the
+# reviewer still has close-out work after that (CR6 envelope, task status) --
+# and a claude session parked at its prompt between turns reports "idle", so
+# idleness alone cannot distinguish "between turns" from "done". Recent tmux
+# activity can.
+REAP_QUIET_SECONDS = 5 * 60
+
 # The closing contract is spelled out in both directives (not just the skill)
 # because it is the reviewer's most-skipped step: on re-review, sessions produce
 # findings but never register the review on the PR, or stop without a verdict.
@@ -254,11 +262,17 @@ class ReviewWatcher:
         spawn ledger. It must stay search-independent: never move it (back)
         into the evaluate() path.
 
-        Every-poll is affordable: one `alissa tmux ls` when no review-*
-        session is live, plus one PR fetch per distinct PR with a live
-        session. Only individual sessions are ever killed (`alissa tmux
-        kill <name>`) -- never the server. Best-effort throughout: an
-        undecidable session is spared and looked at again next poll.
+        Every-poll cost, honestly: one `alissa tmux ls` when no review-*
+        session is live; otherwise, per distinct PR with a live idle quiet
+        session, one PR fetch plus exactly one of `alissa task get <ref>`
+        (the ledger row carries a task ref) or the reviews fetch (it does
+        not). The ledger ref is used deliberately instead of
+        find_review_task: that would fetch the actor's ENTIRE task list per
+        PR, and its open-status filter would drop a human-validated review
+        task back onto the racier GitHub-count fallback. Only individual
+        sessions are ever killed (`alissa tmux kill <name>`) -- never the
+        server. Best-effort throughout: an undecidable session is spared and
+        looked at again next poll.
         """
         try:
             sessions = self.alissa.list_review_sessions()
@@ -268,21 +282,26 @@ class ReviewWatcher:
 
         # Rounds completed per PR, resolved once per sweep (several rounds of
         # one PR can be live at once). None = undecidable this pass.
-        completed_cache: dict[tuple[str, int], float | None] = {}
+        completed_cache: dict[tuple[str, int, str | None], float | None] = {}
 
         for ses in sessions:
             if not ses.is_idle:
                 # A busy session is still doing something (reviewing, or
                 # closing out its round) -- never yank the slot from under it.
                 continue
+            if time.time() - ses.last_activity < REAP_QUIET_SECONDS:
+                # Idle but recently active: likely mid-close-out (the review
+                # is submitted before the envelope and task move land). Wait
+                # for a real quiet period; see REAP_QUIET_SECONDS.
+                continue
             row = self.state.find_spawn_by_session(ses.name)
             if row is None:
                 # Not in our ledger: another workspace's daemon (or a human)
                 # owns it. Not ours to judge.
                 continue
-            key = (row["repo"], row["number"])
+            key = (row["repo"], row["number"], row["task_ref"])
             if key not in completed_cache:
-                completed_cache[key] = self._completed_rounds(row["repo"], row["number"])
+                completed_cache[key] = self._completed_rounds(*key)
             completed = completed_cache[key]
             if completed is None or row["round"] > completed:
                 continue  # undecidable, or the round is still in flight
@@ -297,30 +316,38 @@ class ReviewWatcher:
             except Exception:  # pragma: no cover - defence in depth
                 log.exception("failed to reap session %s", ses.name)
                 continue
+            # Bookkeeping only -- deliberately never consulted before a kill.
+            # The live list is the authority; gating on the reaps table would
+            # spare any session killed behind the ledger's back.
             self.state.record_reap(ses.name)
             log.info(
                 "reaped finished reviewer session %s (round %d done)",
                 ses.name, row["round"],
             )
 
-    def _completed_rounds(self, repo_slug: str, number: int) -> float | None:
+    def _completed_rounds(
+        self, repo_slug: str, number: int, task_ref: str | None
+    ) -> float | None:
         """How many rounds of this PR are over, judged from GitHub/task state.
 
         A closed or merged PR terminates every round, so it reports infinity.
         Otherwise rounds completed = verdict envelopes on the review task (the
-        authoritative round record), falling back to the substantive-review
-        count when no task exists. None means "could not tell" -- the sweep
-        spares the session and retries next poll. RateLimited propagates so
-        run_forever backs off instead of hammering the API once per session.
+        authoritative round record), addressed by the task ref the ledger
+        captured at spawn time -- NOT find_review_task, which would fetch the
+        whole task list and whose open-status filter loses validated tasks.
+        The substantive-review count is the fallback only for spawns recorded
+        before any review task existed. None means "could not tell" -- the
+        sweep spares the session and retries next poll. RateLimited
+        propagates so run_forever backs off instead of hammering the API once
+        per session.
         """
         owner, _, repo = repo_slug.partition("/")
         try:
             pr = self.github.pull_request(owner, repo, number)
             if pr.is_terminal:
                 return float("inf")
-            task = self.alissa.find_review_task(owner, repo, number)
-            if task is not None:
-                return self.alissa.count_verdicts(task.ref)
+            if task_ref:
+                return self.alissa.count_verdicts(task_ref)
             return len(self.github.my_reviews(owner, repo, number))
         except RateLimited:
             raise

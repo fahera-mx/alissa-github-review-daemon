@@ -53,6 +53,10 @@ REVIEW_SESSION_PREFIX = "review-"
 class ManagedSession:
     name: str
     status: str  # the worker's view: "idle", "busy", ...
+    # Epoch seconds of the session's last tmux activity. 0 when the CLI did
+    # not report one -- treated as "long quiet", so a missing field can never
+    # indefinitely immunize a session against the sweep.
+    last_activity: float = 0.0
 
     @property
     def is_idle(self) -> bool:
@@ -269,20 +273,23 @@ class Alissa:
                 continue
             name = row.get("name")
             if isinstance(name, str) and name.startswith(REVIEW_SESSION_PREFIX):
+                last = row.get("lastActivity")
                 sessions.append(
-                    ManagedSession(name=name, status=str(row.get("status") or ""))
+                    ManagedSession(
+                        name=name,
+                        status=str(row.get("status") or ""),
+                        last_activity=float(last) if isinstance(last, (int, float)) else 0.0,
+                    )
                 )
         return sessions
 
-    def kill_session(self, session: str, *, dry_run: bool = False) -> None:
+    def kill_session(self, session: str) -> None:
         """Kill a finished reviewer's managed session to free its worker slot.
 
         Best-effort and idempotent-friendly: the session may already be gone (the
-        reviewer self-killed), so a non-zero exit is not an error here.
+        reviewer self-killed), so a non-zero exit is not an error here. Dry-run
+        is the caller's job (the sweep decides and logs before calling).
         """
-        if dry_run:
-            log.info("[dry-run] would kill session %s", session)
-            return
         run(["alissa", "tmux", "kill", session], timeout=30, check=False)
 
     def add_repo_to_workspace(
