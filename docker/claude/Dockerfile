@@ -26,7 +26,7 @@
 FROM python:3.12-slim-bookworm
 
 # Version of the daemon to install from PyPI. Bump per release.
-ARG REVIEWLOOP_VERSION=0.6.0
+ARG REVIEWLOOP_VERSION=0.7.0
 # Node major version (must be >= 18 for the alissa CLI and claude-code).
 ARG NODE_MAJOR=22
 
