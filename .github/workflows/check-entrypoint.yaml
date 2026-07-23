@@ -27,10 +27,20 @@ jobs:
         # in the Dockerfile), not the repo source tree, so the cross-check
         # validates the library the container actually runs and would catch a
         # pin/default divergence (e.g. a README default that drifts from the pin).
+        #
+        # First-release bootstrap: the renamed dist alissa-tools-github-revloop
+        # has no prior PyPI version to pin to — its first release (the version
+        # this PR publishes on merge) is not on PyPI while the PR is open. So if
+        # the pinned version is not yet published, fall back to the repo source
+        # tree, which is byte-identical to what this PR will publish. Once the
+        # release lands, the primary PyPI install succeeds and this never fires.
         run: |
           python -m pip install --upgrade pip
           version="$(grep -oP '^ARG REVLOOP_VERSION=\K[0-9.]+' docker/claude/Dockerfile)"
           echo "Installing alissa-tools-github-revloop==${version} (pinned in Dockerfile)"
-          python -m pip install "alissa-tools-github-revloop==${version}"
+          if ! python -m pip install "alissa-tools-github-revloop==${version}"; then
+            echo "::warning::alissa-tools-github-revloop==${version} not on PyPI yet (first release of the renamed dist) — falling back to the repo source tree for the cross-check"
+            python -m pip install ./alissa-tools-github-revloop
+          fi
       - name: Execute Entrypoint Config Tests
         run: bash docker/claude/tests-entrypoint-config.sh
