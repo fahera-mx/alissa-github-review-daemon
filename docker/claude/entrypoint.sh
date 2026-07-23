@@ -16,6 +16,13 @@ set -euo pipefail
 log()  { printf '[entrypoint] %s\n' "$*" >&2; }
 die()  { printf '[entrypoint] FATAL: %s\n' "$*" >&2; exit 1; }
 
+# reviewloop.config.json renderer (pass-through-when-unset). Kept in a sibling
+# script so it can be unit-tested standalone (tests-entrypoint-config.sh). It
+# lives next to this file both in the image (/usr/local/bin) and in the repo.
+ENTRYPOINT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=reviewloop-config.sh
+. "${ENTRYPOINT_DIR}/reviewloop-config.sh"
+
 WORKSPACE_ROOT="${ALISSA_WORKSPACE_ROOT:-/workspace}"
 WORKSPACE_NAME="${ALISSA_WORKSPACE:-alissa-review}"
 RUNTIME_USER=alissa
@@ -213,20 +220,13 @@ if [ -n "$(repos_lines)" ]; then
     printf 'attributes: {}\n'
   } > "${MANIFEST}"
 
+  # The generated config PASSES THROUGH optional tuning keys: an unset
+  # ALISSA_POLL_INTERVAL / ALISSA_ROUND_CAP is omitted so the daemon library's
+  # own default applies (env var > library default, no shadowing entrypoint
+  # layer). Structural keys (on_missing_hub, agent_profile) are always emitted.
+  # See reviewloop-config.sh for the precedence contract and per-key rationale.
   repos_json="$(repos_lines | jq -R . | jq -s -c .)"
-  jq -n \
-    --argjson repos "${repos_json}" \
-    --argjson poll   "${ALISSA_POLL_INTERVAL:-60}" \
-    --argjson cap    "${ALISSA_ROUND_CAP:-3}" \
-    --arg     agent  "${ALISSA_AGENT_PROFILE:-claude}" \
-    --arg     hub    "${ALISSA_ON_MISSING_HUB:-add}" \
-    '{
-       repos: $repos,
-       poll_interval: $poll,
-       round_cap: $cap,
-       agent_profile: $agent,
-       on_missing_hub: $hub
-     }' > "${CONFIG}"
+  render_reviewloop_config "${repos_json}" > "${CONFIG}"
 else
   # MOUNTED MODE: no allowlist in the env — respect a mounted workspace as-is.
   [ -f "${MANIFEST}" ] \
