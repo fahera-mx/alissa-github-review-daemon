@@ -6,7 +6,7 @@
   "hub_template": "{root}/{repo}/main",
 
   "poll_interval": 60,
-  "round_cap": 3,
+  "round_cap": 10,
 
   "_repos": "Allowlist of owner/repo; empty means every repo that requests a review. --repo replaces this list rather than extending it.",
   "repos": [],

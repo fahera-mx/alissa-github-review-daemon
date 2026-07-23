@@ -104,7 +104,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `--workspace-root` | cwd | root of the worktree-hub workspace (**CLI only**) |
 | `hub_template` | `{root}/{repo}/main` | reviewer cwd — the pristine `main/` mirror (CR6: reviewers never write) |
 | `poll_interval` | `60` | seconds; must be ≥10 |
-| `round_cap` | `3` | CR9 cap; never queues round cap+1 |
+| `round_cap` | `10` | CR9 cap; never queues round cap+1 |
 | `repos` | `[]` | allowlist of `owner/repo`; empty = all |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | resolved from `gh api user` when null |
