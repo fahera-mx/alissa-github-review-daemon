@@ -1,7 +1,7 @@
 name: Check Container Entrypoint Config Rendering
 on: [pull_request]
 
-# The env-driven entrypoint renders reviewloop.config.json with a
+# The env-driven entrypoint renders revloop.config.json with a
 # pass-through-when-unset contract (optional tuning keys are omitted so the
 # daemon library default applies; structural keys stay pinned). This check
 # exercises that renderer directly — see docker/claude/tests-entrypoint-config.sh.
@@ -23,14 +23,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
       - name: Install daemon package (for the library-default cross-check)
-        # Install the SAME PyPI release the image ships (REVIEWLOOP_VERSION pinned
+        # Install the SAME PyPI release the image ships (REVLOOP_VERSION pinned
         # in the Dockerfile), not the repo source tree, so the cross-check
         # validates the library the container actually runs and would catch a
         # pin/default divergence (e.g. a README default that drifts from the pin).
         run: |
           python -m pip install --upgrade pip
-          version="$(grep -oP '^ARG REVIEWLOOP_VERSION=\K[0-9.]+' docker/claude/Dockerfile)"
-          echo "Installing alissa-tools-github-reviewloop==${version} (pinned in Dockerfile)"
-          python -m pip install "alissa-tools-github-reviewloop==${version}"
+          version="$(grep -oP '^ARG REVLOOP_VERSION=\K[0-9.]+' docker/claude/Dockerfile)"
+          echo "Installing alissa-tools-github-revloop==${version} (pinned in Dockerfile)"
+          python -m pip install "alissa-tools-github-revloop==${version}"
       - name: Execute Entrypoint Config Tests
         run: bash docker/claude/tests-entrypoint-config.sh

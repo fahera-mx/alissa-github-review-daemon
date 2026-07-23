@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import pytest
 
-from alissa.tools.github.reviewloop import prreview
-from alissa.tools.github.reviewloop.alissa import (
+from alissa.tools.github.revloop import prreview
+from alissa.tools.github.revloop.alissa import (
     VERDICT_APPROVE,
     VERDICT_REQUEST_CHANGES,
     Task,
 )
-from alissa.tools.github.reviewloop.ghclient import Review
+from alissa.tools.github.revloop.ghclient import Review
 
 OWNER, REPO, NUMBER = "acme", "widgets", 7
 REVIEWER, DEV = "alissa-app", "dev-account"

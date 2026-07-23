@@ -7,11 +7,11 @@ CODEBASE_PATH = os.environ.get(
     default=os.path.join("src", "main"),
 )
 
-# Everything above `reviewloop` is a PEP 420 namespace package (no __init__.py),
+# Everything above `revloop` is a PEP 420 namespace package (no __init__.py),
 # so other distributions can ship their own alissa.tools.* / alissa.tools.github.*
 # concrete packages. This distribution declares only its own subtree.
 NAMESPACE = "alissa.tools.github"
-PACKAGE = f"{NAMESPACE}.reviewloop"
+PACKAGE = f"{NAMESPACE}.revloop"
 
 with open("requirements.txt", "r") as file:
     requirements = [line for line in file.read().splitlines() if line and not line.startswith("#")]
@@ -26,9 +26,9 @@ with open("README.md") as file:
 
 
 setup(
-    name="alissa-tools-github-reviewloop",
+    name="alissa-tools-github-revloop",
     version=version,
-    description="ALISSA-TOOLS-GITHUB-REVIEWLOOP",
+    description="ALISSA-TOOLS-GITHUB-REVLOOP",
     long_description=readme,
     long_description_content_type='text/markdown',
     url="https://alissa.app",
@@ -48,8 +48,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "alissa-reviewloop=alissa.tools.github.reviewloop.__main__:main",
-            "alissa-pr-review=alissa.tools.github.reviewloop.prreview:main",
+            "alissa-revloop=alissa.tools.github.revloop.__main__:main",
+            "alissa-pr-review=alissa.tools.github.revloop.prreview:main",
         ]
     },
     install_requires=requirements,

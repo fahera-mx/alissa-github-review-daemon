@@ -1,4 +1,4 @@
-"""reviewloop — a GitHub watcher that drives the alissa-code-review
+"""revloop — a GitHub watcher that drives the alissa-code-review
 adversarial review loop (CR1–CR9) to convergence."""
 
 from .config import Config

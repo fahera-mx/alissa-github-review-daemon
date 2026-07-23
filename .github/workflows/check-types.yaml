@@ -11,7 +11,7 @@ jobs:
     strategy:
       matrix:
         path:
-          - alissa-tools-github-reviewloop
+          - alissa-tools-github-revloop
     name: Python Types Check for ${{ matrix.path }}
     runs-on: ubuntu-latest
     steps:

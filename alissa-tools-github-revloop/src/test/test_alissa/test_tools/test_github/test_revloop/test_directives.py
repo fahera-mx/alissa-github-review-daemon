@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from alissa.tools.github.reviewloop.loop import ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE
+from alissa.tools.github.revloop.loop import ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE
 
 
 @pytest.mark.parametrize("template", [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE])

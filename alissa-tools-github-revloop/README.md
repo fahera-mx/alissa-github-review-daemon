@@ -1,6 +1,6 @@
-# alissa-tools-github-reviewloop
+# alissa-tools-github-revloop
 
-The `alissa.tools.github.reviewloop` module: a GitHub watcher that drives the
+The `alissa.tools.github.revloop` module: a GitHub watcher that drives the
 `alissa-code-review` adversarial review loop (CR1–CR9) to convergence.
 
 This distribution ships **only** that module. Everything above it —
@@ -13,7 +13,7 @@ their own packages under the same namespace:
 alissa/                                  ← namespace (no __init__.py)
 └── tools/                               ← namespace
     ├── github/                          ← namespace
-    │   ├── reviewloop/   __init__.py    ← THIS distribution
+    │   ├── revloop/   __init__.py    ← THIS distribution
     │   └── issues/       __init__.py    ← could ship from another repo
     └── slack/                           ← namespace
         └── notify/       __init__.py    ← could ship from another repo
@@ -27,18 +27,18 @@ shadow the others.
 ## Install
 
 ```sh
-pip install -e ./alissa-tools-github-reviewloop
+pip install -e ./alissa-tools-github-revloop
 ```
 
 ## Console scripts
 
 | Command | Entry point |
 | --- | --- |
-| `alissa-reviewloop` | `alissa.tools.github.reviewloop.__main__:main` |
+| `alissa-revloop` | `alissa.tools.github.revloop.__main__:main` |
 
 ## Layout
 
 `src/main` holds the package tree, `src/test` mirrors it as `test_*`. The
 distribution version lives in the plain-text `version` file next to the module
-it versions (`src/main/alissa/tools/github/reviewloop/version`), read by both
+it versions (`src/main/alissa/tools/github/revloop/version`), read by both
 `setup.py` and `version.py`.

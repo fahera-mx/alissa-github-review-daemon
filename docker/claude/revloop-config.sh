@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Render reviewloop.config.json from the environment.
+# Render revloop.config.json from the environment.
 #
 # Precedence contract:  env var  >  daemon library default.  There is NO hidden
 # entrypoint layer in between for optional tuning knobs — the entrypoint used to
@@ -34,12 +34,12 @@
 # `repos` is required (env-driven mode only calls this with a non-empty
 # allowlist) and always emitted.
 #
-# Usage:  reviewloop-config.sh '<repos-json-array>'   # prints config JSON
-# Or source it and call render_reviewloop_config '<repos-json-array>'.
+# Usage:  revloop-config.sh '<repos-json-array>'   # prints config JSON
+# Or source it and call render_revloop_config '<repos-json-array>'.
 # =============================================================================
 set -euo pipefail
 
-render_reviewloop_config() {
+render_revloop_config() {
   local repos_json="$1"
   # --arg (string) + tonumber for the numeric pass-through keys: an unset/empty
   # env var yields "" and the key is dropped, so the library default wins.
@@ -56,5 +56,5 @@ render_reviewloop_config() {
 
 # Direct execution renders to stdout; sourcing just defines the function.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-  render_reviewloop_config "${1:?usage: reviewloop-config.sh <repos-json-array>}"
+  render_revloop_config "${1:?usage: revloop-config.sh <repos-json-array>}"
 fi

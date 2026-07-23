@@ -7,8 +7,8 @@ The skill lists trigger automation as a planned tier ("a CI job on
 `pull_request.ready_for_review` ... is not part of this skill's contract"). This
 is that tier, as a polling daemon instead of a webhook.
 
-Shipped as the module `alissa.tools.github.reviewloop`, in the distribution
-`alissa-tools-github-reviewloop/`. `alissa.tools.github` is a PEP 420 namespace
+Shipped as the module `alissa.tools.github.revloop`, in the distribution
+`alissa-tools-github-revloop/`. `alissa.tools.github` is a PEP 420 namespace
 other repos can extend — see that package's README.
 
 ## What it does
@@ -62,17 +62,17 @@ still-live session.
 ```sh
 python -m venv venv && source venv/bin/activate
 pip install -r requirements-develop.txt
-pip install -e ./alissa-tools-github-reviewloop
+pip install -e ./alissa-tools-github-revloop
 
 cd <your-workspace>
-alissa-reviewloop --once --dry-run -v      # runs on defaults; no config needed
+alissa-revloop --once --dry-run -v      # runs on defaults; no config needed
 ```
 
 `alissa worker` must be running or queued sessions never spawn — the daemon warns
 at startup if it isn't.
 
 ```sh
-alissa-reviewloop         # foreground; tip: run it in its own tmux session
+alissa-revloop         # foreground; tip: run it in its own tmux session
 ```
 
 ### In a container
@@ -91,8 +91,8 @@ That is what lets one config file drive several daemons over different
 workspaces on the same machine:
 
 ```sh
-alissa-reviewloop --workspace-root ~/ws/alpha --repo org/alpha-api &
-alissa-reviewloop --workspace-root ~/ws/beta  --repo org/beta-web &
+alissa-revloop --workspace-root ~/ws/alpha --repo org/alpha-api &
+alissa-revloop --workspace-root ~/ws/beta  --repo org/beta-web &
 ```
 
 Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
@@ -108,18 +108,18 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `repos` | `[]` | allowlist of `owner/repo`; empty = all |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | resolved from `gh api user` when null |
-| `state_path` | `<workspace-root>/.reviewloop/state.db` | spawn ledger; per-workspace by default so parallel daemons never share one |
+| `state_path` | `<workspace-root>/.revloop/state.db` | spawn ledger; per-workspace by default so parallel daemons never share one |
 | `on_missing_review_task` | `spawn_anyway` | `spawn_anyway` \| `warn_and_spawn` \| `skip` |
 | `on_missing_hub` | `skip` | `skip` \| `add` — see *Provisioning new repos* |
 
 ### Config file discovery
 
-`--config-path PATH`, else `./reviewloop.config.json`, else
-`<workspace-root>/reviewloop.config.json`. If none exists the daemon runs on
+`--config-path PATH`, else `./revloop.config.json`, else
+`<workspace-root>/revloop.config.json`. If none exists the daemon runs on
 defaults plus CLI arguments — a config file is optional. An explicit
 `--config-path` that does not exist is an error rather than a silent fallback.
 
-Copy `reviewloop.config.example.json` to start from a documented template.
+Copy `revloop.config.example.json` to start from a documented template.
 
 ## Identity
 
@@ -197,7 +197,7 @@ path) can never trigger a respawn loop.
 
 ## Scope
 
-The daemon (`alissa-reviewloop`) is the **reviewer side**. It reacts to review
+The daemon (`alissa-revloop`) is the **reviewer side**. It reacts to review
 requests and spawns reviewers; it never pushes, merges, or changes PR state — it
 only enqueues reviewers and, on cap-out, comments. Reviewer posture (CR6) is
 enforced in every directive.
@@ -260,6 +260,44 @@ taxonomy and cap-out escalation are defined in the `alissa-code-review` skill.
 The daemon never pushes, merges, or changes PR state; it only enqueues reviewers
 and, on cap-out, comments. Reviewer posture (CR6) is enforced in every directive.
 
+## Migration: `reviewloop` → `revloop`
+
+This repo adopted the three-letter loop-family naming (devloop / orcloop /
+revloop). The rename is name-only — no behaviour changed:
+
+| Was | Now |
+| --- | --- |
+| module `alissa.tools.github.reviewloop` | `alissa.tools.github.revloop` |
+| dist `alissa-tools-github-reviewloop` | `alissa-tools-github-revloop` |
+| CLI `alissa-reviewloop` | `alissa-revloop` |
+| Dockerfile ARG `REVIEWLOOP_VERSION` | `REVLOOP_VERSION` |
+| config file `reviewloop.config.json` | `revloop.config.json` |
+| state dir `<workspace>/.reviewloop/` | `<workspace>/.revloop/` |
+
+The loop-closer console script `alissa-pr-review` keeps its name — it names the
+action, not the loop — only its home module path moved to `…github.revloop`.
+
+**Old dist is frozen.** `alissa-tools-github-reviewloop` stays on PyPI at its
+last published version (**0.11.0**) and receives no further releases. Install
+`alissa-tools-github-revloop` instead; the new line continues monotonically from
+**0.12.0** (its first release, i.e. `0.12.0 > 0.11.0`).
+
+**Operators must migrate a mounted config.** In env-driven mode the container
+entrypoint regenerates `revloop.config.json` on every boot, so nothing to do.
+If you *mount* a config file, rename `reviewloop.config.json` →
+`revloop.config.json`; the old `.reviewloop/` spawn ledger is simply re-created
+as `.revloop/` on first poll (a fresh container clears the ledger anyway).
+
+**On-merge operator follow-up (not performed on this branch):** the Railway
+reviewer service exposes the ARG-matched build variable `REVIEWLOOP_VERSION`.
+Rename it to `REVLOOP_VERSION` with the new release value (0.12.0) and rebuild in
+the same step, so the from-Dockerfile build resolves the ARG.
+
+**Cross-repo consumer follow-up (separate, in the OTHER repo):** the devloop
+image installs this project's *old* dist purely for the `alissa-pr-review`
+loop-closer. Repointing it to `alissa-tools-github-revloop` is a follow-up owned
+by the devloop repo — it is **not** touched from this branch.
+
 ## Environment notes
 
 - `gh` 2.4.0 (Ubuntu 2022 build) predates `gh search`, so all queries go through
@@ -271,10 +309,10 @@ and, on cap-out, comments. Reviewer posture (CR6) is enforced in every directive
 ## Tests
 
 ```sh
-bash tests-unit.sh alissa-tools-github-reviewloop
-bash tests-coverage.sh alissa-tools-github-reviewloop
-bash check-style.sh alissa-tools-github-reviewloop
-bash check-types.sh alissa-tools-github-reviewloop
+bash tests-unit.sh alissa-tools-github-revloop
+bash tests-coverage.sh alissa-tools-github-revloop
+bash check-style.sh alissa-tools-github-revloop
+bash check-types.sh alissa-tools-github-revloop
 ```
 
 96 tests cover the decision state machine, the config layering, and the

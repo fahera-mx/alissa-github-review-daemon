@@ -1,4 +1,4 @@
-"""CLI entry point: alissa-reviewloop (or python -m alissa.tools.github.reviewloop)"""
+"""CLI entry point: alissa-revloop (or python -m alissa.tools.github.revloop)"""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def parse_pr_ref(ref: str) -> tuple[str, str, int]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="alissa-reviewloop",
+        prog="alissa-revloop",
         description="Watch GitHub for review requests and run the adversarial "
         "review loop (alissa-code-review CR1-CR9).",
         epilog="Every setting below can also live in the config file; CLI "
@@ -58,8 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         metavar="PATH",
-        help="config file; without it, ./reviewloop.config.json then "
-        "<workspace-root>/reviewloop.config.json, else defaults only",
+        help="config file; without it, ./revloop.config.json then "
+        "<workspace-root>/revloop.config.json, else defaults only",
     )
 
     mode = p.add_argument_group("mode")
