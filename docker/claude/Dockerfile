@@ -181,6 +181,11 @@ ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 ARG ALISSA_POLL_INTERVAL="60"
 ARG ALISSA_ROUND_CAP="3"
 ARG ALISSA_AGENT_PROFILE="claude"
+# Reviewer model pinned into the agents.yaml claude command at boot (the reviewer
+# is the quality gate, so it must not silently fall back to a smaller model on a
+# usage-throttled account). Alias (`opus`/`sonnet`) or full id (`claude-opus-4-8`);
+# `default` or empty omits the --model flag. See the entrypoint (step 2d) + README.
+ARG ALISSA_AGENT_MODEL="opus"
 ARG ALISSA_ON_MISSING_HUB="add"
 # Worker reconcile tick, seconds.
 ARG ALISSA_WORKER_INTERVAL="2"
@@ -194,6 +199,7 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_POLL_INTERVAL=${ALISSA_POLL_INTERVAL} \
     ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \
+    ALISSA_AGENT_MODEL=${ALISSA_AGENT_MODEL} \
     ALISSA_ON_MISSING_HUB=${ALISSA_ON_MISSING_HUB} \
     ALISSA_WORKER_INTERVAL=${ALISSA_WORKER_INTERVAL} \
     ALISSA_ENABLE_FIREWALL=${ALISSA_ENABLE_FIREWALL} \

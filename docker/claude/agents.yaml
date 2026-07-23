@@ -9,8 +9,16 @@
 # root) — the image runs as uid 1000, which satisfies it. Reviewer posture (CR6:
 # reviewers never write) is enforced by the round directive, not by this profile.
 #
-# To pin a model or tweak flags, override the command below (edit this file
-# before build, or mount your own agents.yaml over it at runtime).
+# To pin the reviewer model, set the ALISSA_AGENT_MODEL env var (default: opus) —
+# the entrypoint rewrites the `command:` below with `--model "$ALISSA_AGENT_MODEL"`
+# at container boot (set it to `default` or empty to omit the flag and inherit the
+# account default). To change flags instead, mount your own agents.yaml over this
+# path at runtime; a mounted file lacks the `alissa-managed:` marker below and is
+# used verbatim, so ALISSA_AGENT_MODEL does not touch it (your command wins).
+#
+# alissa-managed: the entrypoint regenerates the `command:` line of this default
+# profile at boot from ALISSA_AGENT_MODEL — do not remove this marker line, it is
+# what distinguishes the baked default from a runtime-mounted custom agents.yaml.
 claude:
   command: claude --dangerously-skip-permissions --permission-mode acceptEdits
   mode: interactive
