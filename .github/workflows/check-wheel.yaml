@@ -11,7 +11,7 @@ jobs:
     strategy:
       matrix:
         path:
-          - alissa-tools-github-reviewloop
+          - alissa-tools-github-revloop
     name: Wheel Package Check for ${{ matrix.path }}
     runs-on: ubuntu-latest
     steps:
@@ -33,5 +33,5 @@ jobs:
         run: python -m pip install ${{ matrix.path }}/dist/*.whl
       - name: Execute Simple Command to Verify Installation
         run: |
-          python -c "from alissa.tools.github.reviewloop.version import version; assert version.value != '0.0.0', version; print(version)"
-          alissa-reviewloop --help
+          python -c "from alissa.tools.github.revloop.version import version; assert version.value != '0.0.0', version; print(version)"
+          alissa-revloop --help

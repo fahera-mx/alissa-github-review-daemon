@@ -11,7 +11,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/package-publish.yaml
-      - alissa-tools-github-reviewloop/**
+      - alissa-tools-github-revloop/**
     types:
       - closed
     branches:
@@ -29,7 +29,7 @@ jobs:
     strategy:
       matrix:
         path:
-          - alissa-tools-github-reviewloop
+          - alissa-tools-github-revloop
     if: github.event.pull_request.merged == true
     name: Python Package Build and Publish for ${{ matrix.path }}
     runs-on: ubuntu-latest

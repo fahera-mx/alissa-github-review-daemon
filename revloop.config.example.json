@@ -14,7 +14,7 @@
   "agent_profile": "claude",
   "reviewer_login": null,
 
-  "_state_path": "Omit to default to <workspace-root>/.reviewloop/state.db, which keeps daemons on different workspaces from sharing a spawn ledger.",
+  "_state_path": "Omit to default to <workspace-root>/.revloop/state.db, which keeps daemons on different workspaces from sharing a spawn ledger.",
 
   "on_missing_review_task": "spawn_anyway",
 

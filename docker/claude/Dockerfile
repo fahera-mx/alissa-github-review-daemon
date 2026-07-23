@@ -2,13 +2,13 @@
 # =============================================================================
 # Alissa — GitHub Review Daemon (claude reviewer runtime)
 #
-# This image is NOT just the poller. The daemon (`alissa-reviewloop`) is thin: it
+# This image is NOT just the poller. The daemon (`alissa-revloop`) is thin: it
 # watches GitHub and enqueues reviewer sessions via `alissa tmux queue add`. The
 # real review work is done by `alissa worker`, which drains that queue and spawns
 # `claude` reviewer agents inside worktree-hub directories. So the image bundles
 # all three tiers:
 #
-#   * python 3.12 + alissa-tools-github-reviewloop  (the poller, from PyPI)
+#   * python 3.12 + alissa-tools-github-revloop  (the poller, from PyPI)
 #   * node + the alissa CLI                          (worker, tmux queue, tasks)
 #   * claude-code                                    (the agent the worker spawns)
 #
@@ -26,7 +26,7 @@
 FROM python:3.12-slim-bookworm
 
 # Version of the daemon to install from PyPI. Bump per release.
-ARG REVIEWLOOP_VERSION=0.8.0
+ARG REVLOOP_VERSION=0.12.0
 # Node major version (must be >= 18 for the alissa CLI and claude-code).
 ARG NODE_MAJOR=22
 
@@ -64,8 +64,8 @@ RUN npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
 
 # --- The review daemon (from PyPI) -------------------------------------------
-# Installs the `alissa-reviewloop` console script into /usr/local/bin.
-RUN pip install "alissa-tools-github-reviewloop==${REVIEWLOOP_VERSION}"
+# Installs the `alissa-revloop` console script into /usr/local/bin.
+RUN pip install "alissa-tools-github-revloop==${REVLOOP_VERSION}"
 
 # --- Non-root runtime user ----------------------------------------------------
 # Agents run unattended with three live tokens, and claude refuses
@@ -93,9 +93,9 @@ RUN git config --system url."https://github.com/".insteadOf "git@github.com:" \
 
 # --- Entrypoint + optional firewall ------------------------------------------
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY reviewloop-config.sh /usr/local/bin/reviewloop-config.sh
+COPY revloop-config.sh /usr/local/bin/revloop-config.sh
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/reviewloop-config.sh /usr/local/bin/init-firewall.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/revloop-config.sh /usr/local/bin/init-firewall.sh
 
 USER alissa
 WORKDIR /home/alissa
@@ -185,7 +185,7 @@ ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 # the key from the generated config and the daemon library's own current default
 # applies (env var > library default). Baking a concrete value here would shadow
 # the library default — the exact defect this repo's #30 removed. The library
-# defaults at the pinned REVIEWLOOP_VERSION are poll_interval=60, round_cap=3;
+# defaults at the pinned REVLOOP_VERSION are poll_interval=60, round_cap=3;
 # they are documented in the README, not duplicated here.
 ARG ALISSA_POLL_INTERVAL=""
 ARG ALISSA_ROUND_CAP=""

@@ -33,7 +33,7 @@ HUB_ADD = "add"  # `alissa code workspace add <org>/<repo>`
 
 _HUB_MODES = {HUB_SKIP, HUB_ADD}
 
-CONFIG_FILENAME = "reviewloop.config.json"
+CONFIG_FILENAME = "revloop.config.json"
 
 # Keys accepted in the config file. workspace_root is excluded on purpose.
 CONFIG_KEYS = (
@@ -53,7 +53,7 @@ MIN_POLL_INTERVAL = 10  # the search API allows 30 req/min
 
 
 def default_state_path(workspace_root: Path) -> Path:
-    return Path(workspace_root) / ".reviewloop" / "state.db"
+    return Path(workspace_root) / ".revloop" / "state.db"
 
 
 @dataclass(frozen=True)

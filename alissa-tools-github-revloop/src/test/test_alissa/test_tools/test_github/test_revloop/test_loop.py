@@ -10,22 +10,22 @@ import time
 
 import pytest
 
-from alissa.tools.github.reviewloop.config import (
+from alissa.tools.github.revloop.config import (
     CONFIG_FILENAME,
     HUB_ADD,
     ON_MISSING_SKIP,
     Config,
     resolve_config_path,
 )
-from alissa.tools.github.reviewloop.alissa import ManagedSession
-from alissa.tools.github.reviewloop.ghclient import (
+from alissa.tools.github.revloop.alissa import ManagedSession
+from alissa.tools.github.revloop.ghclient import (
     GitHub,
     IdentityMismatch,
     IssueComment,
     PullRequest,
     Review,
 )
-from alissa.tools.github.reviewloop.loop import (
+from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     REAP_QUIET_SECONDS,
     STALE_ROUND_SECONDS,
@@ -36,7 +36,7 @@ from alissa.tools.github.reviewloop.loop import (
     session_name,
     stalled_kind,
 )
-from alissa.tools.github.reviewloop.state import State
+from alissa.tools.github.revloop.state import State
 
 OWNER, REPO, NUMBER = "acme", "widgets", 7
 SLUG = f"{OWNER}/{REPO}"
@@ -747,7 +747,7 @@ def test_state_path_defaults_inside_the_workspace(tmp_path):
     one = Config.build(tmp_path / "ws-one")
     two = Config.build(tmp_path / "ws-two")
 
-    assert one.state_db == (tmp_path / "ws-one" / ".reviewloop" / "state.db")
+    assert one.state_db == (tmp_path / "ws-one" / ".revloop" / "state.db")
     assert one.state_db != two.state_db
 
 
@@ -805,20 +805,20 @@ def test_no_config_anywhere_is_not_an_error(tmp_path):
 
 
 def cli(*argv):
-    from alissa.tools.github.reviewloop.__main__ import build_parser
+    from alissa.tools.github.revloop.__main__ import build_parser
 
     return build_parser().parse_args(list(argv))
 
 
 def test_workspace_root_defaults_to_cwd(tmp_path, monkeypatch):
-    from alissa.tools.github.reviewloop.__main__ import resolve_config
+    from alissa.tools.github.revloop.__main__ import resolve_config
 
     monkeypatch.chdir(tmp_path)
     assert resolve_config(cli()).workspace_root == tmp_path.resolve()
 
 
 def test_workspace_root_flag_beats_cwd(tmp_path, monkeypatch):
-    from alissa.tools.github.reviewloop.__main__ import resolve_config
+    from alissa.tools.github.revloop.__main__ import resolve_config
 
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -829,7 +829,7 @@ def test_workspace_root_flag_beats_cwd(tmp_path, monkeypatch):
 
 
 def test_repeated_repo_flags_accumulate(tmp_path, monkeypatch):
-    from alissa.tools.github.reviewloop.__main__ import resolve_config
+    from alissa.tools.github.revloop.__main__ import resolve_config
 
     monkeypatch.chdir(tmp_path)
     cfg = resolve_config(cli("--repo", "a/one", "--repo", "a/two"))
@@ -839,7 +839,7 @@ def test_repeated_repo_flags_accumulate(tmp_path, monkeypatch):
 def test_cli_fills_in_over_a_discovered_config_file(tmp_path, monkeypatch):
     import json
 
-    from alissa.tools.github.reviewloop.__main__ import resolve_config
+    from alissa.tools.github.revloop.__main__ import resolve_config
 
     (tmp_path / CONFIG_FILENAME).write_text(
         json.dumps({"poll_interval": 60, "round_cap": 3, "dry_run": True})
@@ -855,7 +855,7 @@ def test_cli_fills_in_over_a_discovered_config_file(tmp_path, monkeypatch):
 def test_no_dry_run_overrides_a_dry_run_config(tmp_path, monkeypatch):
     import json
 
-    from alissa.tools.github.reviewloop.__main__ import resolve_config
+    from alissa.tools.github.revloop.__main__ import resolve_config
 
     (tmp_path / CONFIG_FILENAME).write_text(json.dumps({"dry_run": True}))
     monkeypatch.chdir(tmp_path)
@@ -872,7 +872,7 @@ def test_dry_run_flags_are_mutually_exclusive():
 def test_workspace_root_in_config_file_is_a_clear_error(tmp_path, monkeypatch):
     import json
 
-    from alissa.tools.github.reviewloop.__main__ import main
+    from alissa.tools.github.revloop.__main__ import main
 
     (tmp_path / CONFIG_FILENAME).write_text(
         json.dumps({"workspace_root": str(tmp_path)})
@@ -883,7 +883,7 @@ def test_workspace_root_in_config_file_is_a_clear_error(tmp_path, monkeypatch):
 
 
 def test_missing_explicit_config_exits_with_config_error(tmp_path, monkeypatch):
-    from alissa.tools.github.reviewloop.__main__ import main
+    from alissa.tools.github.revloop.__main__ import main
 
     monkeypatch.chdir(tmp_path)
     assert main(["--config-path", str(tmp_path / "nope.json")]) == 2
@@ -891,7 +891,7 @@ def test_missing_explicit_config_exits_with_config_error(tmp_path, monkeypatch):
 
 def test_task_ref_uses_task_number_not_seq(monkeypatch):
     """`TASK-<taskSeq>` 404s server-side; the resolvable ref is taskNumber."""
-    from alissa.tools.github.reviewloop import alissa as alissa_mod
+    from alissa.tools.github.revloop import alissa as alissa_mod
 
     row = {
         "taskSeq": 998,
@@ -922,7 +922,7 @@ def envelope(verdict, round_, at, extra=""):
 
 
 def verdict_from(monkeypatch, payload, ref="TASK-500"):
-    from alissa.tools.github.reviewloop import alissa as alissa_mod
+    from alissa.tools.github.revloop import alissa as alissa_mod
 
     monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: payload)
     return alissa_mod.Alissa().latest_verdict(ref)
@@ -1001,8 +1001,8 @@ def test_undated_envelope_loses_to_a_dated_one(monkeypatch):
 
 
 def test_cli_failure_is_not_fatal(monkeypatch):
-    from alissa.tools.github.reviewloop import alissa as alissa_mod
-    from alissa.tools.github.reviewloop.proc import CommandError
+    from alissa.tools.github.revloop import alissa as alissa_mod
+    from alissa.tools.github.revloop.proc import CommandError
 
     def boom(*a, **k):
         raise CommandError(["alissa", "task", "get"], 1, "task not found")
@@ -1012,7 +1012,7 @@ def test_cli_failure_is_not_fatal(monkeypatch):
 
 
 def test_task_without_a_number_is_skipped(monkeypatch):
-    from alissa.tools.github.reviewloop import alissa as alissa_mod
+    from alissa.tools.github.revloop import alissa as alissa_mod
 
     row = {
         "taskSeq": 998,
@@ -1169,7 +1169,7 @@ def test_sweep_is_idempotent_across_polls(config):
 
 
 def test_sweep_survives_a_session_list_failure(config):
-    from alissa.tools.github.reviewloop.proc import CommandError
+    from alissa.tools.github.revloop.proc import CommandError
 
     w, _, al = watcher(config, make_pr(), [review()])
 
@@ -1183,7 +1183,7 @@ def test_sweep_survives_a_session_list_failure(config):
 
 
 def test_sweep_spares_when_github_is_undecidable(config):
-    from alissa.tools.github.reviewloop.proc import CommandError
+    from alissa.tools.github.revloop.proc import CommandError
 
     pr = make_pr()
     w, gh, al = watcher(config, pr, [review()])
@@ -1445,7 +1445,7 @@ def test_stale_round_with_recently_active_idle_session_defers(config):
 def test_unprobeable_session_list_defers_the_respawn(config):
     """No liveness evidence is not evidence of death: respawning blind is
     exactly the double-spend, so a failed `alissa tmux ls` defers one poll."""
-    from alissa.tools.github.reviewloop.proc import CommandError
+    from alissa.tools.github.revloop.proc import CommandError
 
     st = State(config.state_db)
     w, _, al = watcher(config, make_pr(), [], state=st)
@@ -1547,7 +1547,7 @@ def test_floor_ping_dry_run_is_silent(config):
 def test_failed_ping_comment_retries_next_poll(config):
     """The ping is the operator's only signal for the episode: the ledger row
     lands only after the comment posts, so a transient failure retries."""
-    from alissa.tools.github.reviewloop.proc import CommandError
+    from alissa.tools.github.revloop.proc import CommandError
 
     st = State(config.state_db)
     w, gh, al = watcher(config, make_pr(), [], state=st)
@@ -1662,8 +1662,8 @@ def test_activity_failures_never_block_the_spawn(config, surface):
     """Best-effort by contract: list/create/PATCH failures — including a
     rate-limit, which _api surfaces as RateLimited, not CommandError — log a
     warning and the spawn still goes through."""
-    from alissa.tools.github.reviewloop.ghclient import RateLimited
-    from alissa.tools.github.reviewloop.proc import CommandError
+    from alissa.tools.github.revloop.ghclient import RateLimited
+    from alissa.tools.github.revloop.proc import CommandError
 
     w, gh, al = watcher(config, make_pr(), [])
     if surface == "list":
@@ -1686,7 +1686,7 @@ def test_activity_dry_run_appends_nothing(config, caplog):
     cfg = replace(config, dry_run=True)
     w, gh, al = watcher(cfg, make_pr(), [], state=State(cfg.state_db))
 
-    with caplog.at_level(_logging.INFO, logger="alissa.tools.github.reviewloop.loop"):
+    with caplog.at_level(_logging.INFO, logger="alissa.tools.github.revloop.loop"):
         d = w.evaluate(OWNER, REPO, NUMBER)
 
     assert d.action is Action.SPAWNED
@@ -1758,7 +1758,7 @@ def test_run_forever_exits_cleanly_on_interrupt_during_sleep(config, monkeypatch
     off) the loop spends nearly all its wall-clock inside time.sleep, so
     Ctrl-C almost always lands there — it must hit the same clean-exit path,
     not traceback out of run_forever."""
-    from alissa.tools.github.reviewloop import loop as loop_mod
+    from alissa.tools.github.revloop import loop as loop_mod
 
     w, _, _ = watcher(config, make_pr(), [])
     polls = []
@@ -1809,7 +1809,7 @@ def test_falls_back_to_github_count_when_no_review_task(config):
 
 
 def test_count_verdicts_counts_only_envelope_evidence():
-    from alissa.tools.github.reviewloop.alissa import Alissa
+    from alissa.tools.github.revloop.alissa import Alissa
     payload = {
         "evidence": [
             {"title": "Review verdict: acme/widgets#7 — request_changes (round 1)"},

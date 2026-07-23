@@ -127,7 +127,7 @@ STALLED_COMMENT = (
 # keys on it (plus own authorship -- anyone can paste the marker into their own
 # comment, and a spoofed marker must never be PATCHed), so every append lands in
 # the same single comment however many rounds run.
-ACTIVITY_MARKER = "<!-- alissa-reviewloop:activity -->"
+ACTIVITY_MARKER = "<!-- alissa-revloop:activity -->"
 
 ACTIVITY_HEADER = (
     ACTIVITY_MARKER + "\n"

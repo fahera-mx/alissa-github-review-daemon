@@ -13,4 +13,4 @@ venv/
 .venv/
 
 # Local daemon config — carries workspace paths, not portable
-reviewloop.config.json
+revloop.config.json

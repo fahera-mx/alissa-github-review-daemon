@@ -1,6 +1,6 @@
 """alissa-pr-review: the implementer-side driver for ONE review round.
 
-The reviewer daemon (`alissa-reviewloop`) is autonomous but only the *reviewer*
+The reviewer daemon (`alissa-revloop`) is autonomous but only the *reviewer*
 half: a review request in, a review out. This command is the *implementer* half,
 run by the dev session that just finished the work — it fires the trigger and
 blocks on the verdict, so the loop closes without a second always-on daemon.

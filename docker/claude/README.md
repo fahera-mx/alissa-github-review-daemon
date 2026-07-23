@@ -1,6 +1,6 @@
 # Containerized review daemon (`docker/claude`)
 
-Runs the GitHub review loop unattended in a container: the `alissa-reviewloop`
+Runs the GitHub review loop unattended in a container: the `alissa-revloop`
 poller, an `alissa worker`, and the `claude` reviewer agent it spawns — all in
 one image.
 
@@ -16,7 +16,7 @@ docker build -t alissa-review-daemon docker/claude
 
 # with configuration baked in (see the Configuration table):
 docker build \
-  --build-arg REVIEWLOOP_VERSION=0.2.0 \
+  --build-arg REVLOOP_VERSION=0.2.0 \
   --build-arg ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app" \
   --build-arg ALISSA_POLL_INTERVAL=90 \
   --build-arg ALISSA_ROUND_CAP=3 \
@@ -168,13 +168,13 @@ automatically; locally pass `--build-arg`):
 
 The optional tuning knobs `ALISSA_POLL_INTERVAL` and `ALISSA_ROUND_CAP` are
 **pass-through**: their build `ARG` default is empty, and when they are unset the
-entrypoint **omits the key entirely** from the generated `reviewloop.config.json`
+entrypoint **omits the key entirely** from the generated `revloop.config.json`
 so the daemon library applies its own current default. There is no hidden
 entrypoint fallback layer that would shadow it — set the env var to override,
 leave it unset to inherit the library default (which is why the "default" column
 above says *daemon default* rather than a baked number, and why upgrading the
 daemon can change these without a Dockerfile edit). The parenthetical values are
-the library defaults at the pinned `REVIEWLOOP_VERSION`, informational only.
+the library defaults at the pinned `REVLOOP_VERSION`, informational only.
 
 `ALISSA_AGENT_PROFILE` and `ALISSA_ON_MISSING_HUB` are **not** pass-through: they
 are container constants the image requires. `agent_profile` must name a profile
@@ -203,7 +203,7 @@ refuses to hub-ify unattended without one.
 Reviewers `cd` into `{root}/{repo}/main` worktree hubs. This image is
 self-contained: with `on_missing_hub: add` the daemon hub-ifies each repo itself
 on the first review request, so **you do not pre-clone anything**. The entrypoint
-guarantees a manifest and a `reviewloop.config.json` exist under
+guarantees a manifest and a `revloop.config.json` exist under
 `ALISSA_WORKSPACE_ROOT` (`/workspace`, fixed).
 
 **When `ALISSA_REVIEW_REPOS` is set it is authoritative**: the entrypoint
@@ -227,7 +227,7 @@ docker run --rm -it \
   alissa-review-daemon --once --dry-run -v
 ```
 
-Everything after the image name is passed straight to `alissa-reviewloop`, so
+Everything after the image name is passed straight to `alissa-revloop`, so
 `--once`, `--dry-run`, `-v` all work.
 
 Unattended, persisting the workspace (the cloned hubs) across restarts:
@@ -248,13 +248,13 @@ docker run -d --name alissa-review \
 Mount your volume at **`/workspace`** (the value of `ALISSA_WORKSPACE_ROOT`).
 Everything worth surviving a restart lives there:
 
-- `alissa-workspace.yaml` + `reviewloop.config.json` (regenerated from
+- `alissa-workspace.yaml` + `revloop.config.json` (regenerated from
   `ALISSA_REVIEW_REPOS` each boot when it's set, else whatever you mounted);
 - the cloned worktree hubs `<owner>/<repo>/main` — persisting them means a
   restart does **not** re-clone every repo;
 - `.claude-config/.credentials.json` — the persisted `claude /login` (see the
   claude-auth section); this is why the login survives restarts;
-- `.reviewloop/state.db` — the spawn ledger. Its `escalations` (cap-out memory)
+- `.revloop/state.db` — the spawn ledger. Its `escalations` (cap-out memory)
   are worth keeping so a restart doesn't re-escalate a capped PR.
 
 The ledger's **in-flight `spawns` are cleared on every boot** by the entrypoint:
@@ -323,7 +323,7 @@ volumes:
 1. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
    `gh auth setup-git`; `alissa auth login` (fatal if missing); check the claude
    credential (warn-only — the baked `agents.yaml` handles headless launch).
-2. Ensure a manifest + `reviewloop.config.json` exist (mount or generate).
+2. Ensure a manifest + `revloop.config.json` exist (mount or generate).
 3. **`alissa code workspace sync`** — materialize the worktree hubs the manifest
    declares (create missing/half-built ones, fetch existing). Without this the
    daemon's on-demand `alissa code workspace add` no-ops on a repo already listed
@@ -331,6 +331,6 @@ volumes:
    that never completes.
 4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).
-5. Run `alissa-reviewloop` in the foreground; stop the worker on `SIGTERM`/`SIGINT`.
+5. Run `alissa-revloop` in the foreground; stop the worker on `SIGTERM`/`SIGINT`.
 
 `tini` is PID 1 to reap the tmux/node/claude child fan-out.

@@ -4,9 +4,9 @@
 #
 #   0. as root: fix the volume-mount ownership (+ firewall), then drop to alissa
 #   1. preflight the identities the loop depends on (gh / alissa / claude)
-#   2. bootstrap the worktree-hub workspace + reviewloop config from a manifest
+#   2. bootstrap the worktree-hub workspace + revloop config from a manifest
 #   3. start `alissa worker` (backgrounded) and wait until it is up
-#   4. run `alissa-reviewloop` in the foreground, stopping the worker on exit
+#   4. run `alissa-revloop` in the foreground, stopping the worker on exit
 #
 # The daemon is a thin poller; the worker is what actually spawns reviewers, so
 # the worker MUST be running first — the daemon only warns if it isn't.
@@ -16,12 +16,12 @@ set -euo pipefail
 log()  { printf '[entrypoint] %s\n' "$*" >&2; }
 die()  { printf '[entrypoint] FATAL: %s\n' "$*" >&2; exit 1; }
 
-# reviewloop.config.json renderer (pass-through-when-unset). Kept in a sibling
+# revloop.config.json renderer (pass-through-when-unset). Kept in a sibling
 # script so it can be unit-tested standalone (tests-entrypoint-config.sh). It
 # lives next to this file both in the image (/usr/local/bin) and in the repo.
 ENTRYPOINT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=reviewloop-config.sh
-. "${ENTRYPOINT_DIR}/reviewloop-config.sh"
+# shellcheck source=revloop-config.sh
+. "${ENTRYPOINT_DIR}/revloop-config.sh"
 
 WORKSPACE_ROOT="${ALISSA_WORKSPACE_ROOT:-/workspace}"
 WORKSPACE_NAME="${ALISSA_WORKSPACE:-alissa-review}"
@@ -167,7 +167,7 @@ fi
 #
 # Reviewers cd into {root}/{repo}/main worktree hubs. With on_missing_hub:add
 # the daemon hub-ifies each repo itself on first review request, so we do NOT
-# pre-clone anything — we only guarantee a manifest and a reviewloop config
+# pre-clone anything — we only guarantee a manifest and a revloop config
 # exist. Either may be mounted; otherwise we generate them from env.
 # -----------------------------------------------------------------------------
 mkdir -p "${WORKSPACE_ROOT}"
@@ -194,7 +194,7 @@ skills_lines() {
     | grep -v '^$'
 }
 
-CONFIG="${WORKSPACE_ROOT}/reviewloop.config.json"
+CONFIG="${WORKSPACE_ROOT}/revloop.config.json"
 
 if [ -n "$(repos_lines)" ]; then
   # ENV-DRIVEN MODE: ALISSA_REVIEW_REPOS is authoritative, so (re)generate the
@@ -204,7 +204,7 @@ if [ -n "$(repos_lines)" ]; then
   # the allowlist is the full set of repos the daemon may touch (on_missing_hub
   # only hub-ifies repos already in it), and the cloned hub dirs on the volume
   # are untouched by rewriting this text.
-  log "generating ${MANIFEST} + reviewloop.config.json from ALISSA_REVIEW_REPOS"
+  log "generating ${MANIFEST} + revloop.config.json from ALISSA_REVIEW_REPOS"
   {
     printf 'name: %s\n' "${WORKSPACE_NAME}"
     printf 'description: Containerized Alissa review daemon workspace\n'
@@ -224,9 +224,9 @@ if [ -n "$(repos_lines)" ]; then
   # ALISSA_POLL_INTERVAL / ALISSA_ROUND_CAP is omitted so the daemon library's
   # own default applies (env var > library default, no shadowing entrypoint
   # layer). Structural keys (on_missing_hub, agent_profile) are always emitted.
-  # See reviewloop-config.sh for the precedence contract and per-key rationale.
+  # See revloop-config.sh for the precedence contract and per-key rationale.
   repos_json="$(repos_lines | jq -R . | jq -s -c .)"
-  render_reviewloop_config "${repos_json}" > "${CONFIG}"
+  render_revloop_config "${repos_json}" > "${CONFIG}"
 else
   # MOUNTED MODE: no allowlist in the env — respect a mounted workspace as-is.
   [ -f "${MANIFEST}" ] \
@@ -309,7 +309,7 @@ PY
 # A fresh container has no reviewer running by definition (tmux server is down),
 # so every `spawns` row is stale: clear them and the daemon re-enqueues on its
 # first poll. `escalations` is kept, so capped-out PRs are not re-escalated.
-STATE_DB="${WORKSPACE_ROOT}/.reviewloop/state.db"
+STATE_DB="${WORKSPACE_ROOT}/.revloop/state.db"
 if [ -f "${STATE_DB}" ]; then
   python3 - "${STATE_DB}" <<'PY' || true
 import sqlite3, sys
@@ -378,7 +378,7 @@ shutdown() {
 trap shutdown TERM INT
 
 # Extra daemon flags (e.g. -v, --once, --dry-run) pass through as CMD args.
-log "starting alissa-reviewloop over ${WORKSPACE_ROOT}"
-alissa-reviewloop --workspace-root "${WORKSPACE_ROOT}" "$@" &
+log "starting alissa-revloop over ${WORKSPACE_ROOT}"
+alissa-revloop --workspace-root "${WORKSPACE_ROOT}" "$@" &
 DAEMON_PID=$!
 wait "${DAEMON_PID}"
