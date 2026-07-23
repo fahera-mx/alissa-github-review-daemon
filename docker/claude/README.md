@@ -102,10 +102,42 @@ A `reviewer_login` that disagrees with the `GH_TOKEN` is **fatal at the daemon's
 own startup** (every round would look like round 1 and respawn forever) — so keep
 the token and any configured login in sync.
 
-The reviewer's claude launch command lives in [`agents.yaml`](./agents.yaml)
-(pin a model or change flags there, or mount your own over
-`/home/alissa/.config/alissa/agents.yaml`). The image runs as a non-root user
+The reviewer's claude launch command lives in [`agents.yaml`](./agents.yaml). To
+pin the model, set `ALISSA_AGENT_MODEL` (see [Pinning the reviewer model](#pinning-the-reviewer-model))
+rather than editing the file; to change flags, mount your own file over
+`/home/alissa/.config/alissa/agents.yaml`. The image runs as a non-root user
 because claude refuses `--dangerously-skip-permissions` as root.
+
+### Pinning the reviewer model
+
+The reviewer is the pipeline's **quality gate**: if its recall degrades nothing
+downstream notices. The baked [`agents.yaml`](./agents.yaml) pins no model, so a
+reviewer inherits whatever the persisted `claude /login` account defaults to —
+and on plan-based accounts that default can **silently fall back to a smaller
+model** once a usage threshold is hit. `ALISSA_AGENT_MODEL` makes the model an
+explicit boot-time decision instead of a rebuild-time one.
+
+At container boot the entrypoint appends `--model "$ALISSA_AGENT_MODEL"` to the
+claude profile's `command:` and logs the effective command (grep the startup log
+for `effective reviewer command:`).
+
+| `ALISSA_AGENT_MODEL` | reviewer `command:` becomes |
+| --- | --- |
+| *(unset)* → default `opus` | `claude … --model opus` |
+| `claude-opus-4-8` (any alias or full id) | `claude … --model claude-opus-4-8` |
+| `default` *or* empty | `claude …` (no `--model` — restores account default) |
+
+The value passes through **verbatim** — both aliases (`opus`, `sonnet`) and full
+ids (`claude-opus-4-8`) are valid; there is no allowlist.
+
+**Precedence.** The entrypoint only rewrites the **baked default** profile, which
+it recognizes by an `alissa-managed:` marker comment. A custom `agents.yaml`
+mounted over `/home/alissa/.config/alissa/agents.yaml` carries no such marker, so
+it is used **verbatim** and `ALISSA_AGENT_MODEL` is ignored for it — the mounted
+command (including any `--model` you set there) always wins. This is unchanged for
+every other field: flags, `mode`, `quietSeconds`, and `promptPatterns` are
+untouched, and reviewer posture (CR6: reviewers never write) stays enforced by the
+round directive, independent of the model.
 
 ## Configuration (build ARGs — Railway-friendly)
 
@@ -126,6 +158,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_POLL_INTERVAL` | `60` | seconds between polls (≥10) |
 | `ALISSA_ROUND_CAP` | `3` | CR9 round cap |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches |
+| `ALISSA_AGENT_MODEL` | `opus` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
 | `ALISSA_WORKER_INTERVAL` | `2` | worker reconcile tick (seconds) |
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |

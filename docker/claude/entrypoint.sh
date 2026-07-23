@@ -101,6 +101,61 @@ alissa auth login --token "${ALISSA_API_TOKEN}" >/dev/null 2>&1 \
 log "alissa authenticated"
 
 # -----------------------------------------------------------------------------
+# 2d. Resolve the reviewer model into the baked agents.yaml.
+#
+# The reviewer is the pipeline's quality gate, but the baked claude profile pins
+# no model — so it inherits the persisted /login account's default, which can
+# silently fall back to a smaller model when a plan hits its usage threshold. We
+# pin it explicitly at boot: ALISSA_AGENT_MODEL (default `opus`) is appended to
+# the profile's `command:` as `--model <value>`. The value passes through
+# verbatim — aliases (`opus`, `sonnet`) and full ids (`claude-opus-4-8`) are both
+# valid, no allowlist. `default` or an empty value omits the flag entirely,
+# restoring the account-default behavior.
+#
+# Precedence: we only rewrite the BAKED default (identified by its `alissa-managed:`
+# marker). A custom agents.yaml mounted over this path carries no marker, so it is
+# left verbatim and ALISSA_AGENT_MODEL is ignored for it — the mounted command
+# always wins. The baked file lives in the ephemeral home (not on the volume), so
+# it is pristine on every boot and this rewrite is idempotent.
+# -----------------------------------------------------------------------------
+AGENTS_YAML="${HOME}/.config/alissa/agents.yaml"
+# Default `opus` only when UNSET (use `-`, not `:-`): an explicitly empty value is
+# a valid opt-out and must NOT be re-defaulted back to opus.
+AGENT_MODEL="${ALISSA_AGENT_MODEL-opus}"
+if [ ! -f "${AGENTS_YAML}" ]; then
+  log "WARN: ${AGENTS_YAML} not found — skipping model pin (worker will fall back to a bare claude)"
+elif ! grep -q 'alissa-managed:' "${AGENTS_YAML}"; then
+  log "custom agents.yaml in effect (no alissa-managed marker) — using it verbatim, ALISSA_AGENT_MODEL ignored"
+else
+  BASE_CMD="claude --dangerously-skip-permissions --permission-mode acceptEdits"
+  if [ -z "${AGENT_MODEL}" ] || [ "${AGENT_MODEL}" = "default" ]; then
+    CLAUDE_CMD="${BASE_CMD}"
+    log "reviewer model: account default (ALISSA_AGENT_MODEL='${AGENT_MODEL}') — no --model flag"
+  else
+    CLAUDE_CMD="${BASE_CMD} --model ${AGENT_MODEL}"
+    log "reviewer model: ${AGENT_MODEL} (ALISSA_AGENT_MODEL)"
+  fi
+  # Rewrite the profile's `command:` line. python (not sed) so an arbitrary
+  # passed-through model value can't collide with a substitution metacharacter.
+  python3 - "${AGENTS_YAML}" "${CLAUDE_CMD}" <<'PY' || die "failed to render agents.yaml"
+import re, sys
+path, cmd = sys.argv[1], sys.argv[2]
+out, seen = [], False
+for ln in open(path).read().splitlines(keepends=True):
+    m = re.match(r'^(\s*)command:\s', ln)
+    if m and not seen:
+        out.append(f"{m.group(1)}command: {cmd}\n")
+        seen = True
+    else:
+        out.append(ln)
+if not seen:
+    sys.exit("no `command:` line found in agents.yaml")
+open(path, "w").writelines(out)
+PY
+  log "effective reviewer command: ${CLAUDE_CMD}"
+fi
+
+# -----------------------------------------------------------------------------
 # 3. Bootstrap the workspace (bootstrap-from-manifest model)
 #
 # Reviewers cd into {root}/{repo}/main worktree hubs. With on_missing_hub:add
