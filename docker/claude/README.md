@@ -134,7 +134,10 @@ ids (`claude-opus-4-8`) are valid; there is no allowlist.
 it recognizes by an `alissa-managed:` marker comment. A custom `agents.yaml`
 mounted over `/home/alissa/.config/alissa/agents.yaml` carries no such marker, so
 it is used **verbatim** and `ALISSA_AGENT_MODEL` is ignored for it — the mounted
-command (including any `--model` you set there) always wins. This is unchanged for
+command (including any `--model` you set there) always wins. (If you build your
+mounted file by **copying** the baked default, delete its `alissa-managed:` marker
+line — otherwise the entrypoint still recognizes it and rewrites the command.)
+This is unchanged for
 every other field: flags, `mode`, `quietSeconds`, and `promptPatterns` are
 untouched, and reviewer posture (CR6: reviewers never write) stays enforced by the
 round directive, independent of the model.

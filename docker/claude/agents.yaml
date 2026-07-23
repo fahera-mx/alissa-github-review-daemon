@@ -19,6 +19,8 @@
 # alissa-managed: the entrypoint regenerates the `command:` line of this default
 # profile at boot from ALISSA_AGENT_MODEL — do not remove this marker line, it is
 # what distinguishes the baked default from a runtime-mounted custom agents.yaml.
+# If you COPY this file to mount your own, delete this marker line so the copy is
+# treated as custom (verbatim) rather than being rewritten by the entrypoint.
 claude:
   command: claude --dangerously-skip-permissions --permission-mode acceptEdits
   mode: interactive

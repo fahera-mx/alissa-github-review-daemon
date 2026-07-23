@@ -127,31 +127,51 @@ if [ ! -f "${AGENTS_YAML}" ]; then
 elif ! grep -q 'alissa-managed:' "${AGENTS_YAML}"; then
   log "custom agents.yaml in effect (no alissa-managed marker) — using it verbatim, ALISSA_AGENT_MODEL ignored"
 else
-  BASE_CMD="claude --dangerously-skip-permissions --permission-mode acceptEdits"
-  if [ -z "${AGENT_MODEL}" ] || [ "${AGENT_MODEL}" = "default" ]; then
-    CLAUDE_CMD="${BASE_CMD}"
-    log "reviewer model: account default (ALISSA_AGENT_MODEL='${AGENT_MODEL}') — no --model flag"
-  else
-    CLAUDE_CMD="${BASE_CMD} --model ${AGENT_MODEL}"
-    log "reviewer model: ${AGENT_MODEL} (ALISSA_AGENT_MODEL)"
-  fi
-  # Rewrite the profile's `command:` line. python (not sed) so an arbitrary
-  # passed-through model value can't collide with a substitution metacharacter.
-  python3 - "${AGENTS_YAML}" "${CLAUDE_CMD}" <<'PY' || die "failed to render agents.yaml"
+  # `default` or empty opts out of the pin (empty PIN => no --model flag).
+  case "${AGENT_MODEL}" in
+    default | "") PIN="" ;;
+    *)            PIN="${AGENT_MODEL}" ;;
+  esac
+  # Guard: a real alias/id carries no whitespace. Reject one that does at BOOT,
+  # with a clear message, rather than letting a malformed or flag-injected
+  # `command:` (e.g. "opus --dangerous") surface later as a confusing worker
+  # failure. This is a sanity check, not an allowlist — any single token passes.
+  case "${PIN}" in
+    *[[:space:]]*) die "ALISSA_AGENT_MODEL='${PIN}' contains whitespace — expected an alias (opus) or id (claude-opus-4-8)" ;;
+  esac
+  # Derive the base command from the file's OWN `command:` line (stripping any
+  # existing `--model …`), then append the resolved pin. Deriving — rather than
+  # reconstructing from a hard-coded constant — keeps the base flags in exactly
+  # one place (agents.yaml); a future flag change there is picked up here for
+  # free. Idempotent: the strip makes a re-run a no-op. python (not sed) so the
+  # pin can't collide with a substitution metacharacter; it prints the effective
+  # command back for logging.
+  CLAUDE_CMD="$(python3 - "${AGENTS_YAML}" "${PIN}" <<'PY'
 import re, sys
-path, cmd = sys.argv[1], sys.argv[2]
-out, seen = [], False
+path, pin = sys.argv[1], sys.argv[2]
+out, eff, seen = [], None, False
 for ln in open(path).read().splitlines(keepends=True):
-    m = re.match(r'^(\s*)command:\s', ln)
+    m = re.match(r'^(\s*)command:\s*(.*?)\s*$', ln)
     if m and not seen:
-        out.append(f"{m.group(1)}command: {cmd}\n")
-        seen = True
+        indent, cmd = m.group(1), m.group(2)
+        cmd = re.sub(r'\s*--model\s+\S+', '', cmd).rstrip()  # drop any existing pin
+        if pin:
+            cmd = f"{cmd} --model {pin}"
+        eff, seen = cmd, True
+        out.append(f"{indent}command: {cmd}\n")
     else:
         out.append(ln)
 if not seen:
     sys.exit("no `command:` line found in agents.yaml")
 open(path, "w").writelines(out)
+print(eff)
 PY
+)" || die "failed to render agents.yaml"
+  if [ -n "${PIN}" ]; then
+    log "reviewer model: ${PIN} (ALISSA_AGENT_MODEL)"
+  else
+    log "reviewer model: account default (ALISSA_AGENT_MODEL='${AGENT_MODEL}') — no --model flag"
+  fi
   log "effective reviewer command: ${CLAUDE_CMD}"
 fi
 
