@@ -93,8 +93,9 @@ RUN git config --system url."https://github.com/".insteadOf "git@github.com:" \
 
 # --- Entrypoint + optional firewall ------------------------------------------
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY reviewloop-config.sh /usr/local/bin/reviewloop-config.sh
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/init-firewall.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/reviewloop-config.sh /usr/local/bin/init-firewall.sh
 
 USER alissa
 WORKDIR /home/alissa
@@ -178,8 +179,21 @@ ARG ALISSA_WORKSPACE="alissa-review"
 # alissa-code-git (read-only reviewers never commit).
 ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 # Daemon knobs (see the daemon README's settings table).
-ARG ALISSA_POLL_INTERVAL="60"
-ARG ALISSA_ROUND_CAP="3"
+#
+# ALISSA_POLL_INTERVAL / ALISSA_ROUND_CAP are PASS-THROUGH: their ARG default is
+# empty ON PURPOSE, so when the operator does not set them the entrypoint OMITS
+# the key from the generated config and the daemon library's own current default
+# applies (env var > library default). Baking a concrete value here would shadow
+# the library default — the exact defect this repo's #30 removed. The library
+# defaults at the pinned REVIEWLOOP_VERSION are poll_interval=60, round_cap=3;
+# they are documented in the README, not duplicated here.
+ARG ALISSA_POLL_INTERVAL=""
+ARG ALISSA_ROUND_CAP=""
+# STRUCTURAL container constants (not pass-through): agent_profile must name a
+# profile the baked agents.yaml ships (`claude`); on_missing_hub must be `add`
+# for the self-contained hub-ify-on-demand model (the library default `skip`
+# would review nothing on a fresh volume). Kept explicit and pinned by
+# tests-entrypoint-config.sh.
 ARG ALISSA_AGENT_PROFILE="claude"
 # Reviewer model pinned into the agents.yaml claude command at boot (the reviewer
 # is the quality gate, so it must not silently fall back to a smaller model on a

@@ -155,14 +155,33 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_REVIEW_REPOS` | *(required if no manifest mounted)* | allowlist as one `\|`-separated string (see below) |
 | `ALISSA_WORKSPACE` | `alissa-review` | workspace name in the generated manifest |
 | `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
-| `ALISSA_POLL_INTERVAL` | `60` | seconds between polls (≥10) |
-| `ALISSA_ROUND_CAP` | `3` | CR9 round cap |
-| `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches |
+| `ALISSA_POLL_INTERVAL` | *daemon default* (currently 60) | seconds between polls (≥10); **pass-through** — unset ⇒ library default |
+| `ALISSA_ROUND_CAP` | *daemon default* (currently 3) | CR9 round cap; **pass-through** — unset ⇒ library default |
+| `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
 | `ALISSA_AGENT_MODEL` | `opus` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
 | `ALISSA_WORKER_INTERVAL` | `2` | worker reconcile tick (seconds) |
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |
 | `ALISSA_FIREWALL_EXTRA` | *(empty)* | extra firewall allowlist hosts, space-separated |
+
+#### Config precedence: env var > daemon library default
+
+The optional tuning knobs `ALISSA_POLL_INTERVAL` and `ALISSA_ROUND_CAP` are
+**pass-through**: their build `ARG` default is empty, and when they are unset the
+entrypoint **omits the key entirely** from the generated `reviewloop.config.json`
+so the daemon library applies its own current default. There is no hidden
+entrypoint fallback layer that would shadow it — set the env var to override,
+leave it unset to inherit the library default (which is why the "default" column
+above says *daemon default* rather than a baked number, and why upgrading the
+daemon can change these without a Dockerfile edit). The parenthetical values are
+the library defaults at the pinned `REVIEWLOOP_VERSION`, informational only.
+
+`ALISSA_AGENT_PROFILE` and `ALISSA_ON_MISSING_HUB` are **not** pass-through: they
+are container constants the image requires. `agent_profile` must name a profile
+that the baked [`agents.yaml`](./agents.yaml) ships (`claude`), and
+`on_missing_hub` must be `add` for the self-contained hub-ify-on-demand model —
+the library default `skip` would make a fresh volume review nothing. Both are
+still overridable via their env var.
 
 ### The repos allowlist string
 
