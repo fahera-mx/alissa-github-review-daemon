@@ -47,6 +47,17 @@ class PullRequest:
 
 
 @dataclass(frozen=True)
+class IssueComment:
+    """An issue comment on a PR (a PR is an issue). Distinct from Review:
+    issue comments live on the issues endpoints and never create review
+    records, so posting one can never disturb round counting."""
+
+    id: int
+    author: str
+    body: str
+
+
+@dataclass(frozen=True)
 class Review:
     author: str
     state: str
@@ -220,4 +231,33 @@ class GitHub:
                 "-f",
                 f"body={body}",
             ]
+        )
+
+    def issue_comments(self, owner: str, repo: str, number: int) -> list[IssueComment]:
+        data = (
+            self._api(
+                "-X",
+                "GET",
+                f"repos/{owner}/{repo}/issues/{number}/comments",
+                "-f",
+                "per_page=100",
+            )
+            or []
+        )
+        return [
+            IssueComment(
+                id=int(c.get("id") or 0),
+                author=(c.get("user") or {}).get("login", ""),
+                body=c.get("body") or "",
+            )
+            for c in data
+        ]
+
+    def update_comment(self, owner: str, repo: str, comment_id: int, body: str) -> None:
+        self._api(
+            "-X",
+            "PATCH",
+            f"repos/{owner}/{repo}/issues/comments/{comment_id}",
+            "-f",
+            f"body={body}",
         )
