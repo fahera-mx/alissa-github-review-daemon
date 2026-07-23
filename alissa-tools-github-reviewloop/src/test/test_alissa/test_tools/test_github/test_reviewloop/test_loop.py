@@ -724,7 +724,17 @@ def test_cli_repos_replace_rather_than_extend(tmp_path):
 def test_config_file_is_optional(tmp_path):
     cfg = Config.build(tmp_path, None, {"poll_interval": 45})
     assert cfg.poll_interval == 45
-    assert cfg.round_cap == 3
+    assert cfg.round_cap == 10
+
+
+def test_round_cap_default_is_ten(tmp_path):
+    """CR9 default is 10 (operator decision 2026-07-23). Pin it in both the
+    dataclass default and the from-raw fallback so a silent revert to 3 fails."""
+    assert Config.round_cap == 10
+    # No round_cap in the file or on the CLI -> the from-raw fallback applies.
+    assert Config.build(tmp_path).round_cap == 10
+    # An explicit override still wins.
+    assert Config.build(tmp_path, {"round_cap": 7}).round_cap == 7
 
 
 def test_underscore_keys_are_treated_as_comments(tmp_path):

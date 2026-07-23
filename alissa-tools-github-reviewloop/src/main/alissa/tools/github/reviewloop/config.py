@@ -63,7 +63,7 @@ class Config:
 
     hub_template: str = "{root}/{repo}/main"
     poll_interval: int = 60
-    round_cap: int = 3  # CR9 default
+    round_cap: int = 10  # CR9 default
 
     # Empty tuple means "every repo that requests a review from me".
     repos: tuple[str, ...] = ()
@@ -158,7 +158,7 @@ class Config:
                 "whatever repo requests a review is unbounded"
             )
 
-        cap = int(raw.get("round_cap", 3))
+        cap = int(raw.get("round_cap", cls.round_cap))
         if cap < 1:
             raise ValueError(f"round_cap must be >= 1, got {cap}")
 
