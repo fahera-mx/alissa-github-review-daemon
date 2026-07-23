@@ -18,13 +18,21 @@ from alissa.tools.github.reviewloop.config import (
     resolve_config_path,
 )
 from alissa.tools.github.reviewloop.alissa import ManagedSession
-from alissa.tools.github.reviewloop.ghclient import GitHub, IdentityMismatch, PullRequest, Review
+from alissa.tools.github.reviewloop.ghclient import (
+    GitHub,
+    IdentityMismatch,
+    IssueComment,
+    PullRequest,
+    Review,
+)
 from alissa.tools.github.reviewloop.loop import (
+    ACTIVITY_MARKER,
     REAP_QUIET_SECONDS,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
     Action,
     ReviewWatcher,
+    deferral_activity_kind,
     session_name,
     stalled_kind,
 )
@@ -40,6 +48,11 @@ class FakeGitHub:
         self._pr = pr
         self._reviews = reviews
         self.comments: list[str] = []
+        # Issue comments live in their own store, exactly as on GitHub: posting
+        # or PATCHing one can never touch self._reviews, which is what the
+        # activity-comment pinning tests lean on.
+        self.issue_store: list[IssueComment] = []
+        self._next_comment_id = 1000
         self.requests = [(OWNER, REPO, NUMBER)]
         self.pr_fetches = 0
 
@@ -56,6 +69,24 @@ class FakeGitHub:
 
     def comment(self, owner, repo, number, body):
         self.comments.append(body)
+        self.seed_comment(self.login, body)
+
+    def seed_comment(self, author, body):
+        """Plant an issue comment as any author — the spoofed-marker case."""
+        self.issue_store.append(
+            IssueComment(id=self._next_comment_id, author=author, body=body)
+        )
+        self._next_comment_id += 1
+
+    def issue_comments(self, owner, repo, number):
+        return list(self.issue_store)
+
+    def update_comment(self, owner, repo, comment_id, body):
+        for i, c in enumerate(self.issue_store):
+            if c.id == comment_id:
+                self.issue_store[i] = IssueComment(id=c.id, author=c.author, body=body)
+                return
+        raise AssertionError(f"PATCH of unknown comment id {comment_id}")
 
     def review_requests(self, repos=()):
         # The starved case the sweep exists for is a PR ABSENT from this
@@ -141,6 +172,16 @@ def review(
         url=f"https://github.com/{SLUG}/pull/{NUMBER}#r1",
         body=body,
     )
+
+
+def operator_comments(gh):
+    """Escalation/stall pings only — the mechanical activity log is separate
+    traffic and must not trip 'must not escalate' style assertions."""
+    return [c for c in gh.comments if ACTIVITY_MARKER not in c]
+
+
+def activity_comments(gh):
+    return [c for c in gh.issue_store if ACTIVITY_MARKER in c.body]
 
 
 @pytest.fixture
@@ -327,7 +368,7 @@ def test_artifacts_do_not_push_the_loop_into_a_false_cap_out(config):
 
     assert d.action is Action.SPAWNED
     assert d.round == 2
-    assert gh.comments == [], "must not escalate on artifact count"
+    assert operator_comments(gh) == [], "must not escalate on artifact count"
 
 
 # -- convergence and cap-out ----------------------------------------------
@@ -1428,9 +1469,9 @@ def test_floor_pings_the_operator_once_per_episode(config):
     assert first.action is Action.IN_FLIGHT
     assert second.action is Action.IN_FLIGHT
     assert len(al.enqueued) == 1, "the floor pings, it never respawns"
-    assert len(gh.comments) == 1, "one ping per deferral episode"
-    assert "stalled" in gh.comments[0].lower()
-    assert session in gh.comments[0]
+    assert len(operator_comments(gh)) == 1, "one ping per deferral episode"
+    assert "stalled" in operator_comments(gh)[0].lower()
+    assert session in operator_comments(gh)[0]
     assert st.pinged(f"{OWNER}/{REPO}", NUMBER, stalled_kind(session))
 
 
@@ -1444,7 +1485,7 @@ def test_deferral_below_the_floor_does_not_ping(config):
     d = w.evaluate(OWNER, REPO, NUMBER)
 
     assert d.action is Action.IN_FLIGHT
-    assert gh.comments == []
+    assert operator_comments(gh) == []
 
 
 def test_a_new_deferral_episode_pings_again(config):
@@ -1458,7 +1499,7 @@ def test_a_new_deferral_episode_pings_again(config):
     _live(al, s1, status="busy")
     _backdate(st, PAST_FLOOR)
     w.evaluate(OWNER, REPO, NUMBER)  # episode 1's ping
-    assert len(gh.comments) == 1
+    assert len(operator_comments(gh)) == 1
 
     al.sessions = []  # the operator killed the wedged session
     w.evaluate(OWNER, REPO, NUMBER)  # stale + dead -> respawn (episode 2)
@@ -1469,7 +1510,7 @@ def test_a_new_deferral_episode_pings_again(config):
 
     w.evaluate(OWNER, REPO, NUMBER)
 
-    assert len(gh.comments) == 2, "a fresh episode must ping again"
+    assert len(operator_comments(gh)) == 2, "a fresh episode must ping again"
 
 
 def test_floor_ping_dry_run_is_silent(config):
@@ -1517,6 +1558,187 @@ def test_failed_ping_comment_retries_next_poll(config):
     w.evaluate(OWNER, REPO, NUMBER)  # now deduped
 
     assert len(calls) == 2
+
+
+# -- the mechanical activity comment ----------------------------------------
+
+
+def test_spawns_append_lines_to_one_activity_comment(config):
+    """Round-k spawns across polls land as appended lines in a SINGLE
+    marker-carrying issue comment: created on the first spawn, PATCHed ever
+    after — never a second comment per round."""
+    st = State(config.state_db)
+    gh = FakeGitHub(make_pr(), [])
+    al = FakeAlissa(FakeTask(), verdict_count=0)
+    w = ReviewWatcher(config, github=gh, alissa=al, state=st)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).round == 1
+    al.verdict_count = 1  # round 1's verdict envelope landed
+    assert w.evaluate(OWNER, REPO, NUMBER).round == 2
+
+    acts = activity_comments(gh)
+    assert len(acts) == 1, "exactly ONE activity comment per PR"
+    body = acts[0].body
+    assert "round 1 of 3" in body
+    assert "round 2 of 3" in body
+    assert al.enqueued[0]["session"] in body
+    assert al.enqueued[1]["session"] in body
+    assert "UTC" in body
+    # The comment-create path ran once; round 2's line arrived via PATCH.
+    assert len([c for c in gh.comments if ACTIVITY_MARKER in c]) == 1
+
+
+def test_stale_reenqueue_appends_its_context_line(config):
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    _backdate(st, PAST_STALE)  # stale, session gone -> presumed dead
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    body = activity_comments(gh)[0].body
+    assert "re-enqueued — previous session presumed dead" in body
+    assert al.enqueued[1]["session"] in body
+
+
+def test_liveness_deferral_appends_one_line_per_episode(config):
+    """The deferral is re-decided every poll; appending per decision would
+    grow the comment by a line a minute for hours. One line per deferral
+    episode (keyed on the session, like the stalled ping) says the same
+    thing without the spam."""
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    session = al.enqueued[0]["session"]
+    _live(al, session, status="busy")
+    _backdate(st, PAST_STALE)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.IN_FLIGHT
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.IN_FLIGHT
+
+    body = activity_comments(gh)[0].body
+    assert f"deferred — session `{session}` still busy" in body
+    assert body.count("deferred") == 1, "one deferral line per episode"
+    assert st.pinged(SLUG, NUMBER, deferral_activity_kind(session))
+
+
+def test_spoofed_marker_from_another_author_is_never_patched(config):
+    """Anyone can paste the hidden marker into their own comment; the
+    find-or-create filter is own-author AND marker, so a spoof is ignored
+    and the daemon still creates (and appends to) its OWN comment."""
+    w, gh, al = watcher(config, make_pr(), [])
+    spoof = f"{ACTIVITY_MARKER}\nnot the daemon's comment"
+    gh.seed_comment("mallory", spoof)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    spoofed = [c for c in gh.issue_store if c.author == "mallory"]
+    assert spoofed[0].body == spoof, "the spoofed comment must never be PATCHed"
+    mine = [c for c in activity_comments(gh) if c.author == "alissa-app"]
+    assert len(mine) == 1
+    assert al.enqueued[0]["session"] in mine[0].body
+
+
+def _raising(exc):
+    def boom(*a, **k):
+        raise exc
+
+    return boom
+
+
+@pytest.mark.parametrize("surface", ["list", "list-rate-limited", "create"])
+def test_activity_failures_never_block_the_spawn(config, surface):
+    """Best-effort by contract: list/create/PATCH failures — including a
+    rate-limit, which _api surfaces as RateLimited, not CommandError — log a
+    warning and the spawn still goes through."""
+    from alissa.tools.github.reviewloop.ghclient import RateLimited
+    from alissa.tools.github.reviewloop.proc import CommandError
+
+    w, gh, al = watcher(config, make_pr(), [])
+    if surface == "list":
+        gh.issue_comments = _raising(CommandError(["gh", "api"], 1, "boom"))
+    elif surface == "list-rate-limited":
+        gh.issue_comments = _raising(RateLimited("limit"))
+    else:  # create: listing worked, no activity comment exists yet
+        gh.comment = _raising(CommandError(["gh", "api"], 1, "boom"))
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert len(al.enqueued) == 1
+
+
+def test_activity_dry_run_appends_nothing(config, caplog):
+    import logging as _logging
+    from dataclasses import replace
+
+    cfg = replace(config, dry_run=True)
+    w, gh, al = watcher(cfg, make_pr(), [], state=State(cfg.state_db))
+
+    with caplog.at_level(_logging.INFO, logger="alissa.tools.github.reviewloop.loop"):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert gh.issue_store == [] and gh.comments == []
+    assert any(
+        "[dry-run] would append" in r.getMessage() for r in caplog.records
+    ), "dry-run must say what it would have appended"
+
+
+def test_deferral_activity_dry_run_burns_no_episode(config):
+    """Like the floor ping, dry-run must not record the deferral episode — a
+    later real run still owes the PR its deferral line."""
+    from dataclasses import replace
+
+    cfg = replace(config, dry_run=True)
+    st = State(cfg.state_db)
+    w, gh, al = watcher(cfg, make_pr(), [], state=st)
+    pr = make_pr()
+    session = _record(w, pr, 1)  # a real run recorded this spawn earlier
+    _live(al, session, status="busy")
+    _backdate(st, PAST_STALE)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.IN_FLIGHT
+    assert gh.issue_store == []
+    assert not st.pinged(SLUG, NUMBER, deferral_activity_kind(session))
+
+
+def test_escalation_comments_stay_separate_from_the_activity_comment(config):
+    reviews = [review("CHANGES_REQUESTED", at=f"2026-07-18T1{i}:00:00Z") for i in range(3)]
+    w, gh, _ = watcher(config, make_pr(), reviews)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+
+    assert len(gh.comments) == 1
+    assert ACTIVITY_MARKER not in gh.comments[0], "cap-out must not carry the marker"
+    assert activity_comments(gh) == []
+
+
+def test_activity_comment_creates_no_review_record(config):
+    """PINNING: the activity comment is an ISSUE comment. It must never
+    appear as a review record, so round counting — substantive submitted
+    reviews — is provably unaffected by any number of activity appends.
+
+    task=None pins the GitHub-count fallback, the path where a leaked
+    record would corrupt the round math directly: if the activity comment
+    counted as a review, `completed` would read 2 and the re-evaluation
+    below would spawn round 3 instead of reporting round 2 in flight.
+    """
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()], task=None)
+    before = gh.my_reviews(OWNER, REPO, NUMBER)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)  # spawns round 2, appends the line
+
+    assert d.round == 2
+    assert len(activity_comments(gh)) == 1, "the line landed as an issue comment"
+    assert gh.my_reviews(OWNER, REPO, NUMBER) == before, (
+        "posting the activity comment must not create a review record"
+    )
+    d2 = w.evaluate(OWNER, REPO, NUMBER)
+    assert d2.action is Action.IN_FLIGHT
+    assert d2.round == 2, "round math unchanged by the activity comment"
 
 
 # -- run_forever ------------------------------------------------------------

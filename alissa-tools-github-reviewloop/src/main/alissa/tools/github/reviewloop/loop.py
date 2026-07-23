@@ -123,10 +123,36 @@ STALLED_COMMENT = (
     "finish the round by hand."
 )
 
+# The hidden marker that identifies THE activity comment on a PR. Find-or-create
+# keys on it (plus own authorship -- anyone can paste the marker into their own
+# comment, and a spoofed marker must never be PATCHed), so every append lands in
+# the same single comment however many rounds run.
+ACTIVITY_MARKER = "<!-- alissa-reviewloop:activity -->"
+
+ACTIVITY_HEADER = (
+    ACTIVITY_MARKER + "\n"
+    "**Review-loop activity** — mechanical spawn/round log; the daemon appends "
+    "a line each time it queues (or defers) a reviewer round on this PR."
+)
+
 # The ping-ledger kind prefix for the stalled-deferral operator ping. Unlike
 # the cap-out escalation (terminal per head), a stall can recur, so the kind
 # is narrowed per episode -- see stalled_kind.
 ESCALATION_STALLED = "stalled"
+
+
+def deferral_activity_kind(session: str) -> str:
+    """The ping-ledger kind that dedupes ONE deferral episode's activity line.
+
+    A deferral is re-decided every poll, so appending per decision would grow
+    the activity comment by one identical line a minute for as long as the
+    session holds out. One line per episode carries the same information --
+    "the daemon is deferring behind this session" -- and the session name is
+    the episode identity (nonce-unique per spawn), exactly as stalled_kind
+    reasons for the operator ping. Recorded only after the append lands, so a
+    transient failure retries next poll.
+    """
+    return f"activity-deferred:{session}"
 
 
 def stalled_kind(session: str) -> str:
@@ -252,7 +278,7 @@ class ReviewWatcher:
                 age / 60,
             )
 
-        return self._spawn(pr, round_, task)
+        return self._spawn(pr, round_, task, reenqueued=age is not None)
 
     def _defer_stale_round(self, pr: PullRequest, round_: int, age: float) -> Decision | None:
         """The liveness signal under the stale timer: a deferral, or None to
@@ -310,10 +336,24 @@ class ReviewWatcher:
             and not self.state.pinged(pr.full_name, pr.number, stalled_kind(session))
         ):
             self._escalate_stalled(pr, round_, session, age)
+
+        life = "active" if ses.is_idle else "busy"
+        if not self.state.pinged(pr.full_name, pr.number, deferral_activity_kind(session)):
+            appended = self._append_activity(
+                pr,
+                self._activity_line(
+                    session, round_, f"deferred — session `{session}` still {life}"
+                ),
+            )
+            if appended:
+                self.state.record_ping(
+                    pr.full_name, pr.number, deferral_activity_kind(session)
+                )
+
         return Decision(
             Action.IN_FLIGHT,
             f"round {round_} is stale ({int(age / 60)} min) but session "
-            f"{session} is still {'active' if ses.is_idle else 'busy'} — not "
+            f"{session} is still {life} — not "
             f"respawning over a live reviewer",
             round_,
         )
@@ -495,7 +535,9 @@ class ReviewWatcher:
 
     # -- actions -----------------------------------------------------------
 
-    def _spawn(self, pr: PullRequest, round_: int, task: Task | None) -> Decision:
+    def _spawn(
+        self, pr: PullRequest, round_: int, task: Task | None, *, reenqueued: bool = False
+    ) -> Decision:
         if task is None:
             if self.config.on_missing_review_task == ON_MISSING_SKIP:
                 return Decision(
@@ -542,6 +584,13 @@ class ReviewWatcher:
                 session=name,
                 task_ref=task.ref if task else None,
             )
+
+        # AFTER the enqueue on purpose: the activity comment is telemetry and
+        # must never gate the spawn it reports on.
+        context = (
+            "re-enqueued — previous session presumed dead" if reenqueued else "spawned"
+        )
+        self._append_activity(pr, self._activity_line(name, round_, context))
 
         return Decision(
             Action.SPAWNED,
@@ -620,6 +669,46 @@ class ReviewWatcher:
             )
 
         return warnings
+
+    def _activity_line(self, session: str, round_: int, context: str) -> str:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        return f"- {ts} — `{session}` — round {round_} of {self.config.round_cap} — {context}"
+
+    def _append_activity(self, pr: PullRequest, line: str) -> bool:
+        """Append one line to THE activity comment on the PR; True if it landed.
+
+        Find-or-create: the PR's issue comments are filtered to OWN authorship
+        AND the hidden marker, and the line is PATCH-appended to the first
+        match; with no match, one marker-carrying comment is created. A marker
+        pasted by anyone else fails the author filter and is never touched.
+
+        Best-effort by contract: this is telemetry about a spawn that has
+        already happened, so no failure here may surface to the caller. The
+        except is deliberately broad -- _api turns rate-limit errors into
+        RateLimited (not CommandError), and letting that fly out of evaluate()
+        would fail the whole poll pass over a log line.
+        """
+        if self.config.dry_run:
+            log.info("[dry-run] would append activity line on %s: %s", pr.slug, line)
+            return False
+        try:
+            mine = [
+                c
+                for c in self.github.issue_comments(pr.owner, pr.repo, pr.number)
+                if c.author == self.github.login and ACTIVITY_MARKER in c.body
+            ]
+            if mine:
+                self.github.update_comment(
+                    pr.owner, pr.repo, mine[0].id, mine[0].body + "\n" + line
+                )
+            else:
+                self.github.comment(
+                    pr.owner, pr.repo, pr.number, ACTIVITY_HEADER + "\n" + line
+                )
+        except Exception as exc:
+            log.warning("could not append activity line on %s: %s", pr.slug, exc)
+            return False
+        return True
 
     def _escalate_stalled(
         self, pr: PullRequest, round_: int, session: str, age: float
