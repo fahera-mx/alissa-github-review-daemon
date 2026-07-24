@@ -6,6 +6,7 @@ it is in flight, when the loop has converged, and when CR9 caps out.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 
 import pytest
@@ -1822,3 +1823,168 @@ def test_count_verdicts_counts_only_envelope_evidence():
     assert Alissa._count_verdicts({}) == 0
     assert Alissa._count_verdicts({"evidence": "nope"}) == 0
     assert Alissa._count_verdicts("garbage") == 0
+
+
+# -- poll snapshots (the console sidecar's exhaust) ------------------------
+
+
+def _stale_spawn(st, session):
+    """Backdate a recorded spawn past the staleness threshold."""
+    st._db.execute(
+        "UPDATE spawns SET spawned_at=? WHERE session=?",
+        (int(time.time()) - STALE_ROUND_SECONDS - 60, session),
+    )
+    st._db.commit()
+
+
+def test_poll_writes_exactly_one_snapshot_per_pass(config):
+    w, _, _ = watcher(config, make_pr(), [])
+    assert w.state.read_snapshots() == []
+
+    w.poll_once()
+    w.poll_once()
+
+    assert len(w.state.read_snapshots()) == 2, "one snapshot per poll pass"
+
+
+def test_empty_pass_still_writes_a_snapshot(config):
+    w, gh, _ = watcher(config, make_pr(), [])
+    gh.requests = []  # nothing pending
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[0]
+    assert snap["candidates"] == 0
+    assert snap["stages"] == []
+
+
+def test_snapshot_records_a_spawn(config):
+    w, _, al = watcher(config, make_pr(), [])
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[0]
+    assert snap["candidates"] == 1
+    assert snap["spawned"] == 1
+    assert snap["stale_reenqueued"] == 0
+    stage = snap["stages"][0]
+    assert stage["slug"] == f"{OWNER}/{REPO}#{NUMBER}"
+    assert stage["number"] == NUMBER
+    assert stage["round"] == 1
+    assert stage["attempt"] is None
+    assert stage["stage"] == "spawned"
+    assert stage["session"] == al.enqueued[0]["session"]
+    assert stage["task_ref"] == "TASK-500"
+
+
+def test_snapshot_records_a_skip(config):
+    w, _, _ = watcher(config, make_pr(draft=True), [])
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[0]
+    assert snap["skipped"] == 1
+    assert snap["stages"][0]["stage"] == "skipped"
+
+
+def test_snapshot_records_convergence(config):
+    w, _, _ = watcher(config, make_pr(), [review("APPROVED")], verdict="approve")
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[0]
+    assert snap["converged"] == 1
+    assert snap["stages"][0]["stage"] == "converged"
+
+
+def test_snapshot_records_an_escalation(config):
+    reviews = [
+        review(at="2026-07-18T10:00:00Z"),
+        review(at="2026-07-18T11:00:00Z"),
+        review(at="2026-07-18T12:00:00Z"),
+    ]
+    w, _, _ = watcher(config, make_pr(), reviews)  # 3 rounds, cap 3, no approve
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[0]
+    assert snap["escalated"] == 1
+    assert snap["stages"][0]["stage"] == "escalated"
+
+
+def test_snapshot_distinguishes_a_liveness_deferral_from_in_flight(config):
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)  # round 1 spawn recorded
+    name = al.enqueued[0]["session"]
+    _stale_spawn(st, name)
+    _live(al, name, status="busy")  # session still alive → defer, don't respawn
+
+    w.poll_once()
+
+    snap = st.read_snapshots()[0]
+    assert snap["deferred"] == 1, "a liveness deferral is its own bucket"
+    assert snap["in_flight"] == 0
+    stage = snap["stages"][0]
+    assert stage["stage"] == "deferred"
+    assert stage["session"] == name
+
+
+def test_snapshot_records_a_stale_reenqueue(config):
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)  # round 1 spawn recorded
+    name = al.enqueued[0]["session"]
+    _stale_spawn(st, name)
+    # No live session for `name` → the round's reviewer is presumed dead, so
+    # the pass respawns it: the "stale-re-enqueued" bucket, not a fresh spawn.
+
+    w.poll_once()
+
+    snap = st.read_snapshots()[0]
+    assert snap["stale_reenqueued"] == 1
+    assert snap["spawned"] == 0
+    assert snap["stages"][0]["stage"] == "stale-re-enqueued"
+
+
+def test_snapshot_records_the_reap_count(config):
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review("APPROVED")], verdict="approve")
+    gh.requests = []  # approved → the request is gone; only the sweep acts
+    s1 = _record(w, pr, 1)
+    _live(al, s1)  # idle and quiet → reapable
+
+    w.poll_once()
+
+    assert al.killed == [s1]
+    assert w.state.read_snapshots()[0]["reaped"] == 1
+
+
+def test_poll_captures_a_snapshot_in_dry_run(config):
+    """AC: a dry-run pass OBSERVES the daemon's state — the snapshot is written
+    even though the pass mutates nothing (no spawn ledger row, no reap)."""
+    dry = dataclasses.replace(config, dry_run=True)
+    w, _, _ = watcher(dry, make_pr(), [])
+    assert w.state.read_snapshots() == []
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[0]
+    assert snap["candidates"] == 1
+    assert snap["spawned"] == 1
+    # The observation is recorded, but the spawn ledger was NOT touched.
+    assert w.state.get_spawn(SLUG, NUMBER, 1) is None
+
+
+def test_dry_run_snapshot_reaps_nothing(config):
+    dry = dataclasses.replace(config, dry_run=True)
+    pr = make_pr()
+    w, gh, al = watcher(dry, pr, [review("APPROVED")], verdict="approve")
+    gh.requests = []
+    s1 = _record(w, pr, 1)
+    _live(al, s1)  # reapable, but dry-run kills nothing
+
+    w.poll_once()
+
+    assert al.killed == []
+    assert w.state.read_snapshots()[0]["reaped"] == 0

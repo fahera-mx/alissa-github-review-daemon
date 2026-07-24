@@ -7,13 +7,34 @@ session name back to the round it was spawned for (so the reap sweep can tell
 a finished round's session from an in-flight one), and to remember that a
 cap-out was already escalated. The ledger tolerates sessions dying or being
 killed behind its back: a reap record is bookkeeping, never a precondition.
+
+The `poll_snapshots` table is a different animal from the ledger above: it
+records what each poll pass OBSERVED, not what the daemon must remember to
+avoid double-work. One row per pass carries the timing, the candidate count,
+the decision-summary counts, and a compact JSON column of the pass's per-item
+stages -- everything a future console sidecar (the UI-1 pattern ported from
+the devloop) needs to render live daemon state without spending a single
+GitHub API call of its own. It is self-bounding: the newest SNAPSHOT_RETENTION
+rows are kept and older ones pruned on every write. `read_snapshots` is the
+reader that sidecar will consume (newest first, `stages` decoded back from
+JSON). Adding the table is itself the migration for an existing database --
+`CREATE TABLE IF NOT EXISTS` creates it on the next open of a DB that predates
+it, alongside the untouched legacy ledgers.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
+
+# Poll-snapshot retention: the newest N rows are kept, older ones pruned on
+# every write. Fixed, not a config key -- `poll_snapshots` is an observation
+# buffer for a future console sidecar, and a bounded ring is all it needs (it
+# reads the recent tail). A change to this constant is a change to the
+# observable buffer size, so it is pinned by a test.
+SNAPSHOT_RETENTION = 1000
 
 # Shared between SCHEMA and the migration so the two can never drift.
 _SPAWNS_TABLE = """
@@ -51,6 +72,23 @@ CREATE TABLE IF NOT EXISTS pings (
     kind      TEXT    NOT NULL,
     pinged_at INTEGER NOT NULL,
     PRIMARY KEY (repo, number, kind)
+);
+
+CREATE TABLE IF NOT EXISTS poll_snapshots (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                INTEGER NOT NULL,
+    duration_ms       INTEGER NOT NULL,
+    candidates        INTEGER NOT NULL,
+    spawned           INTEGER NOT NULL,
+    stale_reenqueued  INTEGER NOT NULL,
+    in_flight         INTEGER NOT NULL,
+    deferred          INTEGER NOT NULL,
+    converged         INTEGER NOT NULL,
+    capped            INTEGER NOT NULL,
+    escalated         INTEGER NOT NULL,
+    skipped           INTEGER NOT NULL,
+    reaped            INTEGER NOT NULL,
+    stages_json       TEXT    NOT NULL
 );
 """
 
@@ -216,3 +254,81 @@ class State:
             (repo, number, head_sha, int(time.time())),
         )
         self._db.commit()
+
+    # -- poll snapshots (the console sidecar's exhaust buffer) -------------
+
+    def record_snapshot(
+        self,
+        *,
+        duration_ms: int,
+        candidates: int,
+        spawned: int = 0,
+        stale_reenqueued: int = 0,
+        in_flight: int = 0,
+        deferred: int = 0,
+        converged: int = 0,
+        capped: int = 0,
+        escalated: int = 0,
+        skipped: int = 0,
+        reaped: int = 0,
+        stages: list[dict],
+    ) -> None:
+        """Append one poll-pass observation, then prune to the newest
+        SNAPSHOT_RETENTION rows. `ts` is stamped here (wall-clock seconds,
+        like every other row in this ledger); `stages` is the compact
+        per-item list a future console reads back through read_snapshots,
+        serialized to JSON. Purely observational -- written on every pass,
+        dry-run included -- and pruned on write, so the table is
+        self-bounding. The count kwargs default to 0 so a caller need only
+        pass the ones a given pass produced.
+        """
+        self._db.execute(
+            "INSERT INTO poll_snapshots "
+            "(ts, duration_ms, candidates, spawned, stale_reenqueued, "
+            "in_flight, deferred, converged, capped, escalated, skipped, "
+            "reaped, stages_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                int(time.time()),
+                duration_ms,
+                candidates,
+                spawned,
+                stale_reenqueued,
+                in_flight,
+                deferred,
+                converged,
+                capped,
+                escalated,
+                skipped,
+                reaped,
+                json.dumps(stages, separators=(",", ":")),
+            ),
+        )
+        # Prune on write: keep the newest SNAPSHOT_RETENTION rows by id. The
+        # autoincrement id is monotonic across prunes, so "newest" is well
+        # defined even when a wall-clock step would leave `ts` unordered.
+        self._db.execute(
+            "DELETE FROM poll_snapshots WHERE id NOT IN "
+            "(SELECT id FROM poll_snapshots ORDER BY id DESC LIMIT ?)",
+            (SNAPSHOT_RETENTION,),
+        )
+        self._db.commit()
+
+    def read_snapshots(self, limit: int | None = None) -> list[dict]:
+        """Poll snapshots newest-first, each with its per-item `stages` list
+        decoded back from JSON (the round-trip counterpart of
+        record_snapshot). `limit` caps the rows returned; None returns every
+        retained row. This is the whole contract the future console depends
+        on -- everything it needs is already here, so it makes no GitHub
+        calls."""
+        sql = "SELECT * FROM poll_snapshots ORDER BY id DESC"
+        params: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        out = []
+        for row in self._db.execute(sql, params).fetchall():
+            record = dict(row)
+            record["stages"] = json.loads(record.pop("stages_json"))
+            out.append(record)
+        return out

@@ -195,6 +195,27 @@ prevent that:
 `enqueue_reviewer` sets the reviewer queue's `respawn off`, so a kill (from either
 path) can never trigger a respawn loop.
 
+### Poll snapshots (console exhaust)
+
+Every poll pass persists one row to a `poll_snapshots` table in the same SQLite
+state DB — a self-contained record of what that pass *observed*, so a future
+console sidecar can render live daemon state without spending any GitHub API
+budget of its own (the UI-1 pattern ported from the devloop). Each row carries
+the timestamp, the pass duration in ms, the candidate count, the decision-summary
+counts (`spawned`, `stale_reenqueued`, `in_flight`, `deferred`, `converged`,
+`capped`, `escalated`, `skipped`) and the reap count, plus a JSON column of the
+pass's per-item stages (PR slug and number, round, session name, current stage,
+reason, task ref). It is built entirely from the per-PR decisions already in hand
+— **no extra GitHub calls** — and the table is self-bounding: the newest 1,000
+rows are kept and older ones pruned on every write.
+
+A snapshot **observes** a pass; it is not an action the daemon takes, so it is
+written in `--dry-run` too (where the counts and stages reflect what *would* have
+happened, and the reap count is `0`). `State.read_snapshots()` is the reader the
+console will consume — newest first, with the `stages` JSON decoded back to a
+list. Nothing in the decision logic reads a snapshot, so persisting it can never
+change which reviewers spawn.
+
 ## Scope
 
 The daemon (`alissa-revloop`) is the **reviewer side**. It reacts to review
@@ -315,7 +336,9 @@ bash check-style.sh alissa-tools-github-revloop
 bash check-types.sh alissa-tools-github-revloop
 ```
 
-96 tests cover the decision state machine, the config layering, and the
+154 tests cover the decision state machine, the config layering, the
+`poll_snapshots` exhaust buffer (record/read round-trip, retention pruning,
+in-place migration, one-snapshot-per-poll, dry-run capture), and the
 `alissa-pr-review` round/verdict/timeout logic, with GitHub and Alissa faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,

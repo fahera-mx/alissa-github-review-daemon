@@ -14,6 +14,7 @@ import logging
 import re
 import secrets
 import time
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -185,6 +186,19 @@ class Decision:
     action: Action
     reason: str = ""
     round: int | None = None
+    # Descriptive metadata for the poll-snapshot exhaust (see
+    # ReviewWatcher._stage_record). Populated where a decision names a concrete
+    # reviewer -- the SPAWNED path and the liveness-deferral IN_FLIGHT paths --
+    # and left at its default elsewhere. Purely observational: nothing in the
+    # decision logic reads these, so they never change which branch is taken.
+    # `deferred` marks an IN_FLIGHT that is a liveness deferral (a live session
+    # holding the respawn back) rather than a freshly-enqueued round;
+    # `reenqueued` marks a SPAWNED that respawned a round whose prior session
+    # was presumed dead (the "stale-re-enqueued" summary bucket).
+    session: str | None = None
+    task_ref: str | None = None
+    deferred: bool = False
+    reenqueued: bool = False
 
 
 def session_name(pr: PullRequest, round_: int) -> str:
@@ -323,6 +337,8 @@ class ReviewWatcher:
                 Action.IN_FLIGHT,
                 f"round {round_} is stale but liveness is unprobeable — deferring",
                 round_,
+                session=session,
+                deferred=True,
             )
 
         ses = live.get(session)
@@ -356,6 +372,8 @@ class ReviewWatcher:
             f"{session} is still {life} — not "
             f"respawning over a live reviewer",
             round_,
+            session=session,
+            deferred=True,
         )
 
     def _convergence_reason(
@@ -405,8 +423,13 @@ class ReviewWatcher:
 
     # -- reap sweep --------------------------------------------------------
 
-    def sweep_sessions(self) -> None:
+    def sweep_sessions(self) -> int:
         """Kill the managed session of every finished round. Runs every poll.
+
+        Returns the number of sessions actually reaped this pass (0 in
+        `--dry-run`, where the sweep only logs) -- the poll-snapshot exhaust
+        records it, and it is the one count the snapshot cannot derive from
+        the per-PR Decision list.
 
         The predecessor of this sweep ran inside evaluate(), which is fed by
         the review-requested:@me search -- and submitting a review CLEARS the
@@ -435,7 +458,7 @@ class ReviewWatcher:
             sessions = self.alissa.list_review_sessions()
         except CommandError as exc:
             log.warning("reap sweep skipped: could not list sessions: %s", exc)
-            return
+            return 0
 
         # Per-sweep memos. The PR fetch is keyed per distinct PR; the round
         # count additionally keys on the task ref, because two spawns of one
@@ -443,6 +466,7 @@ class ReviewWatcher:
         # task existed carries None). None = undecidable this pass.
         prs: dict[tuple[str, int], PullRequest | None] = {}
         completed_cache: dict[tuple[str, int, str | None], float | None] = {}
+        reaped = 0
 
         for ses in sessions:
             if not ses.is_idle:
@@ -486,10 +510,12 @@ class ReviewWatcher:
             # The live list is the authority; gating on the reaps table would
             # spare any session killed behind the ledger's back.
             self.state.record_reap(ses.name)
+            reaped += 1
             log.info(
                 "reaped finished reviewer session %s (round %d done)",
                 ses.name, row["round"],
             )
+        return reaped
 
     def _sweep_pr(self, repo_slug: str, number: int) -> PullRequest | None:
         """One PR fetch for the sweep; the caller memoizes per distinct PR.
@@ -596,6 +622,9 @@ class ReviewWatcher:
             Action.SPAWNED,
             f"session {name} → {task.ref if task else 'no task'}",
             round_,
+            session=name,
+            task_ref=task.ref if task else None,
+            reenqueued=reenqueued,
         )
 
     def _ensure_hub(self, pr: PullRequest) -> tuple[Path, str | None]:
@@ -778,7 +807,8 @@ class ReviewWatcher:
         # needs the slot a finished session is squatting on. Deliberately not
         # inside the per-request loop below — the sweep must reach sessions
         # whose PR no longer appears in the search at all.
-        self.sweep_sessions()
+        started = time.monotonic()
+        reaped = self.sweep_sessions()
 
         requests = self.github.review_requests(self.config.repos)
         log.info("%d PR(s) with a review pending from %s", len(requests), self.github.login)
@@ -799,7 +829,88 @@ class ReviewWatcher:
             level = logging.INFO if decision.action != Action.SKIPPED else logging.DEBUG
             log.log(level, "%s → %s (%s)", slug, decision.action.value, decision.reason)
             results.append((slug, decision))
+
+        # Persist one poll_snapshots row per pass, built entirely from the
+        # Decision list already in hand plus the reap count -- no new GitHub
+        # calls. Written in dry-run too: a snapshot OBSERVES the pass, it is
+        # not a side effect the daemon takes, so a future console sees dry-run
+        # passes as well as live ones.
+        self._write_snapshot(
+            results, reaped, duration_ms=int((time.monotonic() - started) * 1000)
+        )
         return results
+
+    def _stage_record(self, slug: str, decision: Decision) -> dict:
+        """One per-item entry of a poll snapshot's compact JSON: the PR
+        reference (the slug and the number parsed from it), the current stage
+        (the decision's action, refined to name the stale-re-enqueue and
+        liveness-deferral buckets the bare action folds together), and the
+        round, session name, and origin task ref carried on the Decision.
+        `attempt` is carried as a fixed None for schema parity with the
+        devloop's per-item record -- the reviewloop is round-based and has no
+        attempt dimension -- so one console can read both loops' snapshots."""
+        _, _, tail = slug.partition("#")
+        stage = decision.action.value
+        if decision.reenqueued:
+            stage = "stale-re-enqueued"
+        elif decision.deferred:
+            stage = "deferred"
+        return {
+            "slug": slug,
+            "number": int(tail),
+            "round": decision.round,
+            "attempt": None,
+            "session": decision.session,
+            "stage": stage,
+            "reason": decision.reason,
+            "task_ref": decision.task_ref,
+        }
+
+    def _write_snapshot(
+        self,
+        results: list[tuple[str, Decision]],
+        reaped: int,
+        *,
+        duration_ms: int,
+    ) -> None:
+        """Persist one poll_snapshots row from the pass's Decision list and the
+        reaper count -- no new GitHub calls. The SPAWNED and IN_FLIGHT buckets
+        each split in two off observational Decision flags: a SPAWNED that
+        respawned a presumed-dead round is `stale_reenqueued`, and an
+        IN_FLIGHT that is a liveness deferral (not a freshly-enqueued round) is
+        `deferred`."""
+        stages = [self._stage_record(slug, d) for slug, d in results]
+        counts = Counter(d.action for _, d in results)
+        spawned = sum(
+            1 for _, d in results
+            if d.action is Action.SPAWNED and not d.reenqueued
+        )
+        stale_reenqueued = sum(
+            1 for _, d in results
+            if d.action is Action.SPAWNED and d.reenqueued
+        )
+        in_flight = sum(
+            1 for _, d in results
+            if d.action is Action.IN_FLIGHT and not d.deferred
+        )
+        deferred = sum(
+            1 for _, d in results
+            if d.action is Action.IN_FLIGHT and d.deferred
+        )
+        self.state.record_snapshot(
+            duration_ms=duration_ms,
+            candidates=len(results),
+            spawned=spawned,
+            stale_reenqueued=stale_reenqueued,
+            in_flight=in_flight,
+            deferred=deferred,
+            converged=counts[Action.CONVERGED],
+            capped=counts[Action.CAPPED],
+            escalated=counts[Action.ESCALATED],
+            skipped=counts[Action.SKIPPED],
+            reaped=reaped,
+            stages=stages,
+        )
 
     def run_forever(self) -> None:
         # preflight() is the caller's responsibility -- the CLI runs it once for
