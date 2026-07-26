@@ -117,6 +117,40 @@ def test_read_only_refuses_to_create_the_database(tmp_path):
     assert not missing.parent.exists()  # not even the .revloop dir
 
 
+@pytest.mark.parametrize("name", ["ws#1", "ws?x", "ws%2f", "ws with space",
+                                  "ws&a=b", "plain"])
+def test_read_only_uri_escapes_path_metacharacters(tmp_path, name):
+    """sqlite parses `file:` URIs, so an unescaped path is a different file.
+
+    `#` truncates at a fragment and `?` at a query -- both dropping `mode=ro`
+    and falling back to `rwc`, i.e. read-only mode CREATING a database, at a
+    path nobody asked for. `%XX` is percent-decoded. Each must read its own
+    seeded row and leave the tree untouched.
+    """
+    root = tmp_path / name
+    root.mkdir()
+    db = root / "state.db"
+    with State(db) as st:
+        spawn(st, session="s1")
+    before = {p for p in tmp_path.rglob("*")}
+
+    with State(db, read_only=True) as ro:
+        rows = ro.read_spawns()
+
+    assert [r["session"] for r in rows] == ["s1"]
+    assert {p for p in tmp_path.rglob("*")} == before  # nothing created
+
+
+def test_read_only_refuses_to_create_a_metacharacter_path(tmp_path):
+    """The absent-db signal the console's banner depends on must survive
+    escaping too -- an OperationalError, not a silently created file."""
+    missing = tmp_path / "ws#1" / "nope" / "state.db"
+    with pytest.raises(sqlite3.OperationalError):
+        State(missing, read_only=True)
+    assert not missing.exists()
+    assert not missing.parent.exists()
+
+
 def test_read_only_reads_but_never_writes(tmp_path):
     db = tmp_path / "state.db"
     with State(db) as st:
@@ -138,3 +172,41 @@ def test_readers_take_a_limit(ledger):
     assert len(ledger.read_spawns(2)) == 2
     assert len(ledger.read_escalations(2)) == 2
     assert len(ledger.read_pings(2)) == 2
+
+
+def test_read_pings_filters_the_kind_before_the_limit(ledger):
+    """The LIMIT must bound the rows the caller WANTS.
+
+    `activity-deferred:*` is written once per deferral episode and
+    `stalled:*` only for the long ones, so filtering after the limit would let
+    telemetry evict every operator page from a bounded read.
+    """
+    ledger.record_ping(REPO, 16, "stalled:wedged")
+    for n in range(20):
+        ledger.record_ping(REPO, 100 + n, f"activity-deferred:s{n}")
+
+    rows = ledger.read_pings(5, kind_prefix="stalled:")
+    assert [r["kind"] for r in rows] == ["stalled:wedged"]
+    # unfiltered, the same window is entirely telemetry -- the defect
+    assert all(r["kind"].startswith("activity-deferred:")
+               for r in ledger.read_pings(5))
+    # the prefix is matched literally, not as a LIKE pattern
+    assert ledger.read_pings(kind_prefix="stalled:%") == []
+    assert ledger.read_pings(kind_prefix="_talled:") == []
+
+
+def test_read_spawns_selects_by_session_at_any_age(ledger):
+    """The pairing lookup is keyed, not truncated: a wedged session's row is
+    the OLDEST in the ledger and must still resolve."""
+    spawn(ledger, number=16, round_=1, session="wedged")
+    for n in range(50):
+        spawn(ledger, number=300 + n, session=f"other-{n}")
+
+    rows = ledger.read_spawns(sessions=["wedged"])
+    assert [r["session"] for r in rows] == ["wedged"]
+    assert rows[0]["number"] == 16
+    # a name that is not in the ledger is simply unpaired, not an error
+    assert ledger.read_spawns(sessions=["wedged", "ghost"]) == rows
+    assert ledger.read_spawns(sessions=[]) == []
+    # no argument keeps the unrestricted read
+    assert len(ledger.read_spawns()) == 51

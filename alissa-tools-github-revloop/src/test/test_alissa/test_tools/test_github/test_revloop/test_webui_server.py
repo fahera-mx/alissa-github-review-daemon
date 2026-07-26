@@ -311,7 +311,38 @@ def test_security_headers_present(live):
     _, _, hdrs = _req(base, "/healthz")
     assert hdrs["X-Frame-Options"] == "DENY"
     assert hdrs["X-Content-Type-Options"] == "nosniff"
+    assert hdrs["Cache-Control"] == "no-store"
     assert "frame-ancestors 'none'" in hdrs["Content-Security-Policy"]
+
+
+def test_no_store_on_every_response(live):
+    """`_send` applies _SECURITY_HEADERS uniformly, so a header dropped from
+    that dict stops being sent on EVERY response at once -- invisibly: the page
+    still renders, only the storage rules change. /api/state carries session
+    names, the config echo and the log tail; the authed page carries the CSRF
+    token."""
+    base, _ = live
+    status, cookie = _login(base)
+    assert status == 303 and cookie
+
+    for path, headers in (("/healthz", None),          # open endpoint
+                          ("/", None),                 # unauthed login page
+                          ("/", {"Cookie": cookie}),   # authed HTML + CSRF
+                          ("/api/state", {"Cookie": cookie})):  # authed JSON
+        status, _, hdrs = _req(base, path, headers=headers)
+        assert status == 200, (path, status)
+        assert hdrs["Cache-Control"] == "no-store", path
+
+
+def test_handler_has_a_socket_timeout():
+    """`BaseHTTPRequestHandler` sets no socket timeout unless the class
+    provides one, and HTTP/1.1 keeps the connection alive -- so a client that
+    connects and says nothing pins one of ThreadingHTTPServer's uncapped
+    threads forever. `StreamRequestHandler.setup` reads this attribute; the
+    contract is that it is a number where the stdlib default is None."""
+    assert isinstance(Handler.timeout, (int, float))
+    assert Handler.timeout == 30
+    assert Handler.protocol_version == "HTTP/1.1"
 
 
 def test_unknown_route_404(live):

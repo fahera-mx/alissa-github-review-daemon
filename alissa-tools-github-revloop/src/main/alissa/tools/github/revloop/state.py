@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 # Poll-snapshot retention: the newest N rows are kept, older ones pruned on
@@ -106,10 +107,21 @@ class State:
         thereby render an empty, healthy-looking dashboard the operator cannot
         tell from an idle daemon), and must never run the migration on a
         database the daemon owns.
+
+        The URI is built with `as_uri()`, never by interpolating the path into
+        an f-string: sqlite parses a `file:` URI, so an unescaped `#` truncates
+        the filename at a fragment, `?` at the query, and `%XX` is
+        percent-decoded. Any of the three in `--workspace-root` would yield a
+        DIFFERENT file and -- for `#` and `?` -- one with no `mode` parameter
+        left, silently falling back to `rwc`: read-only mode creating a
+        database, at a path that is not even the one asked for. `as_uri()`
+        percent-encodes everything but the separator, so the guarantee holds
+        for any path an operator can type.
         """
         path = Path(path).expanduser()
         if read_only:
-            self._db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            uri = Path(path).absolute().as_uri() + "?mode=ro"
+            self._db = sqlite3.connect(uri, uri=True)
             self._db.row_factory = sqlite3.Row
             return
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -361,15 +373,43 @@ class State:
     # `pings` are NEVER pruned (they are per-head / per-episode dedupe keys the
     # daemon must keep), so a reader that returned all of them would grow an
     # operator inbox that never clears. Bounding belongs here, in SQL, not in
-    # the caller's slice.
+    # the caller's slice -- and, for `pings`, AFTER the kind filter rather than
+    # before it, or the noisier telemetry kind evicts the operator pages.
+    #
+    # `spawns` is bounded differently on purpose: it is a lookup table, not a
+    # display list, so it is selected by key rather than truncated by recency.
 
-    def read_spawns(self, limit: int | None = None) -> list[dict]:
-        """Spawn rows (one per enqueued reviewer round), newest first."""
-        return self._read_rows(
+    def read_spawns(
+        self,
+        limit: int | None = None,
+        *,
+        sessions: "Iterable[str] | None" = None,
+    ) -> list[dict]:
+        """Spawn rows (one per enqueued reviewer round), newest first.
+
+        `sessions` restricts the read to those session names. That is the
+        bound the console's session->round pairing wants, and a recency bound
+        (row count or time window) is NOT: a stale round whose session is
+        still alive is deferred indefinitely (see loop._defer_stale_round --
+        only an operator kill unblocks the respawn), so a live session's spawn
+        row can be arbitrarily old. Truncating by recency therefore drops the
+        pairing for exactly the wedged session an operator is looking for.
+        Selecting by name bounds the read by the live-session count instead,
+        at any row age. An empty collection reads nothing.
+        """
+        sql = (
             "SELECT repo, number, round, head_sha, session, task_ref, spawned_at "
-            "FROM spawns ORDER BY spawned_at DESC, number DESC, round DESC",
-            limit,
+            "FROM spawns"
         )
+        params: tuple = ()
+        if sessions is not None:
+            names = tuple(sessions)
+            if not names:
+                return []
+            sql += " WHERE session IN (%s)" % ",".join("?" * len(names))
+            params = names
+        sql += " ORDER BY spawned_at DESC, number DESC, round DESC"
+        return self._read_rows(sql, limit, params)
 
     def read_escalations(self, limit: int | None = None) -> list[dict]:
         """Cap-out escalations (the terminal half of the operator inbox),
@@ -381,23 +421,39 @@ class State:
             limit,
         )
 
-    def read_pings(self, limit: int | None = None) -> list[dict]:
+    def read_pings(
+        self,
+        limit: int | None = None,
+        *,
+        kind_prefix: str | None = None,
+    ) -> list[dict]:
         """Operator-ping rows, newest first. `kind` is free-form and carries
         the episode identity (`stalled:<session>`,
-        `activity-deferred:<session>`); the console filters on the prefix --
-        only the stalled kind is an operator page, the activity kind is the
-        telemetry dedupe for an activity-comment line."""
-        return self._read_rows(
-            "SELECT repo, number, kind, pinged_at "
-            "FROM pings ORDER BY pinged_at DESC, number DESC",
-            limit,
-        )
+        `activity-deferred:<session>`).
 
-    def _read_rows(self, sql: str, limit: int | None) -> list[dict]:
+        `kind_prefix` selects one kind IN SQL, so `limit` bounds the rows the
+        caller actually wants. Filtering after the limit instead would let the
+        other kind evict them: only a deferral episode that outlasts
+        STALLED_DEFER_MULTIPLE stale windows writes a `stalled:` row, while
+        EVERY episode writes an `activity-deferred:` one, so the kind the
+        console does not page on is structurally the more numerous. Matched
+        with `substr`, not `LIKE`: the prefix is a literal, and `LIKE` would
+        need `%`/`_` escaped to keep it one.
+        """
+        sql = "SELECT repo, number, kind, pinged_at FROM pings"
         params: tuple = ()
+        if kind_prefix is not None:
+            sql += " WHERE substr(kind, 1, ?) = ?"
+            params = (len(kind_prefix), kind_prefix)
+        sql += " ORDER BY pinged_at DESC, number DESC"
+        return self._read_rows(sql, limit, params)
+
+    def _read_rows(
+        self, sql: str, limit: int | None, params: tuple = ()
+    ) -> list[dict]:
         if limit is not None:
             sql += " LIMIT ?"
-            params = (limit,)
+            params = params + (limit,)
         return [dict(row) for row in self._db.execute(sql, params).fetchall()]
 
     def age_out_spawn(self, repo: str, number: int, round_: int, new_ts: int) -> bool:

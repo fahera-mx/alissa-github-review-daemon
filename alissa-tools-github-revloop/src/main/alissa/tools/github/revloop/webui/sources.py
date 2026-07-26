@@ -79,14 +79,15 @@ RETRY_AGE_BUFFER = 60
 INBOX_CAP_OUT = "cap-out"
 INBOX_STALLED = "stalled"
 
-# How many rows of each inbox table reach the payload. `escalations` and
-# `pings` are never pruned (their rows are the daemon's dedupe keys), so the
-# console bounds its own view the way SPARK_POINTS bounds the snapshot tail --
-# an inbox that never clears stops being an inbox.
+# How many INBOX ITEMS reach the payload. `escalations` and `pings` are never
+# pruned (their rows are the daemon's dedupe keys), so the console bounds its
+# own view the way SPARK_POINTS bounds the snapshot tail -- an inbox that never
+# clears stops being an inbox. The ping read applies the kind filter in SQL, so
+# this counts pages and not the telemetry rows interleaved with them.
 INBOX_LIMIT = 50
-# Ledger rows read to pair live sessions with their PR round. Comfortably more
-# than any plausible live-session count; the pairing only needs recent rows.
-SPAWN_ROWS = 200
+# The kind prefix that makes a ping row an operator page. `read_pings` matches
+# it in SQL; `_inbox` re-checks it to split the session out of the kind.
+PING_STALLED_PREFIX = f"{ESCALATION_STALLED}:"
 
 # retry_now outcomes. Distinguishing "no row" from "the write was lost" keeps
 # the audit line honest: both degrade to a failed action, only one means the
@@ -206,6 +207,16 @@ class Sources:
         writable handle, so it is guarded by an explicit existence check first
         -- a retry click must never be the thing that creates a state.db.
 
+        `write=True` is a FULL daemon handle, deliberately: it applies the
+        schema and, on a pre-0.8 database, runs `_migrate_spawns`. The module
+        docstring's "read-only means read-only" covers the read paths, not this
+        one. Suppressing the migration here would be worse than allowing it --
+        `age_out_spawn`'s `WHERE session=?` does not match a `spawns` still
+        keyed by `(repo, number, round)`, so the console would be writing to a
+        schema it declined to verify. In practice a console reaching an
+        unmigrated db means the daemon has not started since the upgrade, and
+        the migration is the daemon's own all-or-nothing path either way.
+
         The daemon writes state.db from a separate process; without WAL a
         console read/write can collide with a daemon write and raise
         `sqlite3.OperationalError` (a corrupt db raises regardless). Catching
@@ -225,11 +236,16 @@ class Sources:
         return self._read_state([], lambda st: st.read_snapshots(limit))
 
     def ledgers(self) -> dict:
-        empty: "dict[str, list]" = {"spawns": [], "escalations": [], "pings": []}
+        """The two INBOX tables, each bounded to INBOX_LIMIT rows of the kind
+        the console pages on. The spawn ledger is deliberately not here: it is
+        a lookup table read by key, not a display list bounded by recency --
+        `sessions` reads it for exactly the session names it renders."""
+        empty: "dict[str, list]" = {"escalations": [], "pings": []}
         return self._read_state(empty, lambda st: {
-            "spawns": st.read_spawns(SPAWN_ROWS),
             "escalations": st.read_escalations(INBOX_LIMIT),
-            "pings": st.read_pings(INBOX_LIMIT),
+            "pings": st.read_pings(
+                INBOX_LIMIT, kind_prefix=PING_STALLED_PREFIX
+            ),
         })
 
     # -- local process state -----------------------------------------------
@@ -250,6 +266,23 @@ class Sources:
         except ValueError:
             return None
 
+    def spawn_pairs(self, names: "list[str]") -> "dict[str, dict]":
+        """The session -> spawn-row lookup, read for EXACTLY the names about to
+        be rendered.
+
+        Reading by key rather than by recency is what keeps the pairing correct
+        for a wedged session: the daemon defers a stale round behind a session
+        that still shows life and never respawns over it, so the row an
+        operator most needs paired is the OLDEST one in the ledger -- the first
+        casualty of any row-count or time-window cap. The read is still
+        bounded, just by the live-session count (worker slots) instead of by
+        the ledger's unbounded growth. No live sessions, no query at all.
+        """
+        if not names:
+            return {}
+        rows = self._read_state([], lambda st: st.read_spawns(sessions=names))
+        return {row["session"]: row for row in rows}
+
     def sessions(self, spawns: "list[dict] | None" = None) -> "list[dict]":
         """The managed-session table: liveness from `alissa tmux ls`, footprint
         from /proc, and the PR round each session is reviewing.
@@ -259,13 +292,21 @@ class Sources:
         a rename would silently break the pairing, whereas the ledger row IS
         what the daemon's own reap sweep consults. A session with no ledger
         row is simply unpaired -- the panel shows it without a PR.
+
+        `spawns` supplies the ledger rows directly; when it is None (the
+        dashboard's path) they are read here, keyed by the names tmux just
+        returned -- which is why the session list is fetched first.
         """
-        by_session = {
-            row["session"]: row for row in (spawns if spawns is not None else [])
-        }
         raw = self._safe_json(["alissa", "tmux", "ls", "--json"]) or []
         if not isinstance(raw, list):
             return []
+        if spawns is not None:
+            by_session = {row["session"]: row for row in spawns}
+        else:
+            by_session = self.spawn_pairs([
+                e["name"] for e in raw
+                if isinstance(e, dict) and isinstance(e.get("name"), str)
+            ])
         now = int(self._wall())
         out: list[dict] = []
         # ONE /proc snapshot for the whole table: the index is identical for
@@ -434,7 +475,7 @@ class Sources:
         snaps = self.snapshots(SPARK_POINTS)
         latest = snaps[0] if snaps else None
         ledgers = self.ledgers()
-        sessions = self.sessions(ledgers["spawns"])
+        sessions = self.sessions()
         rate = self.rate_limit()
         disk = sysinfo.disk_usage(self.config.workspace_root)
 
@@ -532,7 +573,12 @@ class Sources:
         loop is still deferring behind a session that may be wedged). Both are
         PR references -- the reviewer edge has no issue edge -- so every link
         is a `/pull/` link. Ping kinds other than `stalled` are dedupe keys
-        for telemetry, not operator pages, and are filtered out.
+        for telemetry, not operator pages, and never reach here: `read_pings`
+        drops them in SQL, BEFORE its limit, so INBOX_LIMIT bounds pages and
+        not the telemetry interleaved with them. The kind check below is what
+        splits the session out of the kind, and re-checks the prefix in the
+        process -- a caller that passed unfiltered rows still gets an inbox of
+        pages only, just a shorter one.
 
         Bounded twice over: each reader is already capped at INBOX_LIMIT rows
         (newest first), and the merged list is capped again, so the payload

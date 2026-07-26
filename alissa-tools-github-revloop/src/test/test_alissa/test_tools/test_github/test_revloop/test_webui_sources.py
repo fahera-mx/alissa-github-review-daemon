@@ -99,9 +99,13 @@ def test_snapshots_and_ledgers(tmp_path):
     src = make_sources(tmp_path)
     assert len(src.snapshots()) == 1
     led = src.ledgers()
-    assert len(led["spawns"]) == 1
     assert len(led["escalations"]) == 1
-    assert len(led["pings"]) == 2
+    # the spawn ledger is NOT an inbox table: it is read by key, in sessions()
+    assert "spawns" not in led
+    # the reader filters the telemetry kind in SQL -- the seed writes one of
+    # each, only the `stalled:` one is a page
+    assert len(led["pings"]) == 1
+    assert led["pings"][0]["kind"] == "stalled:" + SESSION
 
 
 def test_state_read_degrades_on_lock(tmp_path, monkeypatch):
@@ -128,7 +132,7 @@ def test_state_read_degrades_on_lock(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sources_mod, "State", LockedState)
     assert src.snapshots() == []
-    assert src.ledgers() == {"spawns": [], "escalations": [], "pings": []}
+    assert src.ledgers() == {"escalations": [], "pings": []}
     # the retry mutation degrades to a clean failure, not a 500 -- and says
     # "state unavailable", never "no ledger row" (that is an operator-error
     # outcome, and conflating them would corrupt the audit trail)
@@ -154,7 +158,7 @@ def test_sessions_parsed_gone_skips_proc(tmp_path):
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner)
-    sess = src.sessions(src.ledgers()["spawns"])
+    sess = src.sessions()
     assert [s["name"] for s in sess] == [SESSION, "review-widgets-pr17-r1-ffff"]
     assert sess[0]["busy"] is True
     assert sess[0]["age_seconds"] == 30  # 5000 - 4970
@@ -179,7 +183,7 @@ def test_sessions_unmanaged_and_unpaired(tmp_path):
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner)
-    row = src.sessions(src.ledgers()["spawns"])[0]
+    row = src.sessions()[0]
     assert row["managed"] is False
     assert row["pr"] is None and row["retry"] is None
 
@@ -494,7 +498,8 @@ def test_reads_never_create_the_state_db(tmp_path):
                   wall_clock=lambda: 5000.0)
     assert src.state_present() is False
     assert src.snapshots() == []
-    assert src.ledgers() == {"spawns": [], "escalations": [], "pings": []}
+    assert src.ledgers() == {"escalations": [], "pings": []}
+    assert src.spawn_pairs([SESSION]) == {}
     assert not config.state_db.exists()
     assert not config.state_db.parent.exists()
 
@@ -609,3 +614,63 @@ def test_inbox_is_bounded(tmp_path):
     assert len(led["escalations"]) == sources_mod.INBOX_LIMIT
     assert len(led["pings"]) == sources_mod.INBOX_LIMIT
     assert len(src.dashboard()["inbox"]) == sources_mod.INBOX_LIMIT
+
+
+def test_inbox_bound_counts_pages_not_telemetry(tmp_path):
+    """The bound must be applied AFTER the kind filter, not before it.
+
+    `activity-deferred:*` is written once per deferral EPISODE; `stalled:*`
+    only once an episode outlasts STALLED_DEFER_MULTIPLE stale windows -- so
+    the telemetry kind is structurally the more numerous. Reading the newest
+    INBOX_LIMIT raw rows and then dropping the telemetry would let ordinary
+    deferral churn evict the real operator pages, and render `Inbox clear.`
+    while the daemon is actively paging a human.
+    """
+    src = make_sources(tmp_path, runner=_quiet_runner)
+    with State(src.config.state_db) as st:
+        # the page comes FIRST, so every telemetry row below is newer than it
+        st.record_ping("acme/widgets", 16, "stalled:wedged")
+        for n in range(sources_mod.INBOX_LIMIT + 20):
+            st.record_ping("acme/widgets", 200 + n, f"activity-deferred:s{n}")
+
+    pings = src.ledgers()["pings"]
+    assert all(p["kind"].startswith("stalled:") for p in pings)
+    assert "stalled:wedged" in {p["kind"] for p in pings}
+
+    inbox = src.dashboard()["inbox"]
+    stalled = [i for i in inbox if i["kind"] == sources_mod.INBOX_STALLED]
+    assert {i["detail"] for i in stalled} >= {"wedged"}
+    assert all(i["repo_slug"] == "acme/widgets" for i in stalled)
+
+
+def test_session_pairing_survives_an_old_spawn_row(tmp_path):
+    """The pairing is read by session name, never by recency.
+
+    A wedged session defers its round indefinitely (loop._defer_stale_round
+    never respawns over a live session), so the row an operator most needs
+    paired is the OLDEST in the ledger -- the first casualty of any row-count
+    or time-window cap. It must still resolve its PR, round and retry.
+    """
+    def runner(argv, **kw):
+        if argv[:3] == ["alissa", "tmux", "ls"]:
+            return json.dumps([{"name": SESSION, "session": "s1",
+                                "status": "busy", "live": True}])
+        if argv[:2] == ["tmux", "list-panes"]:
+            return ""
+        raise AssertionError(argv)
+
+    src = make_sources(tmp_path, runner=runner)
+    with State(src.config.state_db) as st:
+        for n in range(sources_mod.INBOX_LIMIT + 200):
+            st.record_spawn(repo="acme/widgets", number=300 + n, round_=1,
+                            head_sha=f"sha{n}", session=f"other-{n}",
+                            task_ref=None)
+
+    row = src.sessions()[0]
+    assert row["name"] == SESSION
+    assert row["pr"] == "acme/widgets#16"
+    assert row["round"] == 1
+    assert row["retry"] == {"repo_slug": "acme/widgets", "number": 16, "round": 1}
+    # and the read is bounded by the names asked for, not by the ledger size
+    assert set(src.spawn_pairs([SESSION])) == {SESSION}
+    assert src.spawn_pairs([]) == {}
