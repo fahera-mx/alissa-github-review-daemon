@@ -50,6 +50,7 @@ setup(
         "console_scripts": [
             "alissa-revloop=alissa.tools.github.revloop.__main__:main",
             "alissa-pr-review=alissa.tools.github.revloop.prreview:main",
+            "alissa-revloop-ui=alissa.tools.github.revloop.webui.__main__:main",
         ]
     },
     install_requires=requirements,

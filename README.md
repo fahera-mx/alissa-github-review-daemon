@@ -198,8 +198,8 @@ path) can never trigger a respawn loop.
 ### Poll snapshots (console exhaust)
 
 Every poll pass persists one row to a `poll_snapshots` table in the same SQLite
-state DB — a self-contained record of what that pass *observed*, so a future
-console sidecar can render live daemon state without spending any GitHub API
+state DB — a self-contained record of what that pass *observed*, so the
+console sidecar below can render live daemon state without spending any GitHub API
 budget of its own (the UI-1 pattern ported from the devloop). Each row carries
 the timestamp, the pass duration in ms, the candidate count, the decision-summary
 counts (`spawned`, `stale_reenqueued`, `in_flight`, `deferred`, `converged`,
@@ -212,9 +212,63 @@ rows are kept and older ones pruned on every write.
 A snapshot **observes** a pass; it is not an action the daemon takes, so it is
 written in `--dry-run` too (where the counts and stages reflect what *would* have
 happened, and the reap count is `0`). `State.read_snapshots()` is the reader the
-console will consume — newest first, with the `stages` JSON decoded back to a
+console consumes — newest first, with the `stages` JSON decoded back to a
 list. Nothing in the decision logic reads a snapshot, so persisting it can never
 change which reviewers spawn.
+
+## Reviewer console (`alissa-revloop-ui`)
+
+A second console script ships in the same distribution: a **stdlib-only operator
+dashboard sidecar** that renders live reviewer-daemon state and offers two
+actions. It runs as its own process alongside the daemon and shares nothing but
+the daemon's own local exhaust — so it spends **zero** GitHub API budget of its
+own beyond two cached checks. (Ported from the devloop's worker console and
+adapted to reviewer semantics; the two are deliberate copies, not a shared
+package — a shared-webui refactor is a separate lane.)
+
+```sh
+export ALISSA_UI_PASSCODE='…'          # required — no passcode, no boot (fail-closed)
+alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
+```
+
+- **Data, no polling of GitHub.** Every panel reads the daemon's `poll_snapshots`
+  table (the per-pass exhaust — pipeline board, sparklines, review-queue depth),
+  the spawn ledger (which session is on which PR round), the escalation table and
+  the ping ledger (the operator inbox), all read-only; plus local
+  `alissa tmux ls` + a `/proc` walk of each session's pane PID for CPU%/RSS. The
+  only network calls are `gh api rate_limit` (60s cache) and the PyPI version
+  JSON (10m cache, for the running-vs-latest drift chip).
+- **Reviewer semantics.** The pipeline board is PR-centric — PR ref → **round k
+  of the cap** → session → stage (`spawned` / `in-flight` / `deferred` /
+  `stale-re-enqueued` / `converged` / `capped` / `escalated` / `skipped`). The
+  inbox pages the two things the daemon pages a human about: CR9 **cap-outs**
+  (from `escalations`) and **stalled** deferral episodes (from `pings`), both
+  linking to the PR. There is no worker-tasks panel — reviewers create no tasks —
+  and no maintenance edge.
+- **Fail-closed auth.** `ALISSA_UI_PASSCODE` unset ⇒ refuse to start. Login is a
+  constant-time compare behind a throttle; the session cookie is HMAC-signed with
+  a key derived from the passcode **and** a per-boot nonce (so a restart logs
+  everyone out), and every action POST additionally needs a CSRF token bound to
+  that cookie.
+- **Actions (audit-logged to stdout).** *Kill* runs exactly
+  `alissa tmux kill <session>` (never `kill-server`); *Retry-now* ages the round's
+  newest spawn row past the stale window — an `UPDATE`, reusing the daemon's own
+  retry semantics, never a new retry path. Aging is necessary but not sufficient:
+  the daemon still defers a respawn behind a session that shows life (that
+  liveness signal is what stops a round being double-spent), so kill the wedged
+  session first, then retry.
+- **Studio design system**, both themes (parchment/ink light + glass-dark), one
+  gold accent on the drift chip, status colours kept separate.
+
+The daemon is a **read-only consumer's** data source here — `alissa-revloop-ui`
+never drives the loop, and the daemon is unaware of it. The log-tail panel reads
+`--log-file` (or `$ALISSA_REVLOOP_LOG`). The default port is **8788**, not the
+devloop console's 8787: the two daemons routinely run on one machine.
+`ALISSA_UI_SECURE_COOKIE=1` adds `Secure` to the cookie for a TLS-terminated
+(reverse-proxied) posture.
+
+**Out of scope here:** container/entrypoint wiring for the sidecar — a
+dependency-chained follow-up, so this release ships the script only.
 
 ## Scope
 
@@ -336,10 +390,13 @@ bash check-style.sh alissa-tools-github-revloop
 bash check-types.sh alissa-tools-github-revloop
 ```
 
-154 tests cover the decision state machine, the config layering, the
+269 tests cover the decision state machine, the config layering, the
 `poll_snapshots` exhaust buffer (record/read round-trip, retention pruning,
-in-place migration, one-snapshot-per-poll, dry-run capture), and the
-`alissa-pr-review` round/verdict/timeout logic, with GitHub and Alissa faked.
+in-place migration, one-snapshot-per-poll, dry-run capture), the
+`alissa-pr-review` round/verdict/timeout logic, and the reviewer console (auth
+matrix, endpoint payload shapes off a seeded state.db, `/proc` parsing with
+vanished PIDs, pinned action argv, HTML token presence), with GitHub, Alissa,
+tmux and `/proc` faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,
 `alissa task list` parsing, review-task title matching, worker detection, the
