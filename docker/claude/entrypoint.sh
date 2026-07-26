@@ -6,7 +6,8 @@
 #   1. preflight the identities the loop depends on (gh / alissa / claude)
 #   2. bootstrap the worktree-hub workspace + revloop config from a manifest
 #   3. start `alissa worker` (backgrounded) and wait until it is up
-#   4. run `alissa-revloop` in the foreground, stopping the worker on exit
+#   4. optionally start the `alissa-revloop-ui` console sidecar (ALISSA_UI_ENABLED)
+#   5. run `alissa-revloop` in the foreground, stopping the worker on exit
 #
 # The daemon is a thin poller; the worker is what actually spawns reviewers, so
 # the worker MUST be running first — the daemon only warns if it isn't.
@@ -108,7 +109,35 @@ alissa auth login --token "${ALISSA_API_TOKEN}" >/dev/null 2>&1 \
 log "alissa authenticated"
 
 # -----------------------------------------------------------------------------
-# 2d. Resolve the reviewer model into the baked agents.yaml.
+# 2d. Reviewer console (sidecar) gate — preflighted HERE, launched at step 4b.
+#
+# The console (alissa-revloop-ui) is OPT-IN via ALISSA_UI_ENABLED (default off).
+# We resolve the flag and validate its one hard requirement now — before any
+# bootstrap work — so a misconfigured deploy fails FAST with a clear message,
+# consistent with the identity gates above (die at boot, not after the worker is
+# up). ALISSA_UI_PASSCODE is the ONLY gate on the console (and, once the platform
+# routes a public URL to it, on the whole operator surface — including its kill
+# and retry-now actions), so ENABLED without a passcode is fatal, exactly as the
+# sidecar itself is fail-closed on the passcode.
+#
+# Truthiness matches the sidecar's own _env_flag (1/true/yes/on, case-insensitive)
+# so `ALISSA_UI_ENABLED=true` behaves like `=1`; anything else (incl. unset) is off.
+# -----------------------------------------------------------------------------
+UI_ENABLED=0
+case "$(printf '%s' "${ALISSA_UI_ENABLED:-0}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) UI_ENABLED=1 ;;
+esac
+UI_PORT="${PORT:-8080}"
+if [ "${UI_ENABLED}" = "1" ]; then
+  [ -n "${ALISSA_UI_PASSCODE:-}" ] \
+    || die "ALISSA_UI_ENABLED is set but ALISSA_UI_PASSCODE is empty — the console is fail-closed on the passcode (it is the ONLY gate, and it rides the public URL once you enable networking). Set ALISSA_UI_PASSCODE, or unset ALISSA_UI_ENABLED."
+  log "reviewer console ENABLED (ALISSA_UI_ENABLED) — will serve on 0.0.0.0:${UI_PORT} (passcode required)"
+else
+  log "reviewer console disabled (ALISSA_UI_ENABLED unset/off) — no listener"
+fi
+
+# -----------------------------------------------------------------------------
+# 2e. Resolve the reviewer model into the baked agents.yaml.
 #
 # The reviewer is the pipeline's quality gate, but the baked claude profile pins
 # no model — so it inherits the persisted /login account's default, which can
@@ -365,11 +394,49 @@ done
 log "alissa worker is running"
 
 # -----------------------------------------------------------------------------
+# 4b. Optionally start the reviewer console sidecar (alissa-revloop-ui).
+#
+# Opt-in via ALISSA_UI_ENABLED (resolved + passcode-preflighted at 2d). It runs
+# as a backgrounded child of this entrypoint, so tini (PID 1) reaps it with the
+# rest of the tmux/node/claude fan-out. It binds 0.0.0.0:${PORT:-8080} — not the
+# sidecar's own 127.0.0.1:8788 default — so a platform (Railway) can route its
+# public URL to the container; the passcode is the ONLY gate (see the README
+# warning). ALISSA_UI_PASSCODE is read straight from the inherited env (already
+# validated present), and it watches the same WORKSPACE_ROOT the daemon does —
+# the state.db written below it and the review-* sessions — so its panels are
+# truthful. It is started AFTER the worker so the process list it renders is the
+# real one from its first paint.
+#
+# Fail-VISIBLE supervision: the console is a sidecar, not the primary function
+# (the daemon + worker are), so its death does NOT tear the container down — but
+# a silent disappearance would strand an operator at a dead URL. A tiny monitor
+# subshell polls the pid and logs LOUDLY if it exits. (It cannot `wait` on the
+# sidecar — a subshell can only wait on its own children — so it polls instead.)
+# -----------------------------------------------------------------------------
+UI_PID=""
+UI_MONITOR_PID=""
+if [ "${UI_ENABLED}" = "1" ]; then
+  log "starting reviewer console (alissa-revloop-ui) on 0.0.0.0:${UI_PORT}"
+  alissa-revloop-ui --host 0.0.0.0 --port "${UI_PORT}" \
+    --workspace-root "${WORKSPACE_ROOT}" &
+  UI_PID=$!
+  (
+    while kill -0 "${UI_PID}" 2>/dev/null; do sleep 30; done
+    log "WARN: reviewer console (alissa-revloop-ui, pid ${UI_PID}) EXITED — the console URL is dead until the next redeploy; the daemon and worker keep running"
+  ) &
+  UI_MONITOR_PID=$!
+fi
+
+# -----------------------------------------------------------------------------
 # 5. Run the daemon in the foreground; stop the worker on shutdown.
 # -----------------------------------------------------------------------------
 DAEMON_PID=""
 shutdown() {
   log "shutting down"
+  # Silence the console monitor FIRST so tearing the sidecar down below does not
+  # trip its "EXITED" alarm during an orderly shutdown.
+  [ -n "${UI_MONITOR_PID}" ] && kill "${UI_MONITOR_PID}" 2>/dev/null || true
+  [ -n "${UI_PID}" ] && kill "${UI_PID}" 2>/dev/null || true
   [ -n "${DAEMON_PID}" ] && kill "${DAEMON_PID}" 2>/dev/null || true
   alissa worker stop >/dev/null 2>&1 || true
   wait "${DAEMON_PID}" 2>/dev/null || true

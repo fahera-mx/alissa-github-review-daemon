@@ -16,7 +16,7 @@ docker build -t alissa-review-daemon docker/claude
 
 # with configuration baked in (see the Configuration table):
 docker build \
-  --build-arg REVLOOP_VERSION=0.2.0 \
+  --build-arg REVLOOP_VERSION=0.15.0 \
   --build-arg ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app" \
   --build-arg ALISSA_POLL_INTERVAL=90 \
   --build-arg ALISSA_ROUND_CAP=3 \
@@ -34,6 +34,12 @@ into the Dockerfile build, which is why these are ARGs and not plain runtime
 ENV. Set the three **secrets** (`GH_TOKEN`, `ALISSA_API_TOKEN`,
 `ANTHROPIC_API_KEY`) as service variables too; those are read at runtime and
 must NOT be baked in.
+
+The **reviewer console** knobs (`ALISSA_UI_ENABLED`, `ALISSA_UI_PASSCODE`,
+`PORT`, `ALISSA_UI_SECURE_COOKIE`) are deliberately **not** ARGs — they are
+runtime-only service variables. See
+[Reviewer console](#reviewer-console-runtime-env-only--alissa_ui_enabled-alissa_ui_passcode-port)
+and [The console on Railway](#the-console-on-railway).
 
 ## The three identities (self-onboarding)
 
@@ -156,7 +162,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_WORKSPACE` | `alissa-review` | workspace name in the generated manifest |
 | `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
 | `ALISSA_POLL_INTERVAL` | *daemon default* (currently 60) | seconds between polls (≥10); **pass-through** — unset ⇒ library default |
-| `ALISSA_ROUND_CAP` | *daemon default* (currently 3) | CR9 round cap; **pass-through** — unset ⇒ library default |
+| `ALISSA_ROUND_CAP` | *daemon default* (currently 10) | CR9 round cap; **pass-through** — unset ⇒ library default |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
 | `ALISSA_AGENT_MODEL` | `opus` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
@@ -182,6 +188,85 @@ that the baked [`agents.yaml`](./agents.yaml) ships (`claude`), and
 `on_missing_hub` must be `add` for the self-contained hub-ify-on-demand model —
 the library default `skip` would make a fresh volume review nothing. Both are
 still overridable via their env var.
+
+### Reviewer console (runtime env only — `ALISSA_UI_ENABLED`, `ALISSA_UI_PASSCODE`, `PORT`)
+
+The image can also serve the **reviewer console**
+([`alissa-revloop-ui`](../../README.md#reviewer-console-alissa-revloop-ui)) — a
+read-only operator dashboard sidecar — alongside the worker and daemon. It
+renders the daemon's own local exhaust from this container's volume
+(`/workspace/.revloop/state.db`: poll snapshots, the spawn ledger, escalations,
+pings) plus the live `review-*` tmux sessions, so it costs **no** GitHub API
+budget beyond two cached checks. It is **opt-in and off by default**, and its
+knobs are **runtime-only** (not build `ARG`s), for the reasons in each row:
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `ALISSA_UI_ENABLED` | *(unset ⇒ off)* | `1`/`true`/`yes`/`on` starts the console sidecar; anything else (incl. unset) leaves **no listener**. Runtime-only so it pairs with the two below; the entrypoint already defaults it off, so no ARG default is needed |
+| `ALISSA_UI_PASSCODE` | *(none)* | **the console's only gate** — a secret, so never a build ARG (an ARG leaks into `docker history`, like the tokens). With `ALISSA_UI_ENABLED` set, an **empty passcode dies at boot** (fail-closed, consistent with the identity gates) |
+| `PORT` | `8080` | bind port for the console. Platform-injected at runtime (Railway sets it); the entrypoint binds `0.0.0.0:${PORT:-8080}` so the platform can route a public URL to it. `EXPOSE 8080` in the Dockerfile documents the default |
+| `ALISSA_UI_SECURE_COOKIE` | *(unset ⇒ off)* | `1` adds `Secure` to the session cookie — set it whenever the console rides a TLS-terminated public URL |
+
+When enabled the console binds **`0.0.0.0`** (not the sidecar's own
+`127.0.0.1:8788` default) so the platform's router can reach it, and exposes an
+unauthenticated **`/healthz`** liveness endpoint (`{"ok": true, "version": …}`) —
+use it as the deployment healthcheck. The console is a **sidecar**: if it exits
+the daemon and worker keep running, but the entrypoint logs the exit loudly (the
+URL is dead until the next redeploy). It is started *after* the worker, so its
+first paint already shows the real process list. See [Railway](#the-console-on-railway)
+for the public-networking warning.
+
+```
+ALISSA_UI_ENABLED=1
+ALISSA_UI_PASSCODE=<a long random secret>
+# PORT is set by the platform; locally it defaults to 8080
+```
+
+```sh
+docker run -d --name alissa-review \
+  -e GH_TOKEN -e ALISSA_API_TOKEN \
+  -e ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" \
+  -e ALISSA_UI_ENABLED=1 -e ALISSA_UI_PASSCODE="$(openssl rand -hex 24)" \
+  -p 8080:8080 \
+  -v alissa-review-workspace:/workspace \
+  alissa-review-daemon -v
+# then: curl -fsS localhost:8080/healthz  ->  {"ok": true, "version": "…"}
+```
+
+The wiring has its own suite — [`tests-entrypoint-ui.sh`](./tests-entrypoint-ui.sh)
+boots this entrypoint with the console off, enabled-without-a-passcode, enabled,
+and with the sidecar killed under it (CLIs stubbed, sidecar real, no docker
+required); it runs in CI beside the config-renderer suite.
+
+> ⚠️ Enabling the console and turning on the service's public networking puts the
+> operator dashboard — including its **kill** and **retry-now** actions — on the
+> public internet, gated **only** by `ALISSA_UI_PASSCODE`. Use a long, random
+> passcode, or leave the console disabled and reach it over a private network /
+> port-forward instead.
+
+#### The console on Railway
+
+1. Set `ALISSA_UI_ENABLED=1` and a **long, random** `ALISSA_UI_PASSCODE` as
+   service variables (both runtime-only — the passcode is a secret, so it must
+   not be an ARG). Enabling without a passcode makes the container **die at
+   boot** with a clear message, before the worker or daemon start.
+2. Under the service's **Settings → Networking**, enable a public domain (or a
+   TCP proxy). Railway injects `PORT` and routes the public URL to it; the
+   entrypoint already binds `0.0.0.0:${PORT:-8080}`.
+3. Set the **Healthcheck Path** to **`/healthz`** — the console's unauthenticated
+   liveness endpoint (`{"ok": true, "version": …}`). It reports up without
+   exposing any data or needing the passcode. (Leave the healthcheck unset while
+   the console is disabled: with no listener there is nothing to probe.)
+4. When the console rides a TLS-terminated public URL, also set
+   `ALISSA_UI_SECURE_COOKIE=1` so the session cookie carries `Secure`.
+
+> ⚠️ **The console then rides the public URL, gated ONLY by the passcode.** A
+> public domain + `ALISSA_UI_ENABLED=1` exposes the dashboard — and its **kill**
+> and **retry-now** actions, which can end a running reviewer — to anyone who
+> reaches the URL; `ALISSA_UI_PASSCODE` is the sole gate (behind a login throttle
+> and CSRF, but still one shared secret). Prefer a private network / port-forward,
+> or keep the passcode long and random. Leave `ALISSA_UI_ENABLED` unset to serve
+> nothing at all.
 
 ### The repos allowlist string
 
@@ -323,6 +408,9 @@ volumes:
 1. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
    `gh auth setup-git`; `alissa auth login` (fatal if missing); check the claude
    credential (warn-only — the baked `agents.yaml` handles headless launch).
+   Also resolve the `ALISSA_UI_ENABLED` console gate and, when enabled, **die
+   here** if `ALISSA_UI_PASSCODE` is empty (fail-closed, fail-fast); then resolve
+   `ALISSA_AGENT_MODEL` into `agents.yaml` and log the effective command.
 2. Ensure a manifest + `revloop.config.json` exist (mount or generate).
 3. **`alissa code workspace sync`** — materialize the worktree hubs the manifest
    declares (create missing/half-built ones, fetch existing). Without this the
@@ -331,6 +419,12 @@ volumes:
    that never completes.
 4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).
-5. Run `alissa-revloop` in the foreground; stop the worker on `SIGTERM`/`SIGINT`.
+4b. When `ALISSA_UI_ENABLED` is set, start the reviewer console
+   (`alissa-revloop-ui`) backgrounded on `0.0.0.0:${PORT:-8080}` — a sidecar,
+   not the primary function, so a monitor logs loudly if it exits but does not
+   tear the container down.
+5. Run `alissa-revloop` in the foreground; stop the worker (and the console
+   sidecar) on `SIGTERM`/`SIGINT`.
 
-`tini` is PID 1 to reap the tmux/node/claude child fan-out.
+`tini` is PID 1 to reap the tmux/node/claude child fan-out (the console sidecar
+included).

@@ -272,8 +272,13 @@ devloop console's 8787: the two daemons routinely run on one machine.
 `ALISSA_UI_SECURE_COOKIE=1` adds `Secure` to the cookie for a TLS-terminated
 (reverse-proxied) posture.
 
-**Out of scope here:** container/entrypoint wiring for the sidecar — a
-dependency-chained follow-up, so this release ships the script only.
+**In the container.** The reviewer image wires the sidecar in: set
+`ALISSA_UI_ENABLED=1` **and** `ALISSA_UI_PASSCODE`, and the entrypoint starts the
+console alongside the worker and daemon on `0.0.0.0:${PORT:-8080}` (off by
+default; enabled-without-a-passcode dies at boot; `/healthz` is the platform
+healthcheck path). Enabling it behind a public URL puts the dashboard — kill and
+retry-now included — on the internet behind that one passcode. See
+[`docker/claude/README.md`](./docker/claude/README.md#reviewer-console-runtime-env-only--alissa_ui_enabled-alissa_ui_passcode-port).
 
 ## Scope
 
@@ -393,6 +398,14 @@ bash tests-unit.sh alissa-tools-github-revloop
 bash tests-coverage.sh alissa-tools-github-revloop
 bash check-style.sh alissa-tools-github-revloop
 bash check-types.sh alissa-tools-github-revloop
+```
+
+The container entrypoint has its own two shell suites (no docker needed — the
+CLIs it shells out to are stubbed):
+
+```sh
+bash docker/claude/tests-entrypoint-config.sh   # config renderer pass-through
+bash docker/claude/tests-entrypoint-ui.sh       # reviewer-console wiring
 ```
 
 282 tests cover the decision state machine, the config layering, the
