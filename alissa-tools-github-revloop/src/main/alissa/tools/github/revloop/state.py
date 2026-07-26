@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 # Poll-snapshot retention: the newest N rows are kept, older ones pruned on
@@ -94,8 +95,35 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
 
 
 class State:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
+        """Open the ledger. The daemon opens it read-write (creating the file,
+        applying the schema, migrating an old `spawns` key); a read-only
+        CONSUMER -- the console sidecar -- must not do any of that.
+
+        `read_only` connects through the `mode=ro` URI, which cannot create the
+        database and raises `sqlite3.OperationalError` when it does not exist.
+        That is the point: a console pointed at a workspace with no daemon
+        state must report "no state here", not silently CREATE a state.db (and
+        thereby render an empty, healthy-looking dashboard the operator cannot
+        tell from an idle daemon), and must never run the migration on a
+        database the daemon owns.
+
+        The URI is built with `as_uri()`, never by interpolating the path into
+        an f-string: sqlite parses a `file:` URI, so an unescaped `#` truncates
+        the filename at a fragment, `?` at the query, and `%XX` is
+        percent-decoded. Any of the three in `--workspace-root` would yield a
+        DIFFERENT file and -- for `#` and `?` -- one with no `mode` parameter
+        left, silently falling back to `rwc`: read-only mode creating a
+        database, at a path that is not even the one asked for. `as_uri()`
+        percent-encodes everything but the separator, so the guarantee holds
+        for any path an operator can type.
+        """
         path = Path(path).expanduser()
+        if read_only:
+            uri = Path(path).absolute().as_uri() + "?mode=ro"
+            self._db = sqlite3.connect(uri, uri=True)
+            self._db.row_factory = sqlite3.Row
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(path))
         self._db.row_factory = sqlite3.Row
@@ -332,3 +360,129 @@ class State:
             record["stages"] = json.loads(record.pop("stages_json"))
             out.append(record)
         return out
+
+    # -- console ledger bridge (read-only lists + the retry-now UPDATE) -----
+    #
+    # The console sidecar (webui) renders the spawn ledger, the escalation
+    # table and the ping ledger directly -- the operator inbox, the session ->
+    # PR mapping, and the retry-now action -- the way it reads poll_snapshots
+    # through read_snapshots: no GitHub call, just the local tables.
+    #
+    # Rows come back newest-first, and every reader takes the same optional
+    # `limit` read_snapshots does. Unlike poll_snapshots, `escalations` and
+    # `pings` are NEVER pruned (they are per-head / per-episode dedupe keys the
+    # daemon must keep), so a reader that returned all of them would grow an
+    # operator inbox that never clears. Bounding belongs here, in SQL, not in
+    # the caller's slice -- and, for `pings`, AFTER the kind filter rather than
+    # before it, or the noisier telemetry kind evicts the operator pages.
+    #
+    # `spawns` is bounded differently on purpose: it is a lookup table, not a
+    # display list, so it is selected by key rather than truncated by recency.
+
+    def read_spawns(
+        self,
+        limit: int | None = None,
+        *,
+        sessions: "Iterable[str] | None" = None,
+    ) -> list[dict]:
+        """Spawn rows (one per enqueued reviewer round), newest first.
+
+        `sessions` restricts the read to those session names. That is the
+        bound the console's session->round pairing wants, and a recency bound
+        (row count or time window) is NOT: a stale round whose session is
+        still alive is deferred indefinitely (see loop._defer_stale_round --
+        only an operator kill unblocks the respawn), so a live session's spawn
+        row can be arbitrarily old. Truncating by recency therefore drops the
+        pairing for exactly the wedged session an operator is looking for.
+        Selecting by name bounds the read by the live-session count instead,
+        at any row age. An empty collection reads nothing.
+        """
+        sql = (
+            "SELECT repo, number, round, head_sha, session, task_ref, spawned_at "
+            "FROM spawns"
+        )
+        params: tuple = ()
+        if sessions is not None:
+            names = tuple(sessions)
+            if not names:
+                return []
+            sql += " WHERE session IN (%s)" % ",".join("?" * len(names))
+            params = names
+        sql += " ORDER BY spawned_at DESC, number DESC, round DESC"
+        return self._read_rows(sql, limit, params)
+
+    def read_escalations(self, limit: int | None = None) -> list[dict]:
+        """Cap-out escalations (the terminal half of the operator inbox),
+        newest first. Keyed per head_sha: a fresh push after a cap-out is a new
+        row, so the console can show that the PR capped out again."""
+        return self._read_rows(
+            "SELECT repo, number, head_sha, escalated_at "
+            "FROM escalations ORDER BY escalated_at DESC, number DESC",
+            limit,
+        )
+
+    def read_pings(
+        self,
+        limit: int | None = None,
+        *,
+        kind_prefix: str | None = None,
+    ) -> list[dict]:
+        """Operator-ping rows, newest first. `kind` is free-form and carries
+        the episode identity (`stalled:<session>`,
+        `activity-deferred:<session>`).
+
+        `kind_prefix` selects one kind IN SQL, so `limit` bounds the rows the
+        caller actually wants. Filtering after the limit instead would let the
+        other kind evict them: only a deferral episode that outlasts
+        STALLED_DEFER_MULTIPLE stale windows writes a `stalled:` row, while
+        EVERY episode writes an `activity-deferred:` one, so the kind the
+        console does not page on is structurally the more numerous. Matched
+        with `substr`, not `LIKE`: the prefix is a literal, and `LIKE` would
+        need `%`/`_` escaped to keep it one.
+        """
+        sql = "SELECT repo, number, kind, pinged_at FROM pings"
+        params: tuple = ()
+        if kind_prefix is not None:
+            sql += " WHERE substr(kind, 1, ?) = ?"
+            params = (len(kind_prefix), kind_prefix)
+        sql += " ORDER BY pinged_at DESC, number DESC"
+        return self._read_rows(sql, limit, params)
+
+    def _read_rows(
+        self, sql: str, limit: int | None, params: tuple = ()
+    ) -> list[dict]:
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = params + (limit,)
+        return [dict(row) for row in self._db.execute(sql, params).fetchall()]
+
+    def age_out_spawn(self, repo: str, number: int, round_: int, new_ts: int) -> bool:
+        """Retry-now: stamp the NEWEST spawn row of THIS round back to
+        `new_ts` (the console passes a time just past the stale window), so
+        `spawn_age` reads as stale and the daemon's own re-enqueue path can
+        respawn the round on its next pass. An UPDATE, never a DELETE: the
+        spawn history stays intact (the reap sweep still maps the old session
+        name back to its round), only the newest row's clock moves. Keyed per
+        round, like `get_spawn` -- a retry re-arms only the round the console
+        named. Returns False when there is no row to age (the console then
+        reports nothing to retry).
+
+        Aging is necessary but not sufficient for a respawn: the daemon defers
+        a stale round whose session still shows signs of life (loop's liveness
+        signal, which exists to stop double-spending a round). Kill the wedged
+        session first, then retry -- that is exactly the operator sequence the
+        stalled ping asks for.
+        """
+        row = self._db.execute(
+            "SELECT session FROM spawns WHERE repo=? AND number=? AND round=? "
+            "ORDER BY spawned_at DESC, rowid DESC LIMIT 1",
+            (repo, number, round_),
+        ).fetchone()
+        if row is None:
+            return False
+        self._db.execute(
+            "UPDATE spawns SET spawned_at=? WHERE session=?",
+            (int(new_ts), row["session"]),
+        )
+        self._db.commit()
+        return True
