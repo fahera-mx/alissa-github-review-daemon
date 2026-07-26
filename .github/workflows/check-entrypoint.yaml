@@ -1,13 +1,16 @@
 name: Check Container Entrypoint Config Rendering
 on: [pull_request]
 
-# The env-driven entrypoint renders revloop.config.json with a
-# pass-through-when-unset contract (optional tuning keys are omitted so the
-# daemon library default applies; structural keys stay pinned). This check
-# exercises that renderer directly — see docker/claude/tests-entrypoint-config.sh.
+# Two entrypoint contracts are checked here:
+#   * the revloop.config.json renderer's pass-through-when-unset behaviour
+#     (optional tuning keys omitted so the daemon library default applies;
+#     structural keys pinned) — docker/claude/tests-entrypoint-config.sh;
+#   * the reviewer-console wiring (ALISSA_UI_ENABLED / ALISSA_UI_PASSCODE /
+#     ${PORT} / /healthz), by booting the real entrypoint against stubbed CLIs
+#     with the real sidecar — docker/claude/tests-entrypoint-ui.sh.
 jobs:
   entrypoint-config-check:
-    name: Entrypoint config renderer
+    name: Entrypoint config renderer + console wiring
     runs-on: ubuntu-latest
     steps:
       - name: Clone Repo
@@ -44,3 +47,11 @@ jobs:
           fi
       - name: Execute Entrypoint Config Tests
         run: bash docker/claude/tests-entrypoint-config.sh
+      - name: Execute Entrypoint Console Wiring Tests
+        # Boots the entrypoint four times (console off / enabled-without-passcode
+        # / enabled / sidecar killed under it). No docker needed: the CLIs the
+        # entrypoint shells out to are stubbed and the console sidecar is the
+        # real one installed above. The last case waits out two 30s monitor
+        # windows, hence the timeout headroom.
+        timeout-minutes: 5
+        run: bash docker/claude/tests-entrypoint-ui.sh

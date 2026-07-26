@@ -25,8 +25,11 @@
 # claude-code need Node >= 18 — both satisfied.
 FROM python:3.12-slim-bookworm
 
-# Version of the daemon to install from PyPI. Bump per release.
-ARG REVLOOP_VERSION=0.12.0
+# Version of the daemon to install from PyPI. Bump per release. 0.15.0 is the
+# release this repo publishes on merge; it is the first version whose console
+# script `alissa-revloop-ui` the entrypoint starts (0.14.0 added the script,
+# this release wires it into the container), so the pin must not go below it.
+ARG REVLOOP_VERSION=0.15.0
 # Node major version (must be >= 18 for the alissa CLI and claude-code).
 ARG NODE_MAJOR=22
 
@@ -164,6 +167,17 @@ WORKDIR /workspace
 # CLAUDE_CODE_OAUTH_TOKEN. Secrets baked via ARG leak into `docker history` and
 # every image layer — inject them as runtime env instead (Railway provides
 # service variables to the container at runtime).
+#
+# ALSO deliberately not here (runtime-only): the reviewer console knobs.
+#   * ALISSA_UI_PASSCODE — a SECRET (the console's only gate); baking it via ARG
+#     would leak it into `docker history`, exactly like the tokens above.
+#   * PORT — platform-injected at runtime (Railway sets it); the entrypoint
+#     binds 0.0.0.0:${PORT:-8080}, so there is nothing to bake.
+#   * ALISSA_UI_ENABLED — opt-in flag; the entrypoint already defaults it OFF
+#     (`${ALISSA_UI_ENABLED:-0}`), so no ARG default is needed. Kept runtime-only
+#     so it pairs with the passcode it is useless without.
+#   * ALISSA_UI_SECURE_COOKIE — TLS-posture flag read by the sidecar itself.
+# EXPOSE below documents the console port; the console is disabled by default.
 
 # Allowlist of repos to watch, as a single string separated by "|" (a single
 # repo needs no separator). "|" is used because repo slugs contain "/".
@@ -185,7 +199,7 @@ ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 # the key from the generated config and the daemon library's own current default
 # applies (env var > library default). Baking a concrete value here would shadow
 # the library default — the exact defect this repo's #30 removed. The library
-# defaults at the pinned REVLOOP_VERSION are poll_interval=60, round_cap=3;
+# defaults at the pinned REVLOOP_VERSION are poll_interval=60, round_cap=10;
 # they are documented in the README, not duplicated here.
 ARG ALISSA_POLL_INTERVAL=""
 ARG ALISSA_ROUND_CAP=""
@@ -198,7 +212,7 @@ ARG ALISSA_AGENT_PROFILE="claude"
 # Reviewer model pinned into the agents.yaml claude command at boot (the reviewer
 # is the quality gate, so it must not silently fall back to a smaller model on a
 # usage-throttled account). Alias (`opus`/`sonnet`) or full id (`claude-opus-4-8`);
-# `default` or empty omits the --model flag. See the entrypoint (step 2d) + README.
+# `default` or empty omits the --model flag. See the entrypoint (step 2e) + README.
 ARG ALISSA_AGENT_MODEL="opus"
 ARG ALISSA_ON_MISSING_HUB="add"
 # Worker reconcile tick, seconds.
@@ -218,6 +232,15 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_WORKER_INTERVAL=${ALISSA_WORKER_INTERVAL} \
     ALISSA_ENABLE_FIREWALL=${ALISSA_ENABLE_FIREWALL} \
     ALISSA_FIREWALL_EXTRA=${ALISSA_FIREWALL_EXTRA}
+
+# The reviewer console (alissa-revloop-ui) listens here when ALISSA_UI_ENABLED is
+# set. EXPOSE is documentation/metadata only — it opens no port by itself; the
+# entrypoint binds 0.0.0.0:${PORT:-8080}, and 8080 is the default the console
+# falls back to when the platform injects no PORT (the sidecar's own default,
+# 127.0.0.1:8788, is for a local run — the container always overrides both).
+# The console is DISABLED by default (opt-in) and fail-closed on
+# ALISSA_UI_PASSCODE. Liveness (a platform healthcheck path): GET /healthz.
+EXPOSE 8080
 
 # Start as root so the entrypoint can chown a root-owned volume mount; it drops
 # to `alissa` (via gosu) before running anything else. All the build steps above
