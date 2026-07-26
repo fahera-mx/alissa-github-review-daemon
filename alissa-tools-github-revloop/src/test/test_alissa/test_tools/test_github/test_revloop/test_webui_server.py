@@ -80,8 +80,13 @@ def test_kill_audits(tmp_path):
     app.kill_session(SESSION)
     assert lines[0][0] == "kill"
     assert lines[0][1]["ok"] is True
+    # the trail records WHOSE process tree was killed -- this daemon's reviewer
+    # session, or another daemon's worker (both are killable by design)
+    assert lines[0][1]["managed"] is True
+    app.kill_session("develop-acme-widgets-i7-a1")
+    assert lines[1][1]["managed"] is False
     app.kill_session("-rf")
-    assert lines[1][1]["ok"] is False
+    assert lines[2][1]["ok"] is False
 
 
 # -- App.retry: an UPDATE, delegated ---------------------------------------
@@ -109,9 +114,12 @@ def test_retry_audits_with_the_ledger_outcome(tmp_path):
     app = make_app(tmp_path, audit=lambda action, detail: lines.append((action, detail)))
     app.retry("acme/widgets", 16, 1)
     app.retry("acme/widgets", 999, 1)  # no ledger row
-    assert lines[0] == ("retry", {"ok": True, "repo_slug": "acme/widgets",
+    assert lines[0] == ("retry", {"ok": True, "outcome": "retried",
+                                  "repo_slug": "acme/widgets",
                                   "number": 16, "round": 1})
+    # a genuinely absent row is audited as such -- distinct from a lost write
     assert lines[1][1]["ok"] is False
+    assert lines[1][1]["outcome"] == "no ledger row"
 
 
 # -- live server: end-to-end auth + CSRF gating ----------------------------

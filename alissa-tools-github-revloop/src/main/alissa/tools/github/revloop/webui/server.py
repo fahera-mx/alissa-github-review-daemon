@@ -33,7 +33,7 @@ from urllib.parse import parse_qs
 from ..proc import CommandError, run as proc_run
 from .auth import SESSION_COOKIE, Auth
 from .page import dashboard_page, login_page
-from .sources import Sources
+from .sources import RETRY_OK, Sources, is_managed
 
 # A managed reviewer session is `review-<repo>-pr<n>-r<k>-<nonce>` and friends:
 # it starts with a letter and carries only these characters. Validating against
@@ -55,6 +55,12 @@ _MAX_BODY = 64 * 1024
 
 _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
+    # Nothing this server serves is cacheable: /api/state carries session
+    # names, the config echo and the daemon log tail, and the authed page
+    # carries the CSRF token. Applied uniformly (the login page and /healthz
+    # lose nothing by it) so no authenticated response can be stored by the
+    # browser or by an intermediary in the reverse-proxied posture.
+    "Cache-Control": "no-store",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": (
@@ -102,19 +108,31 @@ class App:
         self.secure_cookie = secure_cookie
 
     def kill_session(self, name: "str | None") -> "tuple[bool, str]":
-        """Kill exactly ONE managed session. The argv is pinned to
+        """Kill exactly ONE session, by name. The argv is pinned to
         `alissa tmux kill <name>` -- never `kill-server`, never a flag -- and
-        the name is validated first, so an action POST can only ever kill a
-        well-formed session name."""
+        the name is validated for SHAPE first, so an action POST can only ever
+        kill a well-formed session name.
+
+        Deliberately not restricted to this daemon's `review-*` namespace: the
+        sessions table lists every session that holds a worker slot (including
+        another daemon's), and seeing what holds a slot is only half useful if
+        the operator cannot free it. The unmanaged rows are marked as such in
+        the table and named in the confirm prompt -- the gate is the operator's
+        informed click, not a namespace filter. The audit line records
+        `managed` alongside the name, so the trail says whose process tree was
+        killed: this daemon's reviewer, or someone else's worker.
+        """
         if not name or not _SAFE_SESSION.match(name):
             self._audit("kill", {"session": name, "ok": False, "error": "invalid name"})
             return False, "invalid session name"
+        managed = is_managed(name)
         try:
             self._run(["alissa", "tmux", "kill", name], timeout=30)
         except CommandError as exc:
-            self._audit("kill", {"session": name, "ok": False, "error": str(exc)})
+            self._audit("kill", {"session": name, "managed": managed,
+                                 "ok": False, "error": str(exc)})
             return False, str(exc)
-        self._audit("kill", {"session": name, "ok": True})
+        self._audit("kill", {"session": name, "managed": managed, "ok": True})
         return True, "killed"
 
     def retry(
@@ -133,16 +151,23 @@ class App:
         except (TypeError, ValueError):
             self._audit("retry", {"ok": False, "error": "bad number", "repo_slug": repo_slug})
             return False, "bad number"
-        aged = self.sources.retry_now(str(repo_slug), num, rnd)
+        outcome = self.sources.retry_now(str(repo_slug), num, rnd)
+        ok = outcome == RETRY_OK
         self._audit("retry", {
-            "ok": bool(aged), "repo_slug": repo_slug, "number": num, "round": rnd,
+            "ok": ok, "outcome": outcome, "repo_slug": repo_slug,
+            "number": num, "round": rnd,
         })
-        return bool(aged), "retried" if aged else "no ledger row"
+        return ok, outcome
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "alissa-revloop-ui"
     protocol_version = "HTTP/1.1"
+    # HTTP/1.1 keeps connections alive and ThreadingHTTPServer spawns one
+    # (uncapped) thread per connection, so without a socket timeout a client
+    # that connects and says nothing pins a thread forever. 30s is far longer
+    # than any request this server serves.
+    timeout = 30
 
     @property
     def app(self) -> App:

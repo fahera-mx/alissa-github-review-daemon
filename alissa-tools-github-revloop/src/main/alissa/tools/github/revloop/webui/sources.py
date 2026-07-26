@@ -25,10 +25,20 @@ truncated log, an absent state.db all degrade to empty/None, never an exception
 that would blank the whole dashboard. All IO is injected (run/http_get/clock),
 so the whole layer is drivable from tests without a subprocess or a socket.
 
+Read-only means read-only: every read opens the ledger through State's
+`read_only` mode (the sqlite `mode=ro` URI), which cannot create the file and
+cannot run the daemon's schema/migration path. A workspace with no daemon
+state therefore reports ABSENT (`state_present` in the payload, a banner on the
+page) instead of quietly conjuring an empty state.db that renders exactly like
+an idle daemon -- the one distinction the console exists to make, and easy to
+get wrong because `--workspace-root` defaults to the cwd.
+
 The single mutation is `retry_now`: it ages the newest ledger row of one round
 past the stale window (an UPDATE, via `State.age_out_spawn`), so the daemon's
 own re-enqueue path can respawn it on its next pass. No new retry logic lives
-here -- the console only moves a clock the daemon already reads.
+here -- the console only moves a clock the daemon already reads. It reports a
+tri-state (aged / no row / state unavailable) so the audit trail never records
+a lost write as "nothing to retry".
 """
 
 from __future__ import annotations
@@ -69,6 +79,22 @@ RETRY_AGE_BUFFER = 60
 INBOX_CAP_OUT = "cap-out"
 INBOX_STALLED = "stalled"
 
+# How many rows of each inbox table reach the payload. `escalations` and
+# `pings` are never pruned (their rows are the daemon's dedupe keys), so the
+# console bounds its own view the way SPARK_POINTS bounds the snapshot tail --
+# an inbox that never clears stops being an inbox.
+INBOX_LIMIT = 50
+# Ledger rows read to pair live sessions with their PR round. Comfortably more
+# than any plausible live-session count; the pairing only needs recent rows.
+SPAWN_ROWS = 200
+
+# retry_now outcomes. Distinguishing "no row" from "the write was lost" keeps
+# the audit line honest: both degrade to a failed action, only one means the
+# operator asked to retry something that isn't there.
+RETRY_OK = "retried"
+RETRY_NO_ROW = "no ledger row"
+RETRY_UNAVAILABLE = "state unavailable"
+
 
 def is_managed(name: "str | None") -> bool:
     """Whether a tmux session belongs to this daemon's reviewer namespace.
@@ -92,7 +118,14 @@ def _default_http_get(url: str, timeout: float) -> "bytes | None":
 class _Cache:
     """A one-value TTL cache over a monotonic clock. Refreshes lazily on read;
     a fetch that returns None does NOT overwrite the last good value with junk
-    (an unreachable PyPI keeps showing the last known latest version)."""
+    (an unreachable PyPI keeps showing the last known latest version).
+
+    A FAILED fetch still arms the TTL, so a missing `gh` or an unreachable PyPI
+    is retried once per window rather than on every poll: without that, the
+    "cached so a room of operators cannot move the rate budget" contract only
+    held once a check had succeeded, and a broken check made every /api/state
+    block on its full timeout.
+    """
 
     def __init__(self, ttl: float, clock: Callable[[], float]) -> None:
         self._ttl = ttl
@@ -102,14 +135,13 @@ class _Cache:
 
     def get(self, fetch: Callable[[], object]) -> object:
         now = self._clock()
-        if self._value is None or now >= self._expires:
+        if now >= self._expires:
             fresh = fetch()
             if fresh is not None:
                 self._value = fresh
-                self._expires = now + self._ttl
-            elif self._value is not None:
-                # keep the stale-but-good value; retry next call
-                self._expires = now + self._ttl
+            # Arm the window either way: on success with the fresh value, on
+            # failure keeping the last good one (or None) as a negative cache.
+            self._expires = now + self._ttl
         return self._value
 
 
@@ -157,16 +189,34 @@ class Sources:
 
     # -- state.db (no GitHub call) -----------------------------------------
 
-    def _read_state(self, default, fn):
+    def state_present(self) -> bool:
+        """Whether the daemon's state.db exists at the resolved path. False is
+        an ANSWER, not an error: it means this workspace has no revloop state
+        (usually a mistyped `--workspace-root`), and the page says so rather
+        than rendering an empty dashboard that looks like an idle daemon."""
+        return Path(self.config.state_db).is_file()
+
+    def _read_state(self, default, fn, *, write: bool = False):
         """Open a short-lived `State` and run `fn(state)`, degrading to
-        `default` if the db can't be read/written. The daemon writes state.db
-        from a separate process; without WAL a console read/write can collide
-        with a daemon write and raise `sqlite3.OperationalError` (a corrupt db
-        raises regardless). Catching here honors this module's contract: a
-        state access never raises an exception that would blank the dashboard
-        or 500 the retry action -- it degrades like every other source."""
+        `default` if the db is absent or can't be read/written.
+
+        Reads go through State's read-only mode, so a console read can never
+        create or migrate the daemon's database (and an absent file surfaces as
+        `sqlite3.OperationalError`, handled here). The retry mutation needs a
+        writable handle, so it is guarded by an explicit existence check first
+        -- a retry click must never be the thing that creates a state.db.
+
+        The daemon writes state.db from a separate process; without WAL a
+        console read/write can collide with a daemon write and raise
+        `sqlite3.OperationalError` (a corrupt db raises regardless). Catching
+        here honors this module's contract: a state access never raises an
+        exception that would blank the dashboard or 500 the retry action -- it
+        degrades like every other source.
+        """
+        if write and not self.state_present():
+            return default
         try:
-            with State(self.config.state_db) as st:
+            with State(self.config.state_db, read_only=not write) as st:
                 return fn(st)
         except sqlite3.Error:
             return default
@@ -177,9 +227,9 @@ class Sources:
     def ledgers(self) -> dict:
         empty: "dict[str, list]" = {"spawns": [], "escalations": [], "pings": []}
         return self._read_state(empty, lambda st: {
-            "spawns": st.read_spawns(),
-            "escalations": st.read_escalations(),
-            "pings": st.read_pings(),
+            "spawns": st.read_spawns(SPAWN_ROWS),
+            "escalations": st.read_escalations(INBOX_LIMIT),
+            "pings": st.read_pings(INBOX_LIMIT),
         })
 
     # -- local process state -----------------------------------------------
@@ -218,6 +268,11 @@ class Sources:
             return []
         now = int(self._wall())
         out: list[dict] = []
+        # ONE /proc snapshot for the whole table: the index is identical for
+        # every session in this build, so rebuilding it per session would make
+        # the walk O(sessions x processes). Built lazily -- a table with no
+        # live pane never scans /proc at all.
+        index: "tuple[dict[int, list[int]], dict[int, dict]] | None" = None
         for entry in raw:
             if not isinstance(entry, dict):
                 continue
@@ -232,7 +287,11 @@ class Sources:
             if live and session_id:
                 pid = self.pane_pid(session_id)
                 if pid is not None:
-                    usage = sysinfo.tree_usage(pid, proc_root=self._proc_root)
+                    if index is None:
+                        index = sysinfo.build_index(self._proc_root)
+                    usage = sysinfo.tree_usage(
+                        pid, proc_root=self._proc_root, index=index
+                    )
             row = by_session.get(name)
             out.append(
                 {
@@ -339,10 +398,16 @@ class Sources:
 
     # -- the retry-now mutation --------------------------------------------
 
-    def retry_now(self, repo_slug: str, number: int, round_: int) -> bool:
+    def retry_now(self, repo_slug: str, number: int, round_: int) -> str:
         """Age the newest ledger row of one round past the stale window so the
-        daemon can respawn it next pass. Returns whether a row was actually
-        aged (False when the round has no ledger row to retry).
+        daemon can respawn it next pass. Returns one of RETRY_OK,
+        RETRY_NO_ROW, or RETRY_UNAVAILABLE.
+
+        The tri-state exists for the audit trail: a write lost to a lock (or an
+        absent state.db) still degrades to a failed action rather than a 500 --
+        the read paths' contract -- but it must not be RECORDED as "the round
+        had no ledger row", which is an operator-error outcome, not a
+        console-failure one.
 
         The console adds no retry logic of its own: the daemon decides whether
         an aged round is really dead (its liveness signal defers a respawn
@@ -350,13 +415,16 @@ class Sources:
         clock that decision reads.
         """
         new_ts = int(self._wall()) - STALE_ROUND_SECONDS - RETRY_AGE_BUFFER
-
-        # A write collision with the daemon degrades to False (a clean "no row
-        # aged" action failure) rather than surfacing as a 500 on the operator's
-        # Retry click -- same contract as the read paths above.
-        return self._read_state(
-            False, lambda st: st.age_out_spawn(repo_slug, number, round_, new_ts)
+        outcome = self._read_state(
+            RETRY_UNAVAILABLE,
+            lambda st: (
+                RETRY_OK
+                if st.age_out_spawn(repo_slug, number, round_, new_ts)
+                else RETRY_NO_ROW
+            ),
+            write=True,
         )
+        return str(outcome)
 
     # -- the assembled dashboard payload -----------------------------------
 
@@ -384,6 +452,11 @@ class Sources:
             "generated_at": int(self._wall()),
             "header": {
                 "drift": self.drift(),
+                # False = this workspace has no revloop state.db at all. The
+                # page renders a banner: an empty dashboard here means "wrong
+                # workspace", not "idle daemon".
+                "state_present": self.state_present(),
+                "state_db": str(self.config.state_db),
                 "uptime_seconds": int(self._wall()) - self.boot_wall,
                 "poll_interval": self.config.poll_interval,
                 "round_cap": self.config.round_cap,
@@ -460,6 +533,10 @@ class Sources:
         PR references -- the reviewer edge has no issue edge -- so every link
         is a `/pull/` link. Ping kinds other than `stalled` are dedupe keys
         for telemetry, not operator pages, and are filtered out.
+
+        Bounded twice over: each reader is already capped at INBOX_LIMIT rows
+        (newest first), and the merged list is capped again, so the payload
+        cannot grow without bound as the two never-pruned tables accumulate.
         """
         now = int(self._wall())
         out: list[dict] = []
@@ -489,4 +566,4 @@ class Sources:
                 }
             )
         out.sort(key=lambda item: item["age_seconds"])
-        return out
+        return out[:INBOX_LIMIT]

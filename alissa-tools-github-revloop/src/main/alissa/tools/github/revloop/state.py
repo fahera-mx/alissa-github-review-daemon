@@ -94,8 +94,24 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
 
 
 class State:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
+        """Open the ledger. The daemon opens it read-write (creating the file,
+        applying the schema, migrating an old `spawns` key); a read-only
+        CONSUMER -- the console sidecar -- must not do any of that.
+
+        `read_only` connects through the `mode=ro` URI, which cannot create the
+        database and raises `sqlite3.OperationalError` when it does not exist.
+        That is the point: a console pointed at a workspace with no daemon
+        state must report "no state here", not silently CREATE a state.db (and
+        thereby render an empty, healthy-looking dashboard the operator cannot
+        tell from an idle daemon), and must never run the migration on a
+        database the daemon owns.
+        """
         path = Path(path).expanduser()
+        if read_only:
+            self._db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            self._db.row_factory = sqlite3.Row
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(path))
         self._db.row_factory = sqlite3.Row
@@ -338,39 +354,51 @@ class State:
     # The console sidecar (webui) renders the spawn ledger, the escalation
     # table and the ping ledger directly -- the operator inbox, the session ->
     # PR mapping, and the retry-now action -- the way it reads poll_snapshots
-    # through read_snapshots: no GitHub call, just the local tables. These
-    # readers return every row newest-first; the console already tail-bounds
-    # what it shows.
+    # through read_snapshots: no GitHub call, just the local tables.
+    #
+    # Rows come back newest-first, and every reader takes the same optional
+    # `limit` read_snapshots does. Unlike poll_snapshots, `escalations` and
+    # `pings` are NEVER pruned (they are per-head / per-episode dedupe keys the
+    # daemon must keep), so a reader that returned all of them would grow an
+    # operator inbox that never clears. Bounding belongs here, in SQL, not in
+    # the caller's slice.
 
-    def read_spawns(self) -> list[dict]:
-        """Every spawn row (one per enqueued reviewer round), newest first."""
-        rows = self._db.execute(
+    def read_spawns(self, limit: int | None = None) -> list[dict]:
+        """Spawn rows (one per enqueued reviewer round), newest first."""
+        return self._read_rows(
             "SELECT repo, number, round, head_sha, session, task_ref, spawned_at "
-            "FROM spawns ORDER BY spawned_at DESC, number DESC, round DESC"
-        ).fetchall()
-        return [dict(row) for row in rows]
+            "FROM spawns ORDER BY spawned_at DESC, number DESC, round DESC",
+            limit,
+        )
 
-    def read_escalations(self) -> list[dict]:
-        """Every cap-out escalation (the terminal half of the operator inbox),
+    def read_escalations(self, limit: int | None = None) -> list[dict]:
+        """Cap-out escalations (the terminal half of the operator inbox),
         newest first. Keyed per head_sha: a fresh push after a cap-out is a new
         row, so the console can show that the PR capped out again."""
-        rows = self._db.execute(
+        return self._read_rows(
             "SELECT repo, number, head_sha, escalated_at "
-            "FROM escalations ORDER BY escalated_at DESC, number DESC"
-        ).fetchall()
-        return [dict(row) for row in rows]
+            "FROM escalations ORDER BY escalated_at DESC, number DESC",
+            limit,
+        )
 
-    def read_pings(self) -> list[dict]:
-        """Every operator-ping row, newest first. `kind` is free-form and
-        carries the episode identity (`stalled:<session>`,
+    def read_pings(self, limit: int | None = None) -> list[dict]:
+        """Operator-ping rows, newest first. `kind` is free-form and carries
+        the episode identity (`stalled:<session>`,
         `activity-deferred:<session>`); the console filters on the prefix --
         only the stalled kind is an operator page, the activity kind is the
         telemetry dedupe for an activity-comment line."""
-        rows = self._db.execute(
+        return self._read_rows(
             "SELECT repo, number, kind, pinged_at "
-            "FROM pings ORDER BY pinged_at DESC, number DESC"
-        ).fetchall()
-        return [dict(row) for row in rows]
+            "FROM pings ORDER BY pinged_at DESC, number DESC",
+            limit,
+        )
+
+    def _read_rows(self, sql: str, limit: int | None) -> list[dict]:
+        params: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        return [dict(row) for row in self._db.execute(sql, params).fetchall()]
 
     def age_out_spawn(self, repo: str, number: int, round_: int, new_ts: int) -> bool:
         """Retry-now: stamp the NEWEST spawn row of THIS round back to

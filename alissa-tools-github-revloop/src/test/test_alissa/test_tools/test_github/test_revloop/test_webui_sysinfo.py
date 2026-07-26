@@ -115,7 +115,9 @@ def test_tree_usage_sums_rss_and_cpu(tmp_path):
 def test_tree_usage_vanished_root_is_zero(tmp_path):
     write_uptime(tmp_path, 100.0)
     usage = sysinfo.tree_usage(999, proc_root=tmp_path)
-    assert usage == {"pids": 0, "rss_bytes": 0, "cpu_percent": None}
+    # "unknown", not 0 B: the same thing the sessions panel shows for a session
+    # with no pane at all, so the column reads consistently.
+    assert usage == {"pids": 0, "rss_bytes": None, "cpu_percent": None}
 
 
 def test_tree_usage_child_vanishes_mid_walk(tmp_path):
@@ -129,7 +131,10 @@ def test_tree_usage_child_vanishes_mid_walk(tmp_path):
 
 
 def test_tree_usage_none_root(tmp_path):
-    assert sysinfo.tree_usage(None, proc_root=tmp_path)["pids"] == 0
+    usage = sysinfo.tree_usage(None, proc_root=tmp_path)
+    # both "unknown" paths agree: no pane at all reads the same as a pane that
+    # vanished -- neither may claim a measured 0 B
+    assert usage == {"pids": 0, "rss_bytes": None, "cpu_percent": None}
 
 
 def test_tree_usage_no_uptime_leaves_cpu_none(tmp_path):
@@ -150,3 +155,24 @@ def test_disk_usage_shape(tmp_path):
 
 def test_disk_usage_bad_path_none():
     assert sysinfo.disk_usage("/no/such/path/at/all/here") is None
+
+
+def test_tree_usage_accepts_a_shared_index(tmp_path):
+    """Several trees can be accounted from ONE /proc snapshot -- the dashboard
+    builds the index once instead of once per session."""
+    write_uptime(tmp_path, 100.0)
+    write_stat(tmp_path, 10, 1, rss=100, starttime=0)
+    write_stat(tmp_path, 20, 1, rss=7, starttime=0)
+    index = sysinfo.build_index(tmp_path)
+
+    calls = []
+    real_build = sysinfo.build_index
+    try:
+        sysinfo.build_index = lambda root: calls.append(root) or real_build(root)
+        a = sysinfo.tree_usage(10, proc_root=tmp_path, index=index)
+        b = sysinfo.tree_usage(20, proc_root=tmp_path, index=index)
+    finally:
+        sysinfo.build_index = real_build
+    assert calls == []  # the passed index is used verbatim -- no rescan
+    assert a["rss_bytes"] == 100 * sysinfo._PAGE_SIZE
+    assert b["rss_bytes"] == 7 * sysinfo._PAGE_SIZE

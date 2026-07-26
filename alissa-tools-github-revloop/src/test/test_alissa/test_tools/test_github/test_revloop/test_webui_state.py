@@ -3,6 +3,8 @@ retry-now ager that UPDATEs (never DELETEs) the newest row of a round."""
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from alissa.tools.github.revloop.state import State
@@ -103,3 +105,36 @@ def test_age_out_absent_row_returns_false(ledger):
     assert ledger.age_out_spawn(REPO, 99, 1, 0) is False   # other PR
     assert ledger.age_out_spawn(REPO, 16, 9, 0) is False   # other round
     assert ledger.age_out_spawn("other/repo", 16, 1, 0) is False
+
+
+# -- read-only mode: a consumer must not create or migrate the daemon's DB ---
+
+def test_read_only_refuses_to_create_the_database(tmp_path):
+    missing = tmp_path / "nope" / "state.db"
+    with pytest.raises(sqlite3.OperationalError):
+        State(missing, read_only=True)
+    assert not missing.exists()
+    assert not missing.parent.exists()  # not even the .revloop dir
+
+
+def test_read_only_reads_but_never_writes(tmp_path):
+    db = tmp_path / "state.db"
+    with State(db) as st:
+        spawn(st, session="s1")
+    with State(db, read_only=True) as ro:
+        assert len(ro.read_spawns()) == 1
+        with pytest.raises(sqlite3.OperationalError):
+            ro.record_escalation(REPO, 16, "sha")
+
+
+# -- bounded reads (escalations/pings are never pruned) ---------------------
+
+def test_readers_take_a_limit(ledger):
+    for n in range(5):
+        spawn(ledger, number=20 + n, session=f"s{n}")
+        ledger.record_escalation(REPO, 20 + n, f"sha{n}")
+        ledger.record_ping(REPO, 20 + n, f"stalled:s{n}")
+    assert len(ledger.read_spawns()) == 5
+    assert len(ledger.read_spawns(2)) == 2
+    assert len(ledger.read_escalations(2)) == 2
+    assert len(ledger.read_pings(2)) == 2

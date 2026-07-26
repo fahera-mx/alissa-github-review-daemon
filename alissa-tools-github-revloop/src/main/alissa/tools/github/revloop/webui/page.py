@@ -243,6 +243,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   padding: 0.85rem 1rem; max-height: 320px; overflow: auto; white-space: pre-wrap;
 }
 .empty { color: var(--text-muted); font-size: 0.8125rem; padding: 0.75rem 0; }
+.banner-warn {
+  border: 1px solid var(--status-blocked); background: var(--status-blocked-bg);
+  color: var(--status-blocked); border-radius: var(--radius-md);
+  padding: 0.75rem 1rem; margin-bottom: 1.5rem; font-size: 0.8125rem;
+}
 .stale { color: var(--text-muted); font-size: 0.75rem; margin-left: 0.5rem; }
 """
 
@@ -304,6 +309,8 @@ _DASHBOARD = """<!doctype html>
     </button>
   </div>
 </header>
+
+<div id="state-banner"></div>
 
 <div class="tiles" id="tiles"></div>
 
@@ -477,7 +484,7 @@ _JS = r"""
     if (!sessions.length) { el('sessions').innerHTML = '<div class="empty">No managed sessions.</div>'; return; }
     var head = '<table><thead><tr><th>Session</th><th>PR</th><th>Round</th><th>State</th>' +
       '<th class="num">Age</th><th class="num">CPU%</th><th class="num">RSS</th><th></th></tr></thead><tbody>';
-    var rows = sessions.map(function (s) {
+    var rows = sessions.map(function (s, i) {
       var dotcls = s.status === 'busy' ? 'busy' : s.status === 'gone' ? 'gone' : 'idle';
       var unmanaged = s.managed ? '' : ' <span class="muted">(unmanaged)</span>';
       return '<tr><td class="mono">' + esc(s.name) + unmanaged + '</td>' +
@@ -487,16 +494,20 @@ _JS = r"""
         '<td class="num">' + dur(s.age_seconds) + '</td>' +
         '<td class="num">' + (s.cpu_percent == null ? '--' : s.cpu_percent) + '</td>' +
         '<td class="num">' + bytes(s.rss_bytes) + '</td>' +
-        '<td class="num" data-name="' + esc(s.name) + '"></td></tr>';
+        '<td class="num" data-actions="' + i + '"></td></tr>';
     }).join('');
     el('sessions').innerHTML = head + rows + '</tbody></table>';
-    sessions.forEach(function (s) {
-      var cell = el('sessions').querySelector('td[data-name="' + String(s.name).replace(/"/g, '') + '"]');
+    sessions.forEach(function (s, i) {
+      // Index slot, not a name selector: session names are attacker-agnostic
+      // but arbitrary (the table lists unmanaged sessions too), and a quote or
+      // bracket in a name would break a name-built selector.
+      var cell = el('sessions').querySelector('td[data-actions="' + i + '"]');
       if (!cell) return;
       var kill = document.createElement('button');
       kill.className = 'btn danger sm'; kill.textContent = 'Kill';
       kill.addEventListener('click', function () {
-        if (!confirm('Kill ' + s.name + '?')) return;
+        var warn = s.managed ? '' : '\n\nThis session is NOT managed by this daemon.';
+        if (!confirm('Kill ' + s.name + '?' + warn)) return;
         act('/action/kill', {session: s.name}, kill);
       });
       cell.appendChild(kill);
@@ -523,6 +534,12 @@ _JS = r"""
     el('h-cap').textContent = h.round_cap;
     el('h-uptime').textContent = dur(h.uptime_seconds);
     el('h-dryrun').innerHTML = h.dry_run ? ' &middot; <span class="inbox-kind">DRY-RUN</span>' : '';
+    // An empty dashboard means two very different things; say which.
+    el('state-banner').innerHTML = h.state_present ? '' :
+      '<div class="banner-warn">No revloop state at <span class="mono">' + esc(h.state_db) +
+      '</span> — this workspace has never run the daemon. The panels below are ' +
+      'empty because there is nothing to read, not because the daemon is idle. ' +
+      'Check --workspace-root.</div>';
     var chip = el('drift'), dr = h.drift;
     chip.className = 'chip drift ' + dr.state;
     chip.textContent = 'v' + dr.running + (dr.state === 'behind' ? ' -> ' + dr.latest : '');

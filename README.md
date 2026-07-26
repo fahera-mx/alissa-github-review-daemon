@@ -231,6 +231,11 @@ export ALISSA_UI_PASSCODE='…'          # required — no passcode, no boot (fa
 alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
 ```
 
+- **Read-only, and it says so when there is nothing to read.** Reads open the
+  ledger through sqlite's `mode=ro`, so the console can never create or migrate
+  the daemon's `state.db`; a workspace that has never run the daemon renders a
+  banner naming the path instead of an empty dashboard that looks like an idle
+  daemon (`--workspace-root` defaults to the cwd, so that is the easy mistake).
 - **Data, no polling of GitHub.** Every panel reads the daemon's `poll_snapshots`
   table (the per-pass exhaust — pipeline board, sparklines, review-queue depth),
   the spawn ledger (which session is on which PR round), the escalation table and
@@ -390,7 +395,7 @@ bash check-style.sh alissa-tools-github-revloop
 bash check-types.sh alissa-tools-github-revloop
 ```
 
-269 tests cover the decision state machine, the config layering, the
+282 tests cover the decision state machine, the config layering, the
 `poll_snapshots` exhaust buffer (record/read round-trip, retention pruning,
 in-place migration, one-snapshot-per-poll, dry-run capture), the
 `alissa-pr-review` round/verdict/timeout logic, and the reviewer console (auth

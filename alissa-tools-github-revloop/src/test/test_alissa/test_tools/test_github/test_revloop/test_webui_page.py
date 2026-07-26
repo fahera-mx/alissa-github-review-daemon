@@ -53,7 +53,7 @@ def test_gold_accent_is_spent_only_on_the_drift_chip():
 def test_dashboard_has_all_panel_containers():
     html = dashboard_page("c", "1.0.0")
     for panel_id in ("tiles", "pipeline", "sessions", "inbox", "log",
-                     "spark-duration", "spark-active", "drift"):
+                     "spark-duration", "spark-active", "drift", "state-banner"):
         assert f'id="{panel_id}"' in html
 
 
@@ -81,3 +81,21 @@ def test_dashboard_theme_key_is_console_specific():
     """localStorage is per-origin, not per-port: a shared theme key would let
     the two consoles fight over the toggle."""
     assert "revloop-ui-theme" in dashboard_page("c", "1.0.0")
+
+
+def test_dashboard_warns_when_there_is_no_daemon_state():
+    """An empty dashboard means two different things; the page says which."""
+    html = dashboard_page("c", "1.0.0")
+    assert "h.state_present" in html
+    assert "No revloop state at" in html
+    assert "--workspace-root" in html
+
+
+def test_kill_button_is_wired_by_index_not_by_name():
+    """Session names in this table are arbitrary (unmanaged rows included), so
+    a name-built selector could silently lose the button or break outright."""
+    html = dashboard_page("c", "1.0.0")
+    assert "data-actions=" in html
+    assert "data-name=" not in html
+    # and an unmanaged session is called out in the confirm prompt
+    assert "NOT managed by this daemon" in html

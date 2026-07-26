@@ -12,7 +12,13 @@ from alissa.tools.github.revloop.config import Config
 from alissa.tools.github.revloop.loop import STALE_ROUND_SECONDS
 from alissa.tools.github.revloop.state import State
 from alissa.tools.github.revloop.webui import sources as sources_mod
-from alissa.tools.github.revloop.webui.sources import Sources, is_managed
+from alissa.tools.github.revloop.webui.sources import (
+    RETRY_NO_ROW,
+    RETRY_OK,
+    RETRY_UNAVAILABLE,
+    Sources,
+    is_managed,
+)
 
 SESSION = "review-widgets-pr16-r1-ab12cd"
 
@@ -69,6 +75,15 @@ def make_sources(tmp_path, *, runner=None, http=None, clock=None, proc_root="/pr
     )
 
 
+def _quiet_runner(argv, **kw):
+    """No sessions, no rate limit -- for tests about everything else."""
+    if argv[:3] == ["alissa", "tmux", "ls"]:
+        return "[]"
+    if argv[:3] == ["gh", "api", "rate_limit"]:
+        return "{}"
+    raise AssertionError(argv)
+
+
 # -- managed-session namespace ---------------------------------------------
 
 def test_is_managed():
@@ -96,7 +111,7 @@ def test_state_read_degrades_on_lock(tmp_path, monkeypatch):
     src = make_sources(tmp_path)
 
     class LockedState:
-        def __init__(self, path):
+        def __init__(self, path, *, read_only=False):
             pass
 
         def __enter__(self):
@@ -114,8 +129,10 @@ def test_state_read_degrades_on_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(sources_mod, "State", LockedState)
     assert src.snapshots() == []
     assert src.ledgers() == {"spawns": [], "escalations": [], "pings": []}
-    # the retry mutation degrades to a clean "no row aged", not a 500
-    assert src.retry_now("acme/widgets", 16, 1) is False
+    # the retry mutation degrades to a clean failure, not a 500 -- and says
+    # "state unavailable", never "no ledger row" (that is an operator-error
+    # outcome, and conflating them would corrupt the audit trail)
+    assert src.retry_now("acme/widgets", 16, 1) == RETRY_UNAVAILABLE
 
 
 # -- sessions --------------------------------------------------------------
@@ -336,7 +353,7 @@ def test_log_tail_unreadable_path(tmp_path):
 
 def test_retry_now_ages_past_the_daemons_stale_window(tmp_path):
     src = make_sources(tmp_path)
-    assert src.retry_now("acme/widgets", 16, 1) is True
+    assert src.retry_now("acme/widgets", 16, 1) == RETRY_OK
     with State(src.config.state_db) as st:
         row = st.read_spawns()[0]
         # wall_clock 5000, minus the daemon's own stale window, minus the buffer
@@ -347,10 +364,10 @@ def test_retry_now_ages_past_the_daemons_stale_window(tmp_path):
         assert row["session"] == SESSION
 
 
-def test_retry_now_absent_round_is_false(tmp_path):
+def test_retry_now_absent_round_says_no_row(tmp_path):
     src = make_sources(tmp_path)
-    assert src.retry_now("acme/widgets", 999, 1) is False
-    assert src.retry_now("acme/widgets", 16, 7) is False
+    assert src.retry_now("acme/widgets", 999, 1) == RETRY_NO_ROW
+    assert src.retry_now("acme/widgets", 16, 7) == RETRY_NO_ROW
 
 
 # -- config echo -----------------------------------------------------------
@@ -464,3 +481,131 @@ def test_dashboard_spends_no_github_budget_beyond_the_cached_checks(tmp_path):
     src.dashboard()  # a second poll: rate_limit is cached, so no second gh call
     gh_calls = [a for a in seen if a and a[0] == "gh"]
     assert gh_calls == [["gh", "api", "rate_limit"]]
+
+
+# -- read-only posture: the console never creates the daemon's state --------
+
+def test_reads_never_create_the_state_db(tmp_path):
+    """A wrong --workspace-root must not leave a phantom .revloop/state.db --
+    and must be distinguishable from an idle daemon."""
+    config = Config.build(tmp_path / "elsewhere", {}, {})
+    src = Sources(config=config, running_version="0.14.0",
+                  run=lambda argv, **kw: "[]", http_get=lambda u, t: None,
+                  wall_clock=lambda: 5000.0)
+    assert src.state_present() is False
+    assert src.snapshots() == []
+    assert src.ledgers() == {"spawns": [], "escalations": [], "pings": []}
+    assert not config.state_db.exists()
+    assert not config.state_db.parent.exists()
+
+    payload = src.dashboard()
+    assert payload["header"]["state_present"] is False
+    assert payload["header"]["state_db"] == str(config.state_db)
+
+
+def test_retry_never_creates_the_state_db(tmp_path):
+    config = Config.build(tmp_path / "elsewhere", {}, {})
+    src = Sources(config=config, running_version="0.14.0",
+                  run=lambda argv, **kw: "", http_get=lambda u, t: None,
+                  wall_clock=lambda: 5000.0)
+    assert src.retry_now("acme/widgets", 16, 1) == RETRY_UNAVAILABLE
+    assert not config.state_db.exists()
+
+
+def test_state_present_true_for_a_seeded_workspace(tmp_path):
+    src = make_sources(tmp_path, runner=_quiet_runner)
+    assert src.state_present() is True
+    assert src.dashboard()["header"]["state_present"] is True
+
+
+# -- caching a FAILED check (negative cache) --------------------------------
+
+def test_failed_remote_checks_are_retried_once_per_window(tmp_path):
+    """A missing `gh` / unreachable PyPI must not be retried on every poll --
+    each /api/state would otherwise block on the full timeouts."""
+    from alissa.tools.github.revloop.proc import CommandError
+
+    clock = Clock()
+    gh_calls, pypi_calls = [], []
+
+    def runner(argv, **kw):
+        gh_calls.append(argv)
+        raise CommandError(argv, 1, "gh: not found")
+
+    def http(url, timeout):
+        pypi_calls.append(url)
+        return None
+
+    src = make_sources(tmp_path, runner=runner, http=http, clock=clock)
+    for _ in range(6):  # six polls, 10s apart, inside both windows
+        assert src.rate_limit() is None
+        assert src.latest_version() is None
+        clock.tick(10)
+    assert len(gh_calls) == 1
+    assert len(pypi_calls) == 1
+    # ...and the window still expires: the next poll past the TTL retries
+    clock.tick(sources_mod.RATE_CACHE_TTL)
+    src.rate_limit()
+    assert len(gh_calls) == 2
+
+
+# -- one /proc snapshot per dashboard build ---------------------------------
+
+def test_sessions_builds_the_proc_index_once(tmp_path, monkeypatch):
+    """The index is identical for every session in one build; rebuilding it per
+    session would make the walk O(sessions x processes)."""
+    proc = tmp_path / "proc"
+    for pid in (77, 78, 79):
+        (proc / str(pid)).mkdir(parents=True)
+        tail = ["S"] + ["0"] * 21
+        tail[1] = "1"
+        (proc / str(pid) / "stat").write_text(f"{pid} (claude) " + " ".join(tail))
+
+    def runner(argv, **kw):
+        if argv[:3] == ["alissa", "tmux", "ls"]:
+            return json.dumps([
+                {"name": f"review-widgets-pr{n}-r1-aaa", "session": f"s{n}",
+                 "status": "busy", "live": True} for n in (77, 78, 79)])
+        if argv[:2] == ["tmux", "list-panes"]:
+            return argv[3].lstrip("s") + "\n"  # session sN -> pane pid N
+        raise AssertionError(argv)
+
+    builds = []
+    real_build = sources_mod.sysinfo.build_index
+    monkeypatch.setattr(sources_mod.sysinfo, "build_index",
+                        lambda root: builds.append(root) or real_build(root))
+    src = make_sources(tmp_path, runner=runner, proc_root=str(proc))
+    rows = src.sessions()
+    assert len(rows) == 3 and all(r["pane_pid"] for r in rows)
+    assert len(builds) == 1
+
+
+def test_sessions_never_walks_proc_without_a_live_pane(tmp_path, monkeypatch):
+    def runner(argv, **kw):
+        if argv[:3] == ["alissa", "tmux", "ls"]:
+            return json.dumps([{"name": SESSION, "session": "s1",
+                                "status": "gone", "live": False}])
+        raise AssertionError(argv)
+
+    builds = []
+    monkeypatch.setattr(sources_mod.sysinfo, "build_index",
+                        lambda root: builds.append(root) or ({}, {}))
+    src = make_sources(tmp_path, runner=runner)
+    assert src.sessions()[0]["rss_bytes"] is None
+    assert builds == []
+
+
+# -- bounded inbox ----------------------------------------------------------
+
+def test_inbox_is_bounded(tmp_path):
+    """`escalations` and `pings` are never pruned, so an unbounded inbox would
+    keep every page ever raised on the dashboard forever."""
+    src = make_sources(tmp_path, runner=_quiet_runner)
+    with State(src.config.state_db) as st:
+        for n in range(sources_mod.INBOX_LIMIT + 20):
+            st.record_escalation("acme/widgets", 100 + n, f"sha{n}")
+            st.record_ping("acme/widgets", 100 + n, f"stalled:s{n}")
+    led = src.ledgers()
+    assert len(led["escalations"]) == sources_mod.INBOX_LIMIT
+    assert len(led["pings"]) == sources_mod.INBOX_LIMIT
+    assert len(src.dashboard()["inbox"]) == sources_mod.INBOX_LIMIT

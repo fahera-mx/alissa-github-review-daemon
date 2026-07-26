@@ -111,16 +111,27 @@ def tree_pids(root_pid: int, children: "dict[int, list[int]]") -> "set[int]":
 
 
 def tree_usage(
-    root_pid: "int | None", *, proc_root: "str | os.PathLike[str]" = "/proc"
+    root_pid: "int | None",
+    *,
+    proc_root: "str | os.PathLike[str]" = "/proc",
+    index: "tuple[dict[int, list[int]], dict[int, dict]] | None" = None,
 ) -> dict:
     """CPU% (cumulative average since the pane started) and summed RSS for the
-    whole process tree under `root_pid`. Returns zeros/None when the root has
-    already vanished -- the sessions panel then just shows a live session with
-    no measurable footprint, never an error."""
-    empty = {"pids": 0, "rss_bytes": 0, "cpu_percent": None}
+    whole process tree under `root_pid`. Returns None/None when the root has
+    already vanished -- "unknown", the same thing the caller shows for a
+    session with no pane at all, so the column reads consistently.
+
+    `index` is the (children, stats) pair from `build_index`. Pass it when
+    accounting SEVERAL trees from one snapshot of `/proc`: the index is
+    identical for every session in one dashboard build, and rebuilding it per
+    session makes the walk O(sessions x processes) -- on a busy reviewer host
+    thousands of `stat` reads every poll, stolen from the reviewer agents the
+    console exists to watch. Omitted, it is built once for this call.
+    """
+    empty = {"pids": 0, "rss_bytes": None, "cpu_percent": None}
     if root_pid is None:
         return empty
-    children, stats = build_index(proc_root)
+    children, stats = index if index is not None else build_index(proc_root)
     if root_pid not in stats:
         return empty
     uptime = read_uptime(proc_root)
