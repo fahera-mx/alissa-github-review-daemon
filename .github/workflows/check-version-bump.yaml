@@ -8,8 +8,21 @@ on: [pull_request]
 # ahead of PyPI and every pinned consumer keeps running the old code. That is the
 # 2026-07-28 alissa-github-develop-daemon incident (its PRs #62 and #64).
 #
-# This check closes the gap on the pull_request side: touch the dist source, bump
-# the version; bump the version, make it one PyPI does not already have.
+# This check closes the gap on the pull_request side: touch anything that gets
+# published, bump the version; bump the version, make it one PyPI does not already
+# have.
+#
+# SCOPE: the guarded prefix is the whole distribution directory — the same subtree
+# package-publish.yaml triggers on — minus src/test/. The property being enforced
+# is "if merging this pull request runs a publish, it must publish something", so
+# the guard has to cover every path that starts a publish AND changes the artifact:
+# requirements.txt (install_requires), setup.py (name, entry_points,
+# python_requires), README.md (long_description) and MANIFEST.in (sdist contents),
+# not just src/. src/test/ is exempt in the other direction: nothing under it is
+# packaged (setup.py packages src/main only, MANIFEST.in adds requirements.txt and
+# version), so a test-only change yields a byte-identical wheel and must not cost a
+# release number. Repo-level paths — README.md, docker/, .github/, the *.sh check
+# scripts — are outside the dist directory and never require a bump.
 #
 # SOURCE OF TRUTH: the plain-text `version` file, NOT the `version.py` beside it.
 # setup.py reads `version` to set the distribution version, and version.py is a
@@ -64,50 +77,61 @@ jobs:
           # file set GitHub shows in the pull request's "Files changed" tab —
           # unrelated commits that landed on main meanwhile are not attributed
           # to this pull request.
+          #
+          # --no-renames: with rename detection on, a file moved OUT of the dist
+          # directory is reported only at its destination, so the wheel changes
+          # while the guard never sees a dist path. Without it, both sides of a
+          # rename appear and the set is exactly "paths this pull request touches".
           merge_base="$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")"
           changed="${RUNNER_TEMP}/changed-files.txt"
-          git diff --name-only "${merge_base}" "${HEAD_SHA}" > "${changed}"
+          git diff --no-renames --name-only "${merge_base}" "${HEAD_SHA}" > "${changed}"
 
           echo "changed_files=${changed}" >> "${GITHUB_OUTPUT}"
           echo "Changed files in this pull request (${merge_base}..${HEAD_SHA}):"
           sed 's/^/  /' "${changed}"
-      - name: Enforce Version Bump for Source Changes
+      - name: Enforce Version Bump for Published Changes
         id: guard
         env:
           CHANGED_FILES: ${{ steps.changes.outputs.changed_files }}
-          SRC_PREFIX: ${{ matrix.path }}/src/
+          # The whole dist directory (what package-publish.yaml triggers on)…
+          DIST_PREFIX: ${{ matrix.path }}/
+          # …except the tests, which are not packaged. See the SCOPE note above.
+          TEST_PREFIX: ${{ matrix.path }}/src/test/
           VERSION_FILE: ${{ matrix.version_file }}
         run: |
           set -euo pipefail
 
-          src_changed=false
+          dist_changed=false
           version_changed=false
           while IFS= read -r file; do
             if [ -z "${file}" ]; then
               continue
             fi
             case "${file}" in
-              "${SRC_PREFIX}"*) src_changed=true ;;
+              "${TEST_PREFIX}"*) ;;
+              "${DIST_PREFIX}"*) dist_changed=true ;;
             esac
             if [ "${file}" = "${VERSION_FILE}" ]; then
               version_changed=true
             fi
           done < "${CHANGED_FILES}"
 
-          if [ "${src_changed}" = "false" ]; then
-            echo "src_changed=false" >> "${GITHUB_OUTPUT}"
+          if [ "${dist_changed}" = "false" ]; then
+            echo "dist_changed=false" >> "${GITHUB_OUTPUT}"
             echo "version_changed=false" >> "${GITHUB_OUTPUT}"
-            echo "::notice::No changes under ${SRC_PREFIX} — the version-bump rule does not apply to this pull request."
+            echo "::notice::No published files changed under ${DIST_PREFIX} (${TEST_PREFIX} is exempt — nothing under it is packaged) — the version-bump rule does not apply to this pull request."
             exit 0
           fi
-          echo "src_changed=true" >> "${GITHUB_OUTPUT}"
+          echo "dist_changed=true" >> "${GITHUB_OUTPUT}"
 
           if [ "${version_changed}" = "false" ]; then
             current="$(head -n 1 "${VERSION_FILE}" 2>/dev/null | tr -d '[:space:]' || true)"
             {
-              echo "RULE: a pull request that modifies ${SRC_PREFIX}** must also change ${VERSION_FILE}"
+              echo "RULE: a pull request that modifies ${DIST_PREFIX}** must also change ${VERSION_FILE}"
+              echo "      (${TEST_PREFIX}** is exempt — nothing under it is packaged)"
               echo ""
-              echo "This pull request changes ${SRC_PREFIX}** but leaves ${VERSION_FILE} at ${current:-<unreadable>}."
+              echo "This pull request changes published files under ${DIST_PREFIX}** but leaves"
+              echo "${VERSION_FILE} at ${current:-<unreadable>}."
               echo ""
               echo "Why that blocks the merge: on merge, \"Python Package Publish\" uploads with"
               echo "\`twine upload --skip-existing\`. Re-uploading a version PyPI already has is skipped"
@@ -118,9 +142,9 @@ jobs:
               echo ""
               echo "Fix: bump ${VERSION_FILE} to the next unpublished version"
               echo "(the version.py beside it is a derived reader — editing that file alone changes nothing),"
-              echo "or move the change out of ${SRC_PREFIX}** if this pull request must not release."
+              echo "or move the change out of ${DIST_PREFIX}** if this pull request must not release."
             } | tee -a "${GITHUB_STEP_SUMMARY}"
-            echo "::error file=${VERSION_FILE}::Source under ${SRC_PREFIX} changed without bumping ${VERSION_FILE} — the merge-triggered publish would be a silent no-op (see the 2026-07-28 develop-daemon #62/#64 incident). Bump the version file."
+            echo "::error file=${VERSION_FILE}::Published files under ${DIST_PREFIX} changed without bumping ${VERSION_FILE} — the merge-triggered publish would be a silent no-op (see the 2026-07-28 develop-daemon #62/#64 incident). Bump the version file."
             exit 1
           fi
 
@@ -134,8 +158,33 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A pull request can DELETE the version file, which reaches this step as
+          # version_changed=true. Say so in the same shape as every other failure
+          # here rather than dying on a bare `head: cannot open …`.
+          if [ ! -f "${VERSION_FILE}" ]; then
+            {
+              echo "RULE: ${VERSION_FILE} must exist and hold the version this pull request publishes."
+              echo ""
+              echo "This pull request deletes (or moves away) ${VERSION_FILE}. setup.py opens that"
+              echo "exact path to set the distribution version, so the merge-triggered publish would"
+              echo "fail to build — and the version.py beside it would fall back to 0.0.0."
+              echo ""
+              echo "Fix: restore ${VERSION_FILE} holding the version this pull request publishes."
+            } | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo "::error file=${VERSION_FILE}::${VERSION_FILE} is missing — setup.py reads it to set the published version. Restore it."
+            exit 1
+          fi
+
           version="$(head -n 1 "${VERSION_FILE}" | tr -d '[:space:]')"
           if [ -z "${version}" ]; then
+            {
+              echo "RULE: ${VERSION_FILE} must exist and hold the version this pull request publishes."
+              echo ""
+              echo "The file is empty. setup.py reads it to set the distribution version, so the"
+              echo "merge-triggered publish would fail to build."
+              echo ""
+              echo "Fix: write the version this pull request publishes into ${VERSION_FILE}."
+            } | tee -a "${GITHUB_STEP_SUMMARY}"
             echo "::error file=${VERSION_FILE}::${VERSION_FILE} is empty — it must hold the version this pull request publishes."
             exit 1
           fi
