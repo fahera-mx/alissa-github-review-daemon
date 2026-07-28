@@ -383,6 +383,7 @@ def test_config_echo_reports_reviewer_semantics(tmp_path):
     assert echo["stale_round_seconds"] == STALE_ROUND_SECONDS
     assert echo["repos"] == ["acme/widgets"]
     assert echo["state_db"] == str(src.config.state_db)
+    assert echo["operators"] == list(src.config.operators)
 
 
 # -- full dashboard payload ------------------------------------------------

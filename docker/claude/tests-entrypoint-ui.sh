@@ -195,6 +195,8 @@ if [ -f "${CFG}" ]; then
     "generated config omits unset round_cap (pass-through intact)"
   assert_eq "$(jq -r '.on_missing_hub' "${CFG}")" "add" \
     "generated config keeps the structural on_missing_hub"
+  assert_eq "$(jq -r 'has("operators")' "${CFG}")" "false" \
+    "generated config omits operators when ALISSA_REVIEW_OPERATORS is unset (fails closed)"
 else
   bad "entrypoint generated no revloop.config.json"
 fi
@@ -295,8 +297,24 @@ info "4. sidecar killed under the container -> fail-VISIBLE, not fail-fatal"
 # -----------------------------------------------------------------------------
 LOG4="${TMPROOT}/died.log"
 rm -f "${MARKERS}"/*
-run_entrypoint "${LOG4}" ALISSA_UI_ENABLED=on ALISSA_UI_PASSCODE="${PASSCODE}"; PID4="${EP_PID}"
+# ALISSA_REVIEW_OPERATORS rides on THIS boot rather than paying for a fifth one,
+# and specifically on a boot that starts a REAL sidecar — that makes it an
+# end-to-end pin/library-skew check rather than a renderer check. The daemon is
+# stubbed here, so the sidecar is the only component that actually LOADS the
+# generated config, and `Config.build` rejects unknown keys fatally: an image
+# whose `REVLOOP_VERSION` predates a config key it renders dies at boot, and
+# this assertion is what fails instead. Hence the rule for the next person
+# adding a config key — bump `ARG REVLOOP_VERSION` in the SAME PR (CI installs
+# that pin, falling back to the repo source tree while it is unpublished), and
+# this case proves the two moved together. Asserting only that the file was
+# rendered would not: `jq` reading back what the entrypoint just wrote says
+# nothing about whether the daemon can read it.
+run_entrypoint "${LOG4}" ALISSA_UI_ENABLED=on ALISSA_UI_PASSCODE="${PASSCODE}" \
+  ALISSA_REVIEW_OPERATORS="RHDZMOTA| ops-bot "; PID4="${EP_PID}"
 if wait_for_log "${LOG4}" "starting reviewer console" 30; then
+  assert_eq "$(jq -c '.operators' "${WORKSPACE}/revloop.config.json")" \
+    '["RHDZMOTA","ops-bot"]' \
+    "generated config carries ALISSA_REVIEW_OPERATORS (split, trimmed)"
   ui_pid=""
   for _ in $(seq 1 30); do
     # Match on the argv the entrypoint passes, not the program name: the

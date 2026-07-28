@@ -25,11 +25,15 @@
 # claude-code need Node >= 18 — both satisfied.
 FROM python:3.12-slim-bookworm
 
-# Version of the daemon to install from PyPI. Bump per release. 0.15.0 is the
-# release this repo publishes on merge; it is the first version whose console
-# script `alissa-revloop-ui` the entrypoint starts (0.14.0 added the script,
-# this release wires it into the container), so the pin must not go below it.
-ARG REVLOOP_VERSION=0.15.0
+# Version of the daemon to install from PyPI. Bump per release: 0.16.0 is the
+# release this repo publishes on merge (it must match the dist's version file,
+# or the image ships a library that cannot read the config this image renders).
+#
+# The FLOOR is separate from the current pin and moves far less often: never
+# below 0.15.0, the first version shipping the `alissa-revloop-ui` console
+# script the entrypoint starts. Naming the two apart keeps the next release a
+# one-line edit.
+ARG REVLOOP_VERSION=0.16.0
 # Node major version (must be >= 18 for the alissa CLI and claude-code).
 ARG NODE_MAJOR=22
 
@@ -183,6 +187,11 @@ WORKDIR /workspace
 # repo needs no separator). "|" is used because repo slugs contain "/".
 #   e.g. "fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app"
 ARG ALISSA_REVIEW_REPOS=""
+# GitHub logins allowed to re-open a capped PR with an
+# `alissa-review: re-enter +N` comment, same "|"-separated convention. Empty ON
+# PURPOSE: the lever fails closed, and an operator opts in explicitly.
+#   e.g. "RHDZMOTA"
+ARG ALISSA_REVIEW_OPERATORS=""
 # Workspace name recorded in the generated manifest.
 ARG ALISSA_WORKSPACE="alissa-review"
 # Skills installed into every reviewer session (manifest `skills:`), "|"-separated.
@@ -222,6 +231,7 @@ ARG ALISSA_ENABLE_FIREWALL="0"
 ARG ALISSA_FIREWALL_EXTRA=""
 
 ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
+    ALISSA_REVIEW_OPERATORS=${ALISSA_REVIEW_OPERATORS} \
     ALISSA_WORKSPACE=${ALISSA_WORKSPACE} \
     ALISSA_REVIEW_SKILLS=${ALISSA_REVIEW_SKILLS} \
     ALISSA_POLL_INTERVAL=${ALISSA_POLL_INTERVAL} \

@@ -41,6 +41,7 @@ CONFIG_KEYS = (
     "poll_interval",
     "round_cap",
     "repos",
+    "operators",
     "agent_profile",
     "reviewer_login",
     "state_path",
@@ -67,6 +68,14 @@ class Config:
 
     # Empty tuple means "every repo that requests a review from me".
     repos: tuple[str, ...] = ()
+
+    # GitHub logins whose re-entry ack may raise a capped PR's effective cap
+    # (loop.parse_reentry_ack). Empty -- the default -- means NO ack is ever
+    # honoured: the lever fails closed, because anyone who can comment on a PR
+    # could otherwise buy it more rounds. The reviewer identity itself is never
+    # an operator however it is configured (the daemon's own escalation quotes
+    # the grammar, and self-granting would defeat CR9's cap outright).
+    operators: tuple[str, ...] = ()
 
     agent_profile: str = "claude"
     reviewer_login: str | None = None  # None -> resolve once via `gh api user`
@@ -148,7 +157,10 @@ class Config:
                 f"on_missing_hub must be one of {sorted(_HUB_MODES)}, got {hub_mode!r}"
             )
 
-        repos = tuple(raw.get("repos", ()))
+        repos = _string_list(raw.get("repos", ()), "repos", "owner/repo entries")
+        operators = _string_list(
+            raw.get("operators", ()), "operators", "GitHub logins"
+        )
         if hub_mode == HUB_ADD and not repos:
             # Anyone who can request a review could otherwise cause an arbitrary
             # repo to be cloned onto this machine and opened as an agent's cwd.
@@ -175,6 +187,7 @@ class Config:
             poll_interval=interval,
             round_cap=cap,
             repos=repos,
+            operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),
             state_path=Path(state_path).expanduser() if state_path else None,
@@ -182,6 +195,22 @@ class Config:
             on_missing_hub=hub_mode,
             dry_run=bool(raw.get("dry_run", False)),
         )
+
+
+def _string_list(value: Any, key: str, what: str) -> tuple[str, ...]:
+    """A config list key as a tuple of non-empty, stripped strings.
+
+    The guard is the point: JSON makes `"repos": "org/repo"` an easy typo, and
+    Python would iterate it into single CHARACTERS -- an allowlist of 30-odd
+    one-character names, which `watches()` then matches against nothing and the
+    daemon quietly reviews no PR at all. Both list keys go through here so
+    neither can grow the footgun back.
+    """
+    if isinstance(value, str):
+        raise ValueError(
+            f"{key} must be a list of {what}, not a string (got {value!r})"
+        )
+    return tuple(str(item).strip() for item in value if str(item).strip())
 
 
 def load_config_file(path: Path) -> dict[str, Any]:

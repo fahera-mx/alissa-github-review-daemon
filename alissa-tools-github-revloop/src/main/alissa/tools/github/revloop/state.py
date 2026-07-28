@@ -4,8 +4,9 @@ Deliberately thin: GitHub is the source of truth for how many rounds have run
 (one submitted review per round). This table exists only to stop the daemon
 double-spawning a reviewer while a round is still in flight, to map a live
 session name back to the round it was spawned for (so the reap sweep can tell
-a finished round's session from an in-flight one), and to remember that a
-cap-out was already escalated. The ledger tolerates sessions dying or being
+a finished round's session from an in-flight one), to remember that a cap-out
+was already escalated, and to count the operator re-entry acks that raise a
+single PR's effective cap. The ledger tolerates sessions dying or being
 killed behind its back: a reap record is bookkeeping, never a precondition.
 
 The `poll_snapshots` table is a different animal from the ledger above: it
@@ -65,6 +66,16 @@ CREATE TABLE IF NOT EXISTS escalations (
 CREATE TABLE IF NOT EXISTS reaps (
     session   TEXT    NOT NULL PRIMARY KEY,
     reaped_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS grants (
+    repo       TEXT    NOT NULL,
+    number     INTEGER NOT NULL,
+    comment_id INTEGER NOT NULL,
+    author     TEXT    NOT NULL,
+    rounds     INTEGER NOT NULL,
+    granted_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, number, comment_id)
 );
 
 CREATE TABLE IF NOT EXISTS pings (
@@ -269,6 +280,10 @@ class State:
         self._db.commit()
 
     def escalated(self, repo: str, number: int, head_sha: str) -> bool:
+        """Whether this head has been paged at all. Not the whole dedupe story
+        once re-entry grants exist -- a grant consumed without an approve is a
+        new decision on the SAME head, deduped through the ping ledger; see
+        loop._escalation_owed."""
         row = self._db.execute(
             "SELECT 1 FROM escalations WHERE repo=? AND number=? AND head_sha=?",
             (repo, number, head_sha),
@@ -282,6 +297,76 @@ class State:
             (repo, number, head_sha, int(time.time())),
         )
         self._db.commit()
+
+    # -- operator re-entry grants ------------------------------------------
+    #
+    # One row per HONOURED operator ack comment (issue #42): a capped PR is
+    # re-entered only by an explicit, allowlisted, bounded ack, and this table
+    # is what makes the grant *counted* rather than inferred. The comment id is
+    # the grant's identity, so the same ack is honoured exactly once however
+    # many polls read it, and a second grant genuinely requires a second
+    # comment. Rows are never pruned: the effective cap of a PR is
+    # `round_cap + sum(rounds)` over its grants, so dropping one would silently
+    # lower the cap and re-escalate a PR that was already re-entered.
+
+    def record_grant(
+        self, repo: str, number: int, comment_id: int, author: str, rounds: int
+    ) -> bool:
+        """Record one honoured ack. True when it is NEW (first sighting).
+
+        INSERT OR IGNORE keyed on the comment id: re-reading the same ack on
+        every poll must not re-grant its rounds, and the caller uses the return
+        value to log/announce the grant exactly once.
+        """
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO grants "
+            "(repo, number, comment_id, author, rounds, granted_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (repo, number, int(comment_id), author, int(rounds), int(time.time())),
+        )
+        self._db.commit()
+        return cur.rowcount > 0
+
+    def granted_rounds(self, repo: str, number: int) -> int:
+        """Extra rounds this PR has been granted, summed over its acks."""
+        row = self._db.execute(
+            "SELECT COALESCE(SUM(rounds), 0) AS total FROM grants "
+            "WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+        return int(row["total"]) if row is not None else 0
+
+    def newest_grant(self, repo: str, number: int) -> sqlite3.Row | None:
+        """The most recently recorded ack for this PR, or None.
+
+        The escalation names it ("the re-entry granted by @x was consumed"),
+        and it is the newest ack by `granted_at`, so a second grant supersedes
+        the first in the page's wording. Nothing compares that timestamp with
+        the escalation row -- the once-only dedupe is the ping-ledger key; see
+        loop.capout_kind for why not a wall-clock comparison.
+        """
+        return self._db.execute(
+            "SELECT * FROM grants WHERE repo=? AND number=? "
+            "ORDER BY granted_at DESC, rowid DESC LIMIT 1",
+            (repo, number),
+        ).fetchone()
+
+    def read_grants(self, repo: str, number: int) -> list[dict]:
+        """One PR's grant rows, newest first (like every reader here).
+
+        Deliberately narrow: no unfiltered form and no `limit` until something
+        needs them. The console does not read this table yet -- showing "this
+        PR was re-entered by @x" in the operator inbox wants rendering as well
+        as data, so it lands as its own change rather than as unused
+        parameters here.
+        """
+        return self._read_rows(
+            "SELECT repo, number, comment_id, author, rounds, granted_at "
+            "FROM grants WHERE repo=? AND number=? "
+            "ORDER BY granted_at DESC, rowid DESC",
+            None,
+            (repo, number),
+        )
 
     # -- poll snapshots (the console sidecar's exhaust buffer) -------------
 

@@ -106,6 +106,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `poll_interval` | `60` | seconds; must be ≥10 |
 | `round_cap` | `10` | CR9 cap; never queues round cap+1 |
 | `repos` | `[]` | allowlist of `owner/repo`; empty = all |
+| `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | resolved from `gh api user` when null |
 | `state_path` | `<workspace-root>/.revloop/state.db` | spawn ledger; per-workspace by default so parallel daemons never share one |
@@ -170,6 +171,8 @@ Leave it on `skip` unless you want unattended clones.
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | `round_cap` reviews, no approve | comment cap-out on the PR, escalate, stop |
 | new commits after a cap-out | re-escalate (head moved, decision is about the new state) |
+| operator ack on a capped PR | grant N more rounds, log it, append to the activity comment |
+| a granted re-entry consumed without approve | one fresh cap-out naming the ack, then capped again |
 | PR is a draft | skip (CR1) |
 | PR authored by the reviewer identity | skip — GitHub forbids self-review |
 | repo has no worktree hub | skip, or hub-ify first if `on_missing_hub: "add"` |
@@ -177,6 +180,50 @@ Leave it on `skip` unless you want unattended clones.
 `COMMENTED` reviews close a round, not just `APPROVED`/`CHANGES_REQUESTED` —
 single-operator workspaces post comment-mode reviews per CR5, and the loop must
 still advance.
+
+### Operator re-entry after a cap-out
+
+A cap-out is deliberately terminal: the loop never runs past the cap and never
+silently merges. But the interesting case is a PR whose *fixes are already
+pushed* — the loop capped out, the implementer then landed the very changes the
+last verdict asked for, and that head now sits unreviewable. Raising `round_cap`
+would raise it for every PR, and only after a daemon restart.
+
+So one lever exists, per PR, and only for an operator:
+
+```
+alissa-review: re-enter +1
+```
+
+Posted as a comment on the PR (its own line; backticks optional, prose around it
+is fine), by a login listed in `operators`, it raises **that PR's** effective cap
+by N. `N` runs from 1 to 5 — a bigger re-entry is a second comment, not a bigger
+number.
+
+- **Counted, never inferred.** One grant per ack comment, keyed by comment id:
+  the ack sits on the PR forever and grants exactly once. A second grant needs a
+  second comment.
+- **Auditable.** The grant is logged loudly (`RE-ENTRY GRANT …`) and appended to
+  the review-loop activity comment with the author, the comment id, and the
+  before/after cap.
+- **Fails closed.** No `operators` allowlist, no honoured acks. The reviewer
+  identity is never an operator, however it is configured — the cap-out comment
+  itself quotes the grammar, and a daemon that could ack its own page would lift
+  CR9's cap with nobody in the loop. The PR *author* is not excluded — an
+  operator who opened the PR by hand is the ordinary case — so putting an agent
+  identity on the allowlist is a deliberate choice, not something the daemon
+  does for you. Malformed directives, out-of-range `N`,
+  contradictory lines in one comment, quoted (`>`) lines and non-operator
+  authors are all ignored, each with one log line.
+- **Escalation stays once-only.** When the granted rounds are consumed without
+  an `approve`, exactly one fresh cap-out fires — naming the ack that granted
+  them — and the PR is capped again until the next ack.
+
+The cap-out comment teaches all of this at the moment it is needed, and when the
+head has moved past the head the last verdict was written against it says so and
+recommends a single verification round: the reviewer re-checks the fix against
+its own final findings and flips to `approve` (or re-requests, consuming the
+grant).
 
 ### Reaping finished reviewer sessions
 

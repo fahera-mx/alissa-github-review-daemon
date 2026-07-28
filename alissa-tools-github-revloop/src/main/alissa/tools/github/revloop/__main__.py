@@ -80,6 +80,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OWNER/REPO",
         help="only watch this repo; repeatable. Replaces the config list entirely.",
     )
+    over.add_argument(
+        "--operator",
+        dest="operators",
+        action="append",
+        metavar="LOGIN",
+        help="GitHub login allowed to ack a review-loop re-entry "
+        "(`alissa-review: re-enter +N` on a capped PR); repeatable. Replaces "
+        "the config list entirely. Empty = no ack is ever honoured.",
+    )
     over.add_argument("--poll-interval", type=int, metavar="SECONDS")
     over.add_argument("--round-cap", type=int, metavar="N", help="CR9 round cap")
     over.add_argument("--hub-template", metavar="TEMPLATE")
@@ -114,6 +123,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
     through. `repos` becomes a tuple so it matches the config-file form."""
     return {
         "repos": tuple(args.repos) if args.repos else None,
+        "operators": tuple(args.operators) if args.operators else None,
         "poll_interval": args.poll_interval,
         "round_cap": args.round_cap,
         "hub_template": args.hub_template,
