@@ -223,3 +223,87 @@ def test_snapshots_survive_reopen(tmp_path):
         assert len(rows) == 1
         assert rows[0]["duration_ms"] == 99
         assert rows[0]["spawned"] == 2
+
+
+# -- operator re-entry grants ---------------------------------------------
+
+
+def test_fresh_ledger_has_no_grants(ledger):
+    assert ledger.read_grants(REPO, 7) == []
+    assert ledger.granted_rounds(REPO, 7) == 0
+    assert ledger.newest_grant(REPO, 7) is None
+
+
+def test_a_grant_is_recorded_once_per_comment(ledger):
+    """The ack comment stays on the PR forever, so the same id must never
+    grant twice however many polls read it."""
+    assert ledger.record_grant(REPO, 7, 1001, "rhdzmota", 1) is True
+    assert ledger.record_grant(REPO, 7, 1001, "rhdzmota", 1) is False
+
+    assert ledger.granted_rounds(REPO, 7) == 1
+    assert len(ledger.read_grants(REPO, 7)) == 1
+
+
+def test_grants_sum_across_comments(ledger):
+    ledger.record_grant(REPO, 7, 1001, "rhdzmota", 1)
+    ledger.record_grant(REPO, 7, 1002, "ops-bot", 2)
+
+    assert ledger.granted_rounds(REPO, 7) == 3
+
+
+def test_grants_are_scoped_per_pr(ledger):
+    ledger.record_grant(REPO, 7, 1001, "rhdzmota", 2)
+
+    assert ledger.granted_rounds(REPO, 8) == 0
+    assert ledger.granted_rounds("other/repo", 7) == 0
+
+
+def test_newest_grant_is_the_one_the_escalation_names(ledger, monkeypatch):
+    clock = {"t": 1_700_000_000.0}
+    monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
+    ledger.record_grant(REPO, 7, 1001, "rhdzmota", 1)
+    clock["t"] += 3600
+    ledger.record_grant(REPO, 7, 1002, "ops-bot", 2)
+
+    newest = ledger.newest_grant(REPO, 7)
+    assert newest["author"] == "ops-bot"
+    assert newest["rounds"] == 2
+    assert newest["comment_id"] == 1002
+
+
+def test_grants_read_back_newest_first_and_bounded(ledger, monkeypatch):
+    clock = {"t": 1_700_000_000.0}
+    monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
+    for i in range(3):
+        ledger.record_grant(REPO, 7, 1000 + i, "rhdzmota", 1)
+        clock["t"] += 60
+
+    rows = ledger.read_grants(REPO, 7, limit=2)
+    assert [r["comment_id"] for r in rows] == [1002, 1001]
+    # Unfiltered: every PR's grants, still newest first.
+    ledger.record_grant("other/repo", 9, 2001, "ops-bot", 1)
+    assert ledger.read_grants()[0]["repo"] == "other/repo"
+
+
+def test_grants_survive_reopen(tmp_path):
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st.record_grant(REPO, 7, 1001, "rhdzmota", 2)
+
+    with State(path) as st:
+        assert st.granted_rounds(REPO, 7) == 2
+        # ...and a re-read of the same ack still grants nothing more.
+        assert st.record_grant(REPO, 7, 1001, "rhdzmota", 2) is False
+
+
+def test_grants_table_is_added_to_a_database_that_predates_it(tmp_path):
+    """CREATE TABLE IF NOT EXISTS is the whole migration: an existing daemon's
+    state.db gains `grants` on the next open, ledgers untouched."""
+    path = tmp_path / "state.db"
+    _legacy_db(path)
+
+    with State(path) as st:
+        assert st.get_spawn(REPO, 7, 1) is not None      # legacy data intact
+        assert st.granted_rounds(REPO, 7) == 0
+        assert st.record_grant(REPO, 7, 1001, "rhdzmota", 1) is True
+        assert st.granted_rounds(REPO, 7) == 1

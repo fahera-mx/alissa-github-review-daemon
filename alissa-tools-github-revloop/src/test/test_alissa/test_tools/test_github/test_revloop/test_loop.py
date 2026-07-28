@@ -7,6 +7,7 @@ it is in flight, when the loop has converged, and when CR9 caps out.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 
 import pytest
@@ -28,15 +29,19 @@ from alissa.tools.github.revloop.ghclient import (
 )
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
+    MAX_REENTRY_ROUNDS,
     REAP_QUIET_SECONDS,
+    REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
     Action,
     ReviewWatcher,
     deferral_activity_kind,
+    parse_reentry_ack,
     session_name,
     stalled_kind,
 )
+from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
 
 OWNER, REPO, NUMBER = "acme", "widgets", 7
@@ -1988,3 +1993,448 @@ def test_dry_run_snapshot_reaps_nothing(config):
 
     assert al.killed == []
     assert w.state.read_snapshots()[0]["reaped"] == 0
+
+
+# -- operator re-entry after cap-out (issue #42) ---------------------------
+#
+# Live shape (studio PR #277): the loop ran the full cap, every round's
+# findings were fixed, the last verdict even enumerated the path back to
+# approve -- and the fixed head then sat unreviewable, because the only lever
+# was raising round_cap globally and restarting the daemon. An explicit,
+# allowlisted, bounded operator ack is that lever; everything below pins it.
+
+OPERATOR = "operator-1"
+ACK = "alissa-review: re-enter +1"
+
+
+@pytest.fixture
+def ack_config(config):
+    """The cap-3 config, with one allowlisted operator."""
+    return dataclasses.replace(config, operators=(OPERATOR,))
+
+
+def capped_reviews(n=3, sha="abc123"):
+    return [
+        review("CHANGES_REQUESTED", sha=sha, at=f"2026-07-18T1{i}:00:00Z")
+        for i in range(n)
+    ]
+
+
+def add_round(gh, al, *, sha="abc123", at="2026-07-18T20:00:00Z"):
+    """A further round lands: one more substantive review, one more envelope."""
+    gh._reviews.append(review("CHANGES_REQUESTED", sha=sha, at=at))
+    al.verdict_count = sum(1 for r in gh._reviews if r.is_substantive)
+
+
+# -- the ack grammar -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body,rounds",
+    [
+        (ACK, 1),
+        (f"`{ACK}`", 1),                                    # backticked
+        ("ALISSA-REVIEW: RE-ENTER +2", 2),                  # logins shout
+        (f"looks fixed to me\n{ACK}\nthanks", 1),           # prose around it
+        (f"{ACK}\n{ACK}", 1),                               # one comment, one grant
+        ("alissa-review: re-enter +5", 5),                  # the ceiling itself
+    ],
+)
+def test_well_formed_acks_parse(body, rounds):
+    assert parse_reentry_ack(body).rounds == rounds
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        "lgtm, merging",
+        f"> {ACK}",                                    # quoting the escalation
+        f"just post `{ACK}` when you want another round",   # naming it in prose
+    ],
+)
+def test_non_directives_are_not_acks(body):
+    ack = parse_reentry_ack(body)
+    assert not ack.is_directive
+    assert ack.rounds is None
+
+
+@pytest.mark.parametrize(
+    "body,problem",
+    [
+        ("alissa-review: re-enter 1", "malformed"),          # no +
+        ("alissa-review: reenter +1", "malformed"),          # no hyphen
+        ("alissa-review: re-enter +", "malformed"),
+        ("alissa-review: re-enter +0", "ceiling"),
+        ("alissa-review: re-enter +6", "ceiling"),
+        ("alissa-review: re-enter +99", "ceiling"),
+        (f"{ACK}\nalissa-review: re-enter +2", "contradictory"),
+    ],
+)
+def test_ill_formed_directives_are_refused_with_a_reason(body, problem):
+    ack = parse_reentry_ack(body)
+    assert ack.rounds is None
+    assert ack.is_directive, "a directive that misses the grammar must be reported"
+    assert problem in ack.problem
+
+
+def test_the_re_entry_ceiling_is_pinned():
+    """A bigger ack is two comments, not one bigger number — the ceiling is
+    part of 'impossible to fire accidentally'."""
+    assert MAX_REENTRY_ROUNDS == 5
+    assert parse_reentry_ack(f"alissa-review: re-enter +{MAX_REENTRY_ROUNDS}").rounds == 5
+
+
+# -- no ack, no rounds -----------------------------------------------------
+
+
+def test_capped_pr_without_an_ack_is_unchanged(ack_config):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    gh.seed_comment(OPERATOR, "nice work, I'll take a look tomorrow")
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert al.enqueued == [], "no ack, no rounds"
+    assert st.granted_rounds(SLUG, NUMBER) == 0
+    assert len(operator_comments(gh)) == 1
+
+
+def test_a_well_formed_ack_admits_exactly_n_more_rounds(ack_config):
+    """+2 buys two rounds — and then the cap holds again."""
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # cap-out page
+    gh.seed_comment(OPERATOR, "alissa-review: re-enter +2")
+
+    fourth = w.evaluate(OWNER, REPO, NUMBER)
+    assert fourth.action is Action.SPAWNED and fourth.round == 4
+    add_round(gh, al)                                    # round 4 lands, no approve
+
+    fifth = w.evaluate(OWNER, REPO, NUMBER)
+    assert fifth.action is Action.SPAWNED and fifth.round == 5
+    add_round(gh, al, at="2026-07-18T21:00:00Z")         # round 5 lands, no approve
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+    assert len(al.enqueued) == 2, "exactly the two rounds that were granted"
+    assert st.granted_rounds(SLUG, NUMBER) == 2
+
+
+def test_the_grant_is_counted_once_never_per_poll(ack_config):
+    """The ack sits in the comment list forever; it must grant once."""
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+
+    w.evaluate(OWNER, REPO, NUMBER)                      # round 4 spawns
+    add_round(gh, al)                                    # round 4 lands
+    w.evaluate(OWNER, REPO, NUMBER)                      # capped again, re-scans
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert st.granted_rounds(SLUG, NUMBER) == 1
+    assert len(st.read_grants(SLUG, NUMBER)) == 1
+    assert len(al.enqueued) == 1, "one grant, one round — never per poll"
+
+
+def test_a_second_grant_needs_a_second_comment(ack_config):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+    w.evaluate(OWNER, REPO, NUMBER)                      # round 4
+    add_round(gh, al)
+    w.evaluate(OWNER, REPO, NUMBER)                      # grant consumed → capped
+
+    gh.seed_comment(OPERATOR, ACK)                       # a SECOND comment
+    fifth = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert fifth.action is Action.SPAWNED and fifth.round == 5
+    assert st.granted_rounds(SLUG, NUMBER) == 2
+    assert len(st.read_grants(SLUG, NUMBER)) == 2
+
+
+def test_the_grant_is_logged_loudly_and_appended_to_the_activity_comment(
+    ack_config, caplog
+):
+    st = State(ack_config.state_db)
+    w, gh, _ = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, "alissa-review: re-enter +2")
+
+    with caplog.at_level(logging.WARNING):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "RE-ENTRY GRANT" in caplog.text
+    assert OPERATOR in caplog.text and "cap 3 → 5" in caplog.text
+    activity = activity_comments(gh)[0].body
+    assert "re-entry ack" in activity
+    assert f"`{OPERATOR}`" in activity and "+2 round(s)" in activity
+    assert "effective cap 3 → 5" in activity
+
+
+def test_the_activity_line_is_appended_once_per_grant(ack_config):
+    st = State(ack_config.state_db)
+    w, gh, _ = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+    w.evaluate(OWNER, REPO, NUMBER)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    body = activity_comments(gh)[0].body
+    assert body.count("re-entry ack") == 1
+
+
+# -- refusals --------------------------------------------------------------
+
+
+def test_an_ack_from_a_non_operator_is_ignored_with_a_log_line(ack_config, caplog):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment("passer-by", ACK)
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CAPPED
+    assert al.enqueued == []
+    assert st.granted_rounds(SLUG, NUMBER) == 0
+    assert "not an allowlisted operator" in caplog.text
+
+
+def test_a_malformed_ack_from_an_operator_is_ignored_with_a_log_line(
+    ack_config, caplog
+):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, "alissa-review: re-enter please")
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CAPPED
+    assert al.enqueued == []
+    assert st.granted_rounds(SLUG, NUMBER) == 0
+    assert "malformed re-entry directive" in caplog.text
+
+
+def test_an_out_of_range_ack_is_ignored_with_a_log_line(ack_config, caplog):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, "alissa-review: re-enter +50")
+
+    with caplog.at_level(logging.WARNING):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+
+    assert al.enqueued == []
+    assert "outside the re-entry ceiling" in caplog.text
+
+
+def test_a_refused_ack_is_logged_once_not_every_poll(ack_config, caplog):
+    st = State(ack_config.state_db)
+    w, gh, _ = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment("passer-by", ACK)
+
+    with caplog.at_level(logging.WARNING):
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert caplog.text.count("ignoring re-entry directive") == 1
+
+
+def test_the_daemon_can_never_ack_its_own_escalation(ack_config):
+    """The cap-out comment carries the grammar, so the reviewer identity is
+    refused even when an operator lists it — otherwise the daemon could lift
+    CR9's cap with nobody in the loop."""
+    cfg = dataclasses.replace(ack_config, operators=(OPERATOR, "alissa-app"))
+    st = State(cfg.state_db)
+    w, gh, al = watcher(cfg, make_pr(), capped_reviews(), state=st)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+    gh.seed_comment("alissa-app", ACK)                   # our own login, verbatim ack
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert al.enqueued == []
+    assert st.granted_rounds(SLUG, NUMBER) == 0
+
+
+def test_no_ack_is_honoured_without_an_operator_allowlist(config):
+    """The lever fails closed: an empty `operators` honours nothing."""
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert al.enqueued == []
+
+
+def test_unreadable_comments_leave_the_pr_capped(ack_config):
+    """Withholding a round is the safe direction; the scan retries next poll."""
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+
+    def boom(*a, **k):
+        raise CommandError(["gh", "api"], 1, "502 Bad Gateway")
+
+    gh.issue_comments = boom
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert al.enqueued == []
+
+
+# -- escalation stays once-only -------------------------------------------
+
+
+def test_a_consumed_grant_re_escalates_once_naming_the_ack(ack_config):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # page 1
+    gh.seed_comment(OPERATOR, ACK)
+    w.evaluate(OWNER, REPO, NUMBER)                      # round 4 spawns
+    add_round(gh, al)                                    # round 4: still no approve
+
+    consumed = w.evaluate(OWNER, REPO, NUMBER)
+    assert consumed.action is Action.ESCALATED
+    pages = operator_comments(gh)
+    assert len(pages) == 2, "a consumed grant is a fresh decision, not a repeat"
+    assert f"granted by @{OPERATOR}" in pages[1]
+    assert "consumed without an approve" in pages[1]
+    assert "effective cap 4" in pages[1]
+
+    # ...and then it is capped again, silently, until the next ack.
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert len(operator_comments(gh)) == 2
+    assert len(al.enqueued) == 1, "never past the effective cap"
+
+
+def test_an_approve_in_a_granted_round_converges_without_escalating(ack_config):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+    w.evaluate(OWNER, REPO, NUMBER)                      # round 4 spawns
+
+    add_round(gh, al)
+    al.verdict = "approve"                               # the verification round approves
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+    assert d.action is Action.CONVERGED
+    assert len(operator_comments(gh)) == 1, "no second page after an approve"
+
+
+# -- what the cap-out page teaches ----------------------------------------
+
+
+def test_the_escalation_teaches_the_ack_grammar(ack_config):
+    w, gh, _ = watcher(ack_config, make_pr(), capped_reviews())
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    page = operator_comments(gh)[0]
+    assert REENTRY_GRAMMAR in page
+    assert f"1 to {MAX_REENTRY_ROUNDS}" in page
+    assert "allowlisted operator" in page
+    assert "a further grant needs a further comment" in page
+    assert "effective cap 3" in page
+
+
+def test_the_escalation_recommends_a_verification_round_when_the_head_moved(
+    ack_config,
+):
+    """The PR #277 shape: fixes pushed after the last verdict, sitting
+    unreviewed. One round is exactly what that needs."""
+    reviews = capped_reviews(sha="0ldhead0")
+    w, gh, _ = watcher(ack_config, make_pr(sha="f1xedhead"), reviews)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    page = operator_comments(gh)[0]
+    assert "head has moved" in page
+    assert "one round is usually all this needs" in page
+    assert "alissa-review: re-enter +1" in page
+    assert "0ldhead0" in page and "f1xedhead"[:8] in page
+
+
+def test_the_escalation_omits_the_verification_hint_on_an_unmoved_head(ack_config):
+    w, gh, _ = watcher(ack_config, make_pr(sha="abc123"), capped_reviews(sha="abc123"))
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    page = operator_comments(gh)[0]
+    assert "head has moved" not in page
+    assert REENTRY_GRAMMAR in page, "the grammar is offered on every cap-out"
+
+
+# -- the effective cap is what everything downstream reports ---------------
+
+
+def test_a_granted_round_reports_the_effective_cap(ack_config):
+    st = State(ack_config.state_db)
+    w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "round 4 of a review loop (cap 4)" in al.enqueued[0]["directive"]
+    assert "round 4 of 4" in activity_comments(gh)[0].body
+
+
+def test_the_round_1_directive_records_the_effective_cap(config):
+    """Doc drift: the review-task template documents a cap of 3, the daemon's
+    default has been 10 since CR9 was retuned. Round 1 is the round that
+    creates that description, so it carries the real number."""
+    cfg = dataclasses.replace(config, round_cap=10)
+    w, _, al = watcher(cfg, make_pr(), [])
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    directive = al.enqueued[0]["directive"]
+    assert "EFFECTIVE round cap is 10" in directive
+    assert "record THAT number in the review task description" in directive
+    assert "stale template default" in directive
+
+
+def test_the_round_k_directive_records_the_effective_cap_too(config):
+    cfg = dataclasses.replace(config, round_cap=10)
+    w, _, al = watcher(cfg, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "EFFECTIVE round cap is 10" in al.enqueued[0]["directive"]
+
+
+# -- config ---------------------------------------------------------------
+
+
+def test_operators_default_to_an_empty_allowlist(tmp_path):
+    assert Config.build(tmp_path, {}).operators == ()
+
+
+def test_operators_are_read_from_the_config_file(tmp_path):
+    cfg = Config.build(tmp_path, {"operators": ["rhdzmota", " ops-bot "]})
+    assert cfg.operators == ("rhdzmota", "ops-bot")
+
+
+def test_an_operators_string_is_rejected(tmp_path):
+    """A bare string would iterate into characters and allowlist nobody real."""
+    with pytest.raises(ValueError, match="operators must be a list"):
+        Config.build(tmp_path, {"operators": "rhdzmota"})
+
+
+def test_the_dry_run_pass_never_records_a_grant(ack_config):
+    dry = dataclasses.replace(ack_config, dry_run=True)
+    st = State(dry.state_db)
+    w, gh, al = watcher(dry, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED, "a dry run still SHOWS what the ack would buy"
+    assert al.enqueued[0]["dry_run"] is True, "...without really enqueuing it"
+    assert st.get_spawn(SLUG, NUMBER, 4) is None
+    assert st.granted_rounds(SLUG, NUMBER) == 0, "and records nothing"

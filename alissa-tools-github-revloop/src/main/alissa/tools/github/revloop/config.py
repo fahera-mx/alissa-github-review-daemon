@@ -41,6 +41,7 @@ CONFIG_KEYS = (
     "poll_interval",
     "round_cap",
     "repos",
+    "operators",
     "agent_profile",
     "reviewer_login",
     "state_path",
@@ -67,6 +68,14 @@ class Config:
 
     # Empty tuple means "every repo that requests a review from me".
     repos: tuple[str, ...] = ()
+
+    # GitHub logins whose re-entry ack may raise a capped PR's effective cap
+    # (loop.parse_reentry_ack). Empty -- the default -- means NO ack is ever
+    # honoured: the lever fails closed, because anyone who can comment on a PR
+    # could otherwise buy it more rounds. The reviewer identity itself is never
+    # an operator however it is configured (the daemon's own escalation quotes
+    # the grammar, and self-granting would defeat CR9's cap outright).
+    operators: tuple[str, ...] = ()
 
     agent_profile: str = "claude"
     reviewer_login: str | None = None  # None -> resolve once via `gh api user`
@@ -149,6 +158,18 @@ class Config:
             )
 
         repos = tuple(raw.get("repos", ()))
+
+        # A bare string would iterate into single characters and silently
+        # allowlist nothing real, so it is rejected rather than accepted.
+        raw_operators = raw.get("operators", ())
+        if isinstance(raw_operators, str):
+            raise ValueError(
+                "operators must be a list of GitHub logins, not a string "
+                f"(got {raw_operators!r})"
+            )
+        operators = tuple(
+            str(login).strip() for login in raw_operators if str(login).strip()
+        )
         if hub_mode == HUB_ADD and not repos:
             # Anyone who can request a review could otherwise cause an arbitrary
             # repo to be cloned onto this machine and opened as an agent's cwd.
@@ -175,6 +196,7 @@ class Config:
             poll_interval=interval,
             round_cap=cap,
             repos=repos,
+            operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),
             state_path=Path(state_path).expanduser() if state_path else None,

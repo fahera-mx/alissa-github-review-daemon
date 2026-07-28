@@ -11,6 +11,9 @@
   "_repos": "Allowlist of owner/repo; empty means every repo that requests a review. --repo replaces this list rather than extending it.",
   "repos": [],
 
+  "_operators": "GitHub logins allowed to re-open a capped PR with a `alissa-review: re-enter +N` comment (N up to 5). Empty means no ack is ever honoured; the reviewer identity is never an operator. --operator replaces this list rather than extending it.",
+  "operators": [],
+
   "agent_profile": "claude",
   "reviewer_login": null,
 

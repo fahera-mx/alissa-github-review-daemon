@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
+import sqlite3
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from pathlib import Path
 
 from .alissa import VERDICT_APPROVE, Alissa, Task
 from .config import HUB_ADD, ON_MISSING_SKIP, Config
-from .ghclient import GitHub, PullRequest, RateLimited, Review
+from .ghclient import GitHub, IssueComment, PullRequest, RateLimited, Review
 from .proc import CommandError
 from .state import State
 
@@ -79,12 +80,27 @@ _RELEASE_SLOT = (
     "`alissa tmux kill {session}`. Do nothing after it."
 )
 
+# The cap the reviewer must write down. The review-task description template in
+# the alissa-code-review skill documents a default of 3, which this daemon's
+# config has not used since the cap moved to 10 -- so round 1 (the round that
+# CREATES the review task) has to carry the effective number, or every task
+# description keeps repeating the stale one. Both directives say it: a round-k
+# reviewer reading a task that records the wrong cap is the case that surfaced
+# the drift in the first place.
+_RECORD_THE_CAP = (
+    "This loop's EFFECTIVE round cap is {cap} (the daemon's config, plus any "
+    "operator re-entry grants) — record THAT number in the review task "
+    "description, and correct it if the description carries a different cap "
+    "from a stale template default. "
+)
+
 ROUND_1_DIRECTIVE = (
     "You are a PR REVIEWER, not an implementer. {assignment} "
     "Load the alissa-code-review skill and follow procedures/review-a-pr.md: "
     "hydrate the task and the PR it names, review per the rubric, post "
     "severity-tagged comments via gh pr review, record the verdict evidence, "
     "move the task to pending_validation. "
+    + _RECORD_THE_CAP
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions. "
@@ -98,19 +114,78 @@ ROUND_K_DIRECTIVE = (
     "including its round-k section: verify the triage of every prior finding, "
     "verify the fixes, sweep the new diff with the full rubric, record a "
     "round-{round} verdict envelope, move the task to pending_validation. "
+    + _RECORD_THE_CAP
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions. "
     + _RELEASE_SLOT
 )
 
+# The operator re-entry ack (issue #42). A capped PR is unreviewable until an
+# operator says otherwise, and the cap-out message used to OFFER "re-enter with
+# a fresh cap" without any mechanism existing: the only lever was raising
+# round_cap for every PR and restarting the daemon. The grammar below is that
+# mechanism, and it is deliberately dull -- one line, a literal prefix, an
+# explicit +N -- so it is trivially auditable in the PR's comment history and
+# impossible to fire by accident.
+REENTRY_GRAMMAR = "alissa-review: re-enter +N"
+
+# The ceiling on a single ack. A constant, not a config key: the point of the
+# ack is a SMALL bounded re-entry (the live case wanted exactly one round), and
+# an operator who needs more says so again in another comment -- which leaves
+# two auditable rows instead of one giant grant. Pinned by a test.
+MAX_REENTRY_ROUNDS = 5
+
+# "Is this line trying to be a directive?" -- the loose sieve. A line that
+# reaches for the prefix but misses the grammar is reported as malformed
+# (a silent typo would look exactly like a cap that refuses to lift).
+_ACK_LEAD_RE = re.compile(r"^`?\s*alissa-review\s*:", re.IGNORECASE)
+
+# The grammar itself: the WHOLE line, optionally wrapped in backticks, is the
+# directive. Anchored on both ends so a mention inside prose ("just post
+# `alissa-review: re-enter +1`") is not a directive, and quoted lines (`>`) are
+# dropped before matching so replying to the escalation cannot re-grant it.
+_ACK_RE = re.compile(
+    r"^`?\s*alissa-review:\s+re-enter\s+\+(\d{1,3})\s*`?$", re.IGNORECASE
+)
+
 ESCALATION_COMMENT = (
     "**Review loop cap-out (CR9)** — {rounds} rounds ran on this PR without "
-    "converging on `approve`. Per the alissa-code-review skill the loop does not "
-    "run past the cap and never silently merges; this needs an operator decision "
-    "(merge with a recorded waiver, direct specific fixes and re-enter with a "
-    "fresh cap, or park it).\n\n"
-    "Last verdict: `{last_state}` at `{sha}`."
+    "converging on `approve` (effective cap {cap}).{grant_note} Per the "
+    "alissa-code-review skill the loop does not run past the cap and never "
+    "silently merges, so it stops here: this needs an operator decision.\n\n"
+    "Last verdict: `{last_state}` at `{sha}`.\n"
+    "{verification}"
+    "\n**Operator re-entry — grant N more rounds.** Comment with a line that "
+    "reads exactly:\n\n"
+    "```\n" + REENTRY_GRAMMAR + "\n```\n\n"
+    "…with `N` from 1 to {max_rounds}. It is honoured only from an allowlisted "
+    "operator account (the daemon's `operators` config), counted once per "
+    "comment — a further grant needs a further comment — logged, and appended "
+    "to the review-loop activity comment. Anything else is ignored: a quoted "
+    "line, another wording, a bigger N, any other author.\n\n"
+    "Without an ack no further round runs. The other options are unchanged: "
+    "merge with a recorded waiver, or park it."
+)
+
+# Only when the head has moved past the head the last verdict was written
+# against -- the PR #277 shape, where the fixes are already pushed and sitting
+# unreviewed. That case wants exactly one round, and saying so at the moment
+# the operator reads the page is the whole point of the lever being
+# discoverable.
+VERIFICATION_HINT = (
+    "\n**The head has moved since that verdict** (`{sha}`, reviewed at "
+    "`{reviewed}`) — fixes are already pushed and unreviewed, so one round is "
+    "usually all this needs: ack `alissa-review: re-enter +1` and the next "
+    "reviewer verifies the fix against its own final findings and flips to "
+    "approve (or re-requests, consuming the grant).\n"
+)
+
+# Named in the fresh escalation that fires once a grant has been spent without
+# an approve, so the page says which decision was already tried.
+GRANT_CONSUMED_NOTE = (
+    " The re-entry granted by @{author} (`+{rounds}`, comment {comment_id}) "
+    "has been consumed without an approve."
 )
 
 STALLED_COMMENT = (
@@ -172,6 +247,106 @@ def stalled_kind(session: str) -> str:
     return f"{ESCALATION_STALLED}:{session}"
 
 
+def capout_kind(head_sha: str, granted: int) -> str:
+    """The ping-ledger kind that dedupes ONE cap-out page.
+
+    `escalations` is keyed by head alone, which was the whole story while the
+    cap was global: same head, same decision, one page. A re-entry grant breaks
+    that -- rounds run on the operator's own authority and end without an
+    approve on the very SAME head, and that is a new decision, not a repeat of
+    the page the operator already answered. Folding the PR's granted total into
+    the kind says exactly that: one page per (head, grant total), so a consumed
+    grant pages once more and then goes quiet until the next ack. Deliberately
+    not a timestamp comparison against the escalation row -- ordering by
+    wall-clock seconds ties when two events land in the same second, and the
+    tie fails in the loud direction (a page every poll).
+    """
+    return f"capout:{head_sha}:{granted}"
+
+
+def _now() -> str:
+    """The activity comment's timestamp format (UTC, seconds)."""
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+
+
+def grant_activity_kind(comment_id: int) -> str:
+    """The ping-ledger kind that dedupes ONE grant's activity line.
+
+    The grant itself is recorded the moment it is honoured (the effective cap
+    must not depend on a comment API call succeeding), but the activity line is
+    a separate best-effort append -- so the ledger row lands only AFTER the
+    append does, and a failed append is retried on the next poll instead of
+    losing the audit line the grant is supposed to leave.
+    """
+    return f"activity-grant:{comment_id}"
+
+
+@dataclass(frozen=True)
+class Ack:
+    """One comment read against the re-entry grammar.
+
+    Three outcomes, deliberately distinguishable: not a directive at all
+    (`rounds` and `problem` both None -- an ordinary comment, no log), a
+    directive that cannot be honoured (`problem` set -- ignored WITH a log
+    line, because a silent typo is indistinguishable from a cap that refuses
+    to lift), or a good ack (`rounds` set).
+    """
+
+    rounds: int | None = None
+    problem: str | None = None
+
+    @property
+    def is_directive(self) -> bool:
+        return self.rounds is not None or self.problem is not None
+
+
+def parse_reentry_ack(body: str) -> Ack:
+    """Parse a comment body for the operator re-entry directive.
+
+    The grammar is one whole line, `alissa-review: re-enter +N`, optionally
+    wrapped in backticks. Everything else about the comment is ignored, so an
+    operator may explain themselves above or below the line -- but the line
+    itself has to be exact, and a quoted (`>`) line never counts, which is what
+    stops a reply that quotes the escalation from re-granting it.
+
+    Two or more directives disagreeing in one comment is a refusal, not a
+    guess: "acks are counted, never inferred". Repeating the SAME `+N` is fine
+    (it is still one grant, and one comment is one grant however many times it
+    says so).
+    """
+    lead = False
+    found: set[int] = set()
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if line.startswith(">"):  # a quoted escalation is not a directive
+            continue
+        if not _ACK_LEAD_RE.match(line):
+            continue
+        lead = True
+        match = _ACK_RE.match(line)
+        if match:
+            found.add(int(match.group(1)))
+
+    if not found:
+        if lead:
+            return Ack(
+                problem=f"malformed re-entry directive (expected `{REENTRY_GRAMMAR}`)"
+            )
+        return Ack()
+    if len(found) > 1:
+        return Ack(
+            problem="contradictory re-entry directives in one comment "
+            f"(+{', +'.join(str(n) for n in sorted(found))})"
+        )
+    rounds = found.pop()
+    if not 1 <= rounds <= MAX_REENTRY_ROUNDS:
+        return Ack(
+            problem=f"+{rounds} is outside the re-entry ceiling "
+            f"(+1 to +{MAX_REENTRY_ROUNDS})"
+        )
+    return Ack(rounds=rounds)
+
+
 class Action(str, Enum):
     SPAWNED = "spawned"
     IN_FLIGHT = "in-flight"
@@ -227,6 +402,9 @@ class ReviewWatcher:
         self.github = github or GitHub(config.reviewer_login)
         self.alissa = alissa or Alissa()
         self.state = state or State(config.state_db)
+        # (repo, number, comment id) of every re-entry directive already
+        # refused in this process -- see _log_ignored_ack.
+        self._ignored_acks: set[tuple[str, int, int]] = set()
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -267,11 +445,26 @@ class ReviewWatcher:
         if converged is not None:
             return Decision(Action.CONVERGED, converged, completed)
 
-        # CR9: never queue round cap+1.
-        if completed >= self.config.round_cap:
-            if self.state.escalated(pr.full_name, number, pr.head_sha):
+        # The effective cap is the configured one plus every re-entry an
+        # operator has explicitly acked on THIS PR (issue #42). The sum is a
+        # local read, so it costs nothing on the common path; the GitHub scan
+        # that can DISCOVER a new ack runs only when the loop would otherwise
+        # be capped -- exactly the state an ack exists to unstick, and the only
+        # one where an extra comments fetch per poll is worth paying for.
+        granted = self.state.granted_rounds(pr.full_name, number)
+        if completed >= self.config.round_cap + granted:
+            granted = self._collect_acks(pr, granted)
+            self._announce_grants(pr)
+        cap = self.config.round_cap + granted
+
+        # CR9: never queue round cap+1 -- where "cap" is now the effective one.
+        # No ack, no rounds: with no grant this is byte-for-byte the old
+        # behaviour.
+        if completed >= cap:
+            if not self._escalation_owed(pr, granted):
                 return Decision(Action.CAPPED, "already escalated", completed)
-            self._escalate(pr, my_reviews[-1].state if my_reviews else "none", completed)
+            grant = self.state.newest_grant(pr.full_name, number)
+            self._escalate(pr, my_reviews, completed, cap, grant)
             return Decision(Action.ESCALATED, f"{completed} rounds, no approve", completed)
 
         round_ = completed + 1
@@ -280,7 +473,7 @@ class ReviewWatcher:
         if age is not None and age < STALE_ROUND_SECONDS:
             return Decision(Action.IN_FLIGHT, f"round {round_} enqueued {int(age)}s ago", round_)
         if age is not None:
-            deferred = self._defer_stale_round(pr, round_, age)
+            deferred = self._defer_stale_round(pr, round_, age, cap)
             if deferred is not None:
                 return deferred
             log.warning(
@@ -292,9 +485,157 @@ class ReviewWatcher:
                 age / 60,
             )
 
-        return self._spawn(pr, round_, task, reenqueued=age is not None)
+        return self._spawn(pr, round_, task, cap, reenqueued=age is not None)
 
-    def _defer_stale_round(self, pr: PullRequest, round_: int, age: float) -> Decision | None:
+    # -- operator re-entry -------------------------------------------------
+
+    def _is_operator(self, author: str) -> bool:
+        """Whether an ack from this author may be honoured.
+
+        Allowlist membership, case-insensitively (GitHub logins are), minus the
+        reviewer identity itself: the daemon's own escalation comment carries
+        the grammar, so an identity that could ack its own page would be able
+        to lift CR9's cap without a human ever touching it.
+        """
+        if not author or author.lower() == (self.github.login or "").lower():
+            return False
+        return author.lower() in {o.lower() for o in self.config.operators}
+
+    def _collect_acks(self, pr: PullRequest, granted: int) -> int:
+        """Scan the capped PR's comments for operator acks; record new grants.
+
+        Returns the PR's total granted rounds. Every honoured ack is recorded
+        under its comment id, so the same comment can never grant twice however
+        many polls read it, and the log/announce side effects fire once.
+
+        Comment reads are best-effort: an unreadable comment list leaves the PR
+        capped for this pass (the conservative direction -- it can only ever
+        withhold rounds, never invent them) and the scan retries next poll.
+        """
+        try:
+            comments = self.github.issue_comments(pr.owner, pr.repo, pr.number)
+        except Exception as exc:
+            log.warning(
+                "%s is at its cap but its comments are unreadable (%s) — no "
+                "re-entry ack can be honoured this pass; retrying next poll",
+                pr.slug,
+                exc,
+            )
+            return granted
+
+        for comment in comments:
+            # Our own comments are never directives -- the escalation itself
+            # quotes the grammar.
+            if comment.author == self.github.login:
+                continue
+            ack = parse_reentry_ack(comment.body)
+            if not ack.is_directive:
+                continue
+            if not self._is_operator(comment.author):
+                self._log_ignored_ack(
+                    pr, comment, f"{comment.author} is not an allowlisted operator"
+                )
+                continue
+            if ack.rounds is None:
+                self._log_ignored_ack(pr, comment, ack.problem or "malformed directive")
+                continue
+            if self.config.dry_run:
+                log.info(
+                    "[dry-run] would honour re-entry ack +%d from %s on %s "
+                    "(comment %d)",
+                    ack.rounds, comment.author, pr.slug, comment.id,
+                )
+                granted += ack.rounds
+                continue
+            if not self.state.record_grant(
+                pr.full_name, pr.number, comment.id, comment.author, ack.rounds
+            ):
+                continue  # already counted in `granted`
+            granted += ack.rounds
+            log.warning(
+                "RE-ENTRY GRANT %s — operator %s acked +%d round(s) in comment "
+                "%d; effective cap %d → %d",
+                pr.slug,
+                comment.author,
+                ack.rounds,
+                comment.id,
+                self.config.round_cap + granted - ack.rounds,
+                self.config.round_cap + granted,
+            )
+        return granted
+
+    def _log_ignored_ack(
+        self, pr: PullRequest, comment: IssueComment, why: str
+    ) -> None:
+        """Report an ack that will not be honoured — once per comment.
+
+        A capped PR is re-scanned every poll, so an unconditional warning would
+        repeat a line a minute for as long as the PR stays capped. The comment
+        id is the identity of the thing being refused, and an in-memory set is
+        the right scope for it: this is a log line, not a delivery guarantee,
+        so a daemon restart re-stating the refusal once is fine (and a ledger
+        row per typo is not).
+        """
+        key = (pr.full_name, pr.number, comment.id)
+        if key in self._ignored_acks:
+            return
+        self._ignored_acks.add(key)
+        log.warning(
+            "ignoring re-entry directive on %s (comment %d by %s): %s — the PR "
+            "stays capped",
+            pr.slug,
+            comment.id,
+            comment.author,
+            why,
+        )
+
+    def _announce_grants(self, pr: PullRequest) -> None:
+        """Append the activity line of every grant that has not had one yet.
+
+        Separate from recording the grant on purpose: the cap change is
+        authoritative state and must not hinge on a comment API call, while the
+        audit line must survive one failing -- so it is retried here on later
+        polls until it lands (see grant_activity_kind).
+        """
+        granted = self.state.granted_rounds(pr.full_name, pr.number)
+        for row in self.state.read_grants(pr.full_name, pr.number):
+            kind = grant_activity_kind(row["comment_id"])
+            if self.state.pinged(pr.full_name, pr.number, kind):
+                continue
+            line = (
+                f"- {_now()} — operator `{row['author']}` — re-entry ack "
+                f"(comment {row['comment_id']}) — +{row['rounds']} round(s) — "
+                f"effective cap {self.config.round_cap} → "
+                f"{self.config.round_cap + granted}"
+            )
+            if self._append_activity(pr, line):
+                self.state.record_ping(pr.full_name, pr.number, kind)
+
+    def _escalation_owed(self, pr: PullRequest, granted: int) -> bool:
+        """Whether a cap-out page is owed, or already delivered.
+
+        Two ways a page is owed: this head has never been paged (a fresh
+        cap-out, or the implementer pushed since -- the decision is about the
+        new state), or rounds granted by an operator ack have since been
+        consumed without an approve, which is a new decision on an unmoved head
+        (capout_kind). Everything else is the same page the operator already
+        has, and CR9's escalation stays once-only.
+
+        A PR with no grant takes the first branch alone, so the pre-#42
+        behaviour -- and any state.db written by it -- is untouched: no
+        already-escalated PR re-pages just because the daemon was upgraded.
+        """
+        if not self.state.escalated(pr.full_name, pr.number, pr.head_sha):
+            return True
+        if granted == 0:
+            return False
+        return not self.state.pinged(
+            pr.full_name, pr.number, capout_kind(pr.head_sha, granted)
+        )
+
+    def _defer_stale_round(
+        self, pr: PullRequest, round_: int, age: float, cap: int
+    ) -> Decision | None:
         """The liveness signal under the stale timer: a deferral, or None to
         respawn.
 
@@ -358,7 +699,7 @@ class ReviewWatcher:
             appended = self._append_activity(
                 pr,
                 self._activity_line(
-                    session, round_, f"deferred — session `{session}` still {life}"
+                    session, round_, f"deferred — session `{session}` still {life}", cap
                 ),
             )
             if appended:
@@ -562,7 +903,13 @@ class ReviewWatcher:
     # -- actions -----------------------------------------------------------
 
     def _spawn(
-        self, pr: PullRequest, round_: int, task: Task | None, *, reenqueued: bool = False
+        self,
+        pr: PullRequest,
+        round_: int,
+        task: Task | None,
+        cap: int,
+        *,
+        reenqueued: bool = False,
     ) -> Decision:
         if task is None:
             if self.config.on_missing_review_task == ON_MISSING_SKIP:
@@ -585,7 +932,7 @@ class ReviewWatcher:
         name = session_name(pr, round_)
         template = ROUND_1_DIRECTIVE if round_ == 1 else ROUND_K_DIRECTIVE
         directive = template.format(
-            assignment=assignment, round=round_, cap=self.config.round_cap, session=name
+            assignment=assignment, round=round_, cap=cap, session=name
         )
 
         hub, problem = self._ensure_hub(pr)
@@ -616,7 +963,7 @@ class ReviewWatcher:
         context = (
             "re-enqueued — previous session presumed dead" if reenqueued else "spawned"
         )
-        self._append_activity(pr, self._activity_line(name, round_, context))
+        self._append_activity(pr, self._activity_line(name, round_, context, cap))
 
         return Decision(
             Action.SPAWNED,
@@ -699,9 +1046,11 @@ class ReviewWatcher:
 
         return warnings
 
-    def _activity_line(self, session: str, round_: int, context: str) -> str:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-        return f"- {ts} — `{session}` — round {round_} of {self.config.round_cap} — {context}"
+    def _activity_line(self, session: str, round_: int, context: str, cap: int) -> str:
+        """One mechanical line. `cap` is the PR's EFFECTIVE cap (config plus
+        granted re-entries) -- printing the config value would render a granted
+        round 11 as "round 11 of 10"."""
+        return f"- {_now()} — `{session}` — round {round_} of {cap} — {context}"
 
     def _append_activity(self, pr: PullRequest, line: str) -> bool:
         """Append one line to THE activity comment on the PR; True if it landed.
@@ -784,11 +1133,52 @@ class ReviewWatcher:
             return
         self.state.record_ping(pr.full_name, pr.number, stalled_kind(session))
 
-    def _escalate(self, pr: PullRequest, last_state: str, rounds: int) -> None:
+    def _escalate(
+        self,
+        pr: PullRequest,
+        my_reviews: list[Review],
+        rounds: int,
+        cap: int,
+        grant: sqlite3.Row | None = None,
+    ) -> None:
+        """Page the operator, and teach the lever that gets past the page.
+
+        The message carries the re-entry grammar because the cap-out is exactly
+        the moment an operator needs it, and -- when the head has moved past
+        the head the last verdict was written against -- the recommendation to
+        grant a single verification round. A `grant` names the re-entry that
+        was already spent, so a second page cannot read as a repeat of the
+        first.
+        """
+        last = my_reviews[-1] if my_reviews else None
+        reviewed = (last.commit_id if last else "") or ""
+        verification = ""
+        if reviewed and reviewed != pr.head_sha:
+            verification = VERIFICATION_HINT.format(
+                sha=pr.head_sha[:8], reviewed=reviewed[:8]
+            )
+        grant_note = ""
+        if grant is not None:
+            grant_note = GRANT_CONSUMED_NOTE.format(
+                author=grant["author"],
+                rounds=grant["rounds"],
+                comment_id=grant["comment_id"],
+            )
         body = ESCALATION_COMMENT.format(
-            rounds=rounds, last_state=last_state.lower(), sha=pr.head_sha[:8]
+            rounds=rounds,
+            cap=cap,
+            grant_note=grant_note,
+            last_state=(last.state if last else "none").lower(),
+            sha=pr.head_sha[:8],
+            verification=verification,
+            max_rounds=MAX_REENTRY_ROUNDS,
         )
-        log.error("CAP-OUT %s after %d rounds — escalating to operator", pr.slug, rounds)
+        log.error(
+            "CAP-OUT %s after %d rounds (effective cap %d) — escalating to operator",
+            pr.slug,
+            rounds,
+            cap,
+        )
 
         if self.config.dry_run:
             log.info("[dry-run] would comment on %s:\n%s", pr.slug, body)
@@ -798,7 +1188,14 @@ class ReviewWatcher:
             self.github.comment(pr.owner, pr.repo, pr.number, body)
         except CommandError as exc:
             log.error("could not post escalation comment on %s: %s", pr.slug, exc)
+        # Recorded even when the comment failed: a cap-out is terminal state,
+        # and re-paging it every poll because GitHub was briefly unavailable
+        # would be worse than the one missed comment (the log line above and
+        # the escalations row both survive it).
         self.state.record_escalation(pr.full_name, pr.number, pr.head_sha)
+        self.state.record_ping(
+            pr.full_name, pr.number, capout_kind(pr.head_sha, cap - self.config.round_cap)
+        )
 
     # -- polling -----------------------------------------------------------
 
