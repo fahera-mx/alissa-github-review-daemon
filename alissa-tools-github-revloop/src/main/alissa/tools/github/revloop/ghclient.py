@@ -17,6 +17,19 @@ log = logging.getLogger(__name__)
 # was never submitted, so it does not close a round.
 SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}
 
+# GitHub's page size ceiling, and how many pages of issue comments we will walk.
+# Both readers of the comment list need the WHOLE thread, and a truncated read
+# fails silently in each: the activity-comment finder would stop seeing its own
+# comment and fork a second one, and the re-entry ack scan would drop an
+# operator's ack on the floor -- on exactly the long-lived, capped-out PRs where
+# the thread is longest and the ack matters most. Bounded anyway so a
+# pathological thread cannot stall a poll pass; 20 pages is 2000 comments, and
+# the truncation is logged rather than assumed away. Paged explicitly rather
+# than with `gh api --paginate`: this targets gh 2.4.0, whose --paginate
+# concatenates one JSON document per page and would not parse.
+PER_PAGE = 100
+COMMENT_PAGE_LIMIT = 20
+
 
 @dataclass(frozen=True)
 class PullRequest:
@@ -234,24 +247,40 @@ class GitHub:
         )
 
     def issue_comments(self, owner: str, repo: str, number: int) -> list[IssueComment]:
-        data = (
-            self._api(
-                "-X",
-                "GET",
-                f"repos/{owner}/{repo}/issues/{number}/comments",
-                "-f",
-                "per_page=100",
+        """Every issue comment on the PR, oldest first -- see COMMENT_PAGE_LIMIT
+        for why this pages instead of reading the first 100 and hoping."""
+        out: list[IssueComment] = []
+        for page in range(1, COMMENT_PAGE_LIMIT + 1):
+            data = (
+                self._api(
+                    "-X",
+                    "GET",
+                    f"repos/{owner}/{repo}/issues/{number}/comments",
+                    "-f",
+                    f"per_page={PER_PAGE}",
+                    "-f",
+                    f"page={page}",
+                )
+                or []
             )
-            or []
-        )
-        return [
-            IssueComment(
-                id=int(c.get("id") or 0),
-                author=(c.get("user") or {}).get("login", ""),
-                body=c.get("body") or "",
+            out.extend(
+                IssueComment(
+                    id=int(c.get("id") or 0),
+                    author=(c.get("user") or {}).get("login", ""),
+                    body=c.get("body") or "",
+                )
+                for c in data
             )
-            for c in data
-        ]
+            if len(data) < PER_PAGE:
+                break
+        else:
+            log.warning(
+                "%s/%s#%d has more than %d comments — only the first %d were "
+                "read; an operator re-entry ack past that point cannot be seen",
+                owner, repo, number, COMMENT_PAGE_LIMIT * PER_PAGE,
+                COMMENT_PAGE_LIMIT * PER_PAGE,
+            )
+        return out
 
     def update_comment(self, owner: str, repo: str, comment_id: int, body: str) -> None:
         self._api(

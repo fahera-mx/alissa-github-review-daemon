@@ -21,6 +21,8 @@ from alissa.tools.github.revloop.config import (
 )
 from alissa.tools.github.revloop.alissa import ManagedSession
 from alissa.tools.github.revloop.ghclient import (
+    COMMENT_PAGE_LIMIT,
+    PER_PAGE,
     GitHub,
     IdentityMismatch,
     IssueComment,
@@ -647,6 +649,66 @@ def test_matching_configured_login_passes(config):
     gh.token_login = lambda: "alissa-app"
 
     assert gh.verify_identity() == "alissa-app"
+
+
+# -- comment paging --------------------------------------------------------
+#
+# Both readers of the issue-comment list fail SILENTLY on a truncated read: the
+# activity finder forks a second comment, the re-entry ack scan drops the ack.
+
+
+def _paging_github(pages):
+    """A GitHub whose `_api` serves `pages` (a list of page payloads)."""
+    gh = GitHub(login="alissa-app")
+    calls = []
+
+    def api(*args, **kwargs):
+        calls.append(args)
+        page = int([a for a in args if a.startswith("page=")][0].split("=")[1])
+        return pages[page - 1] if page <= len(pages) else []
+
+    gh._api = api
+    return gh, calls
+
+
+def _comment_page(n, start=0):
+    return [{"id": start + i, "user": {"login": "someone"}, "body": f"c{start + i}"}
+            for i in range(n)]
+
+
+def test_issue_comments_stop_at_a_short_page(config):
+    gh, calls = _paging_github([_comment_page(3)])
+
+    comments = gh.issue_comments(OWNER, REPO, NUMBER)
+
+    assert len(comments) == 3
+    assert len(calls) == 1, "a short page is the last page — no speculative fetch"
+
+
+def test_issue_comments_page_past_the_first_hundred(config):
+    gh, calls = _paging_github(
+        [_comment_page(PER_PAGE), _comment_page(PER_PAGE, start=100), _comment_page(7, start=200)]
+    )
+
+    comments = gh.issue_comments(OWNER, REPO, NUMBER)
+
+    assert len(comments) == 207
+    assert len(calls) == 3
+    assert comments[-1].body == "c206", "later pages are appended, oldest first"
+
+
+def test_issue_comment_paging_is_bounded_and_says_so(config, caplog):
+    """A pathological thread must not spin the poll pass — and the truncation
+    is logged, not assumed away."""
+    gh, calls = _paging_github([_comment_page(PER_PAGE, start=i * 100)
+                                for i in range(COMMENT_PAGE_LIMIT + 5)])
+
+    with caplog.at_level(logging.WARNING):
+        comments = gh.issue_comments(OWNER, REPO, NUMBER)
+
+    assert len(calls) == COMMENT_PAGE_LIMIT
+    assert len(comments) == COMMENT_PAGE_LIMIT * PER_PAGE
+    assert "only the first" in caplog.text
 
 
 # -- misc ------------------------------------------------------------------
