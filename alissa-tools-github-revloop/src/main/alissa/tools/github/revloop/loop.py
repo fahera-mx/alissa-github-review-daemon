@@ -514,6 +514,10 @@ class ReviewWatcher:
         """
         try:
             comments = self.github.issue_comments(pr.owner, pr.repo, pr.number)
+        except RateLimited:
+            # Not swallowed: run_forever's backoff is the whole response to a
+            # rate limit, and eating it here would keep the pass hammering.
+            raise
         except Exception as exc:
             log.warning(
                 "%s is at its cap but its comments are unreadable (%s) — no "

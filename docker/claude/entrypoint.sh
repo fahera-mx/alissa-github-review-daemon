@@ -212,6 +212,16 @@ repos_lines() {
     | grep -v '^$'
 }
 
+# ALISSA_REVIEW_OPERATORS: "|"-separated GitHub logins allowed to ack a
+# review-loop re-entry on a capped PR (`alissa-review: re-enter +N`). Same
+# convention as the repo allowlist; unset means no ack is ever honoured.
+operators_lines() {
+  printf '%s' "${ALISSA_REVIEW_OPERATORS:-}" \
+    | tr '|' '\n' \
+    | sed 's/[[:space:]]//g' \
+    | grep -v '^$'
+}
+
 # Skills installed into every reviewer session (manifest `skills:`). Same
 # "|"-separated convention. Defaults to the workspace + review skills; override
 # with ALISSA_REVIEW_SKILLS. alissa-session / alissa-skills-usage are installed
@@ -255,7 +265,12 @@ if [ -n "$(repos_lines)" ]; then
   # layer). Structural keys (on_missing_hub, agent_profile) are always emitted.
   # See revloop-config.sh for the precedence contract and per-key rationale.
   repos_json="$(repos_lines | jq -R . | jq -s -c .)"
-  render_revloop_config "${repos_json}" > "${CONFIG}"
+  # `|| true` because an EMPTY operator list is the normal case: the last
+  # filter in operators_lines is a grep, which exits 1 when it matches nothing,
+  # and under `set -e -o pipefail` that non-zero status would kill the
+  # entrypoint mid-bootstrap. jq's own status still propagates.
+  operators_json="$({ operators_lines || true; } | jq -R . | jq -s -c .)"
+  render_revloop_config "${repos_json}" "${operators_json}" > "${CONFIG}"
 else
   # MOUNTED MODE: no allowlist in the env — respect a mounted workspace as-is.
   [ -f "${MANIFEST}" ] \

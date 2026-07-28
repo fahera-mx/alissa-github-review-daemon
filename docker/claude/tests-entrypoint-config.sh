@@ -48,6 +48,13 @@ assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CA
 assert_eq "${out}" '.on_missing_hub' '"add"'    "on_missing_hub always emitted (structural: add)"
 assert_eq "${out}" '.agent_profile'  '"claude"' "agent_profile always emitted (structural: claude)"
 assert_eq "${out}" '.repos'          "${REPOS}" "repos emitted from allowlist"
+assert_key_absent "${out}" operators "operators omitted when no allowlist is passed"
+
+echo "== operators: pass-through list (empty omitted, set emitted verbatim) =="
+out="$(render_revloop_config "${REPOS}" '[]')"
+assert_key_absent "${out}" operators "operators omitted when the list is empty"
+out="$(render_revloop_config "${REPOS}" '["RHDZMOTA","ops-bot"]')"
+assert_eq "${out}" '.operators' '["RHDZMOTA","ops-bot"]' "operators emitted from allowlist"
 
 echo "== empty-string env is treated as unset (Dockerfile bakes empty ENV) =="
 out="$(ALISSA_ROUND_CAP="" ALISSA_POLL_INTERVAL="" render_revloop_config "${REPOS}")"

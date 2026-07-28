@@ -183,6 +183,11 @@ WORKDIR /workspace
 # repo needs no separator). "|" is used because repo slugs contain "/".
 #   e.g. "fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app"
 ARG ALISSA_REVIEW_REPOS=""
+# GitHub logins allowed to re-open a capped PR with an
+# `alissa-review: re-enter +N` comment, same "|"-separated convention. Empty ON
+# PURPOSE: the lever fails closed, and an operator opts in explicitly.
+#   e.g. "RHDZMOTA"
+ARG ALISSA_REVIEW_OPERATORS=""
 # Workspace name recorded in the generated manifest.
 ARG ALISSA_WORKSPACE="alissa-review"
 # Skills installed into every reviewer session (manifest `skills:`), "|"-separated.
@@ -222,6 +227,7 @@ ARG ALISSA_ENABLE_FIREWALL="0"
 ARG ALISSA_FIREWALL_EXTRA=""
 
 ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
+    ALISSA_REVIEW_OPERATORS=${ALISSA_REVIEW_OPERATORS} \
     ALISSA_WORKSPACE=${ALISSA_WORKSPACE} \
     ALISSA_REVIEW_SKILLS=${ALISSA_REVIEW_SKILLS} \
     ALISSA_POLL_INTERVAL=${ALISSA_POLL_INTERVAL} \

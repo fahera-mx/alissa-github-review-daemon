@@ -25,6 +25,7 @@ from alissa.tools.github.revloop.ghclient import (
     IdentityMismatch,
     IssueComment,
     PullRequest,
+    RateLimited,
     Review,
 )
 from alissa.tools.github.revloop.loop import (
@@ -2287,6 +2288,21 @@ def test_unreadable_comments_leave_the_pr_capped(ack_config):
     gh.issue_comments = boom
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
     assert al.enqueued == []
+
+
+def test_a_rate_limited_ack_scan_propagates(ack_config):
+    """The backoff in run_forever is the response to a rate limit — the scan
+    must not swallow one into a quiet 'capped'."""
+    st = State(ack_config.state_db)
+    w, gh, _ = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    def limited(*a, **k):
+        raise RateLimited("API rate limit exceeded")
+
+    gh.issue_comments = limited
+    with pytest.raises(RateLimited):
+        w.evaluate(OWNER, REPO, NUMBER)
 
 
 # -- escalation stays once-only -------------------------------------------

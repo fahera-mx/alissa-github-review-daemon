@@ -414,6 +414,10 @@ class Sources:
         return {
             "workspace_root": str(c.workspace_root),
             "repos": list(c.repos),
+            # Who may re-open a capped PR with a re-entry ack. Part of the
+            # operator's own picture: the escalation inbox below is where that
+            # lever gets used.
+            "operators": list(c.operators),
             "hub_template": c.hub_template,
             "poll_interval": c.poll_interval,
             "round_cap": c.round_cap,

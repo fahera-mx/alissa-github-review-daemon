@@ -14,7 +14,10 @@
 #   * PASS-THROUGH (optional tuning knobs) — emitted ONLY when the env var is
 #     set. When unset the key is omitted entirely and the daemon library applies
 #     its own current default. These are pure tuning values where the library is
-#     the authority: poll_interval, round_cap.
+#     the authority: poll_interval, round_cap, operators (an EMPTY operator
+#     allowlist is the library's fail-closed default -- emitting `[]` would say
+#     the same thing, but omitting it keeps "unset means the library decides"
+#     true for every optional key without exception).
 #
 #   * STRUCTURAL (container constants) — always emitted with an explicit value
 #     the container requires, INDEPENDENT of the library default. Pass-through is
@@ -34,24 +37,30 @@
 # `repos` is required (env-driven mode only calls this with a non-empty
 # allowlist) and always emitted.
 #
-# Usage:  revloop-config.sh '<repos-json-array>'   # prints config JSON
-# Or source it and call render_revloop_config '<repos-json-array>'.
+# Usage:  revloop-config.sh '<repos-json-array>' ['<operators-json-array>']
+# Or source it and call render_revloop_config '<repos-json>' '<operators-json>'.
 # =============================================================================
 set -euo pipefail
 
 render_revloop_config() {
   local repos_json="$1"
+  # Operator logins allowed to re-open a capped PR with an
+  # `alissa-review: re-enter +N` comment. Absent/empty -> the key is omitted and
+  # the daemon honours no ack at all (see the daemon README).
+  local operators_json="${2:-[]}"
   # --arg (string) + tonumber for the numeric pass-through keys: an unset/empty
   # env var yields "" and the key is dropped, so the library default wins.
   jq -n \
-    --argjson repos "${repos_json}" \
+    --argjson repos     "${repos_json}" \
+    --argjson operators "${operators_json}" \
     --arg     hub    "${ALISSA_ON_MISSING_HUB:-add}" \
     --arg     agent  "${ALISSA_AGENT_PROFILE:-claude}" \
     --arg     poll   "${ALISSA_POLL_INTERVAL:-}" \
     --arg     cap    "${ALISSA_ROUND_CAP:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
      + (if $poll == "" then {} else { poll_interval: ($poll | tonumber) } end)
-     + (if $cap  == "" then {} else { round_cap:     ($cap  | tonumber) } end)'
+     + (if $cap  == "" then {} else { round_cap:     ($cap  | tonumber) } end)
+     + (if ($operators | length) == 0 then {} else { operators: $operators } end)'
 }
 
 # Direct execution renders to stdout; sourcing just defines the function.
