@@ -1,0 +1,183 @@
+name: Check Version Bump for Source Changes
+on: [pull_request]
+
+# "Python Package Publish" runs on merge and uploads with `twine upload
+# --skip-existing`. That flag is what keeps a duplicate release from erroring —
+# but it also means a merged source change that forgot to bump the version is
+# published as NOTHING while the workflow reports success. main silently ends up
+# ahead of PyPI and every pinned consumer keeps running the old code. That is the
+# 2026-07-28 alissa-github-develop-daemon incident (its PRs #62 and #64).
+#
+# This check closes the gap on the pull_request side: touch the dist source, bump
+# the version; bump the version, make it one PyPI does not already have.
+#
+# SOURCE OF TRUTH: the plain-text `version` file, NOT the `version.py` beside it.
+# setup.py reads `version` to set the distribution version, and version.py is a
+# derived reader (Version.from_path() opens the same file at runtime, falling back
+# to 0.0.0). Editing version.py cannot change what gets published, so the guard
+# keys on `version` alone.
+
+# Least privilege: the changed-file set is computed from git history rather than
+# the pull-request API, so a read-only checkout is all this job ever needs (same
+# posture as the other check workflows).
+permissions:
+  contents: read
+
+env:
+  # PyPI JSON API root. Overridable so the guard can be dry-run against an
+  # unreachable host to exercise the network-error path.
+  PYPI_API_BASE: https://pypi.org/pypi
+
+jobs:
+  version-bump-check:
+    strategy:
+      matrix:
+        # The distribution name on PyPI is the directory name, so `path` doubles
+        # as the dist name. `version_file` is spelled out because the module path
+        # under src/main is not derivable from the dist name.
+        include:
+          - path: alissa-tools-github-revloop
+            version_file: alissa-tools-github-revloop/src/main/alissa/tools/github/revloop/version
+    name: Version Bump Check for ${{ matrix.path }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          # Full history: the diff below needs the merge base of the pull request.
+          fetch-depth: 0
+      - name: Compute Changed Files
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "Base commit ${BASE_SHA} is missing from the local clone; fetching it."
+            git fetch --no-tags origin "${BASE_SHA}"
+          fi
+
+          # Diff against the merge base (equivalent to BASE...HEAD), which is the
+          # file set GitHub shows in the pull request's "Files changed" tab —
+          # unrelated commits that landed on main meanwhile are not attributed
+          # to this pull request.
+          merge_base="$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")"
+          changed="${RUNNER_TEMP}/changed-files.txt"
+          git diff --name-only "${merge_base}" "${HEAD_SHA}" > "${changed}"
+
+          echo "changed_files=${changed}" >> "${GITHUB_OUTPUT}"
+          echo "Changed files in this pull request (${merge_base}..${HEAD_SHA}):"
+          sed 's/^/  /' "${changed}"
+      - name: Enforce Version Bump for Source Changes
+        id: guard
+        env:
+          CHANGED_FILES: ${{ steps.changes.outputs.changed_files }}
+          SRC_PREFIX: ${{ matrix.path }}/src/
+          VERSION_FILE: ${{ matrix.version_file }}
+        run: |
+          set -euo pipefail
+
+          src_changed=false
+          version_changed=false
+          while IFS= read -r file; do
+            if [ -z "${file}" ]; then
+              continue
+            fi
+            case "${file}" in
+              "${SRC_PREFIX}"*) src_changed=true ;;
+            esac
+            if [ "${file}" = "${VERSION_FILE}" ]; then
+              version_changed=true
+            fi
+          done < "${CHANGED_FILES}"
+
+          if [ "${src_changed}" = "false" ]; then
+            echo "src_changed=false" >> "${GITHUB_OUTPUT}"
+            echo "version_changed=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::No changes under ${SRC_PREFIX} — the version-bump rule does not apply to this pull request."
+            exit 0
+          fi
+          echo "src_changed=true" >> "${GITHUB_OUTPUT}"
+
+          if [ "${version_changed}" = "false" ]; then
+            current="$(head -n 1 "${VERSION_FILE}" 2>/dev/null | tr -d '[:space:]' || true)"
+            {
+              echo "RULE: a pull request that modifies ${SRC_PREFIX}** must also change ${VERSION_FILE}"
+              echo ""
+              echo "This pull request changes ${SRC_PREFIX}** but leaves ${VERSION_FILE} at ${current:-<unreadable>}."
+              echo ""
+              echo "Why that blocks the merge: on merge, \"Python Package Publish\" uploads with"
+              echo "\`twine upload --skip-existing\`. Re-uploading a version PyPI already has is skipped"
+              echo "silently, so the workflow reports SUCCESS while publishing nothing. main ends up"
+              echo "ahead of PyPI with no signal, and everything pinned to ${current:-that version} keeps"
+              echo "running the old code. That is the 2026-07-28 alissa-github-develop-daemon incident"
+              echo "(its PRs #62 and #64)."
+              echo ""
+              echo "Fix: bump ${VERSION_FILE} to the next unpublished version"
+              echo "(the version.py beside it is a derived reader — editing that file alone changes nothing),"
+              echo "or move the change out of ${SRC_PREFIX}** if this pull request must not release."
+            } | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo "::error file=${VERSION_FILE}::Source under ${SRC_PREFIX} changed without bumping ${VERSION_FILE} — the merge-triggered publish would be a silent no-op (see the 2026-07-28 develop-daemon #62/#64 incident). Bump the version file."
+            exit 1
+          fi
+
+          echo "version_changed=true" >> "${GITHUB_OUTPUT}"
+          echo "::notice::${VERSION_FILE} is part of this pull request — the merge will publish a new release."
+      - name: Verify New Version Is Unpublished
+        if: steps.guard.outputs.version_changed == 'true'
+        env:
+          DIST_NAME: ${{ matrix.path }}
+          VERSION_FILE: ${{ matrix.version_file }}
+        run: |
+          set -euo pipefail
+
+          version="$(head -n 1 "${VERSION_FILE}" | tr -d '[:space:]')"
+          if [ -z "${version}" ]; then
+            echo "::error file=${VERSION_FILE}::${VERSION_FILE} is empty — it must hold the version this pull request publishes."
+            exit 1
+          fi
+          case "${version}" in
+            *[!A-Za-z0-9.+!_-]*)
+              echo "::error file=${VERSION_FILE}::Version '${version}' contains characters that cannot appear in a PEP 440 version."
+              exit 1
+              ;;
+          esac
+
+          url="${PYPI_API_BASE}/${DIST_NAME}/${version}/json"
+          echo "Asking PyPI whether ${DIST_NAME} ${version} already exists: ${url}"
+
+          # A confirmed 200 is the only outcome that fails this step. Anything the
+          # check cannot confirm — connection failure, timeout, 5xx, rate limit —
+          # warns and passes: a PyPI outage must never block a merge.
+          if http_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --retry 2 --retry-delay 3 "${url}")"; then
+            case "${http_code}" in
+              404)
+                echo "::notice::${DIST_NAME} ${version} is not on PyPI (HTTP 404) — this pull request can publish it."
+                ;;
+              200)
+                {
+                  echo "RULE: the version in ${VERSION_FILE} must not already exist on PyPI."
+                  echo ""
+                  echo "${DIST_NAME} ${version} is ALREADY published (${url} responded HTTP 200)."
+                  echo ""
+                  echo "Why that blocks the merge: on merge, \"Python Package Publish\" uploads with"
+                  echo "\`twine upload --skip-existing\`, which skips the duplicate and reports SUCCESS"
+                  echo "while publishing nothing. main ends up ahead of PyPI with no signal — the"
+                  echo "2026-07-28 alissa-github-develop-daemon incident (its PRs #62 and #64)."
+                  echo ""
+                  echo "Fix: bump ${VERSION_FILE} to a version PyPI does not have yet."
+                } | tee -a "${GITHUB_STEP_SUMMARY}"
+                echo "::error file=${VERSION_FILE}::${DIST_NAME} ${version} is already on PyPI — merging would make the publish a silent no-op (see the 2026-07-28 develop-daemon #62/#64 incident). Bump ${VERSION_FILE} again."
+                exit 1
+                ;;
+              *)
+                echo "::warning::PyPI answered HTTP ${http_code} for ${url}; could not confirm whether ${DIST_NAME} ${version} is already published. Passing — a PyPI outage must not block a merge."
+                ;;
+            esac
+          else
+            rc=$?
+            echo "::warning::Could not reach PyPI (curl exited ${rc}) at ${url}; could not confirm whether ${DIST_NAME} ${version} is already published. Passing — a PyPI outage must not block a merge."
+          fi
