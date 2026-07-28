@@ -16,7 +16,6 @@ docker build -t alissa-review-daemon docker/claude
 
 # with configuration baked in (see the Configuration table):
 docker build \
-  --build-arg REVLOOP_VERSION=0.15.0 \
   --build-arg ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app" \
   --build-arg ALISSA_POLL_INTERVAL=90 \
   --build-arg ALISSA_ROUND_CAP=3 \
@@ -25,6 +24,14 @@ docker build \
 
 The image installs the daemon from PyPI, so the build context is just this
 directory — no repo source is copied in.
+
+`REVLOOP_VERSION` is deliberately absent from the example: its `ARG` default in
+the Dockerfile is the release this repo publishes on merge, and it is the value
+CI reads back out of the Dockerfile, so a second copy here could only ever go
+stale — and a stale one is load-bearing once a config key has a version floor
+(pinning below `ALISSA_REVIEW_OPERATORS`' floor makes the daemon reject the key
+and the container exit at boot). Pass `--build-arg REVLOOP_VERSION=…` only when
+you deliberately want a version other than the pinned one.
 
 ### On Railway
 

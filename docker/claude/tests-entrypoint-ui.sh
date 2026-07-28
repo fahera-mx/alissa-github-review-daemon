@@ -175,17 +175,7 @@ info "1. console OFF by default (ALISSA_UI_ENABLED unset)"
 # -----------------------------------------------------------------------------
 LOG1="${TMPROOT}/off.log"
 rm -f "${MARKERS}"/*
-# ALISSA_REVIEW_OPERATORS rides on THIS boot rather than paying for a fifth
-# one — and specifically on the console-OFF boot, because the only real reader
-# of the generated config in this harness is the console sidecar, and CI
-# installs the version PINNED IN THE DOCKERFILE (the last published release).
-# A config key newer than that pin is an unknown key to it, and the daemon's
-# unknown-key guard is fatal by design — so asserting the SET case on a boot
-# that starts a sidecar would fail CI for every PR that adds a config key,
-# until the release lands. The absent-when-unset case is asserted on a boot
-# that DOES run the sidecar (case 4), which is the direction that matters
-# there: the default must not disturb it.
-run_entrypoint "${LOG1}" ALISSA_REVIEW_OPERATORS="RHDZMOTA| ops-bot "; PID1="${EP_PID}"
+run_entrypoint "${LOG1}"; PID1="${EP_PID}"
 wait_for_log "${LOG1}" "alissa worker is running" 30 \
   || bad "entrypoint did not reach the worker-up milestone (see ${LOG1})"
 assert_contains "${LOG1}" "reviewer console disabled" "logs the console as disabled"
@@ -205,8 +195,8 @@ if [ -f "${CFG}" ]; then
     "generated config omits unset round_cap (pass-through intact)"
   assert_eq "$(jq -r '.on_missing_hub' "${CFG}")" "add" \
     "generated config keeps the structural on_missing_hub"
-  assert_eq "$(jq -c '.operators' "${CFG}")" '["RHDZMOTA","ops-bot"]' \
-    "generated config carries ALISSA_REVIEW_OPERATORS (split, trimmed)"
+  assert_eq "$(jq -r 'has("operators")' "${CFG}")" "false" \
+    "generated config omits operators when ALISSA_REVIEW_OPERATORS is unset (fails closed)"
 else
   bad "entrypoint generated no revloop.config.json"
 fi
@@ -307,12 +297,24 @@ info "4. sidecar killed under the container -> fail-VISIBLE, not fail-fatal"
 # -----------------------------------------------------------------------------
 LOG4="${TMPROOT}/died.log"
 rm -f "${MARKERS}"/*
-run_entrypoint "${LOG4}" ALISSA_UI_ENABLED=on ALISSA_UI_PASSCODE="${PASSCODE}"; PID4="${EP_PID}"
+# ALISSA_REVIEW_OPERATORS rides on THIS boot rather than paying for a fifth one,
+# and specifically on a boot that starts a REAL sidecar — that makes it an
+# end-to-end pin/library-skew check rather than a renderer check. The daemon is
+# stubbed here, so the sidecar is the only component that actually LOADS the
+# generated config, and `Config.build` rejects unknown keys fatally: an image
+# whose `REVLOOP_VERSION` predates a config key it renders dies at boot, and
+# this assertion is what fails instead. Hence the rule for the next person
+# adding a config key — bump `ARG REVLOOP_VERSION` in the SAME PR (CI installs
+# that pin, falling back to the repo source tree while it is unpublished), and
+# this case proves the two moved together. Asserting only that the file was
+# rendered would not: `jq` reading back what the entrypoint just wrote says
+# nothing about whether the daemon can read it.
+run_entrypoint "${LOG4}" ALISSA_UI_ENABLED=on ALISSA_UI_PASSCODE="${PASSCODE}" \
+  ALISSA_REVIEW_OPERATORS="RHDZMOTA| ops-bot "; PID4="${EP_PID}"
 if wait_for_log "${LOG4}" "starting reviewer console" 30; then
-  # Unset is the default, and the default must leave the sidecar alone: the key
-  # is omitted entirely (the daemon then honours no re-entry ack at all).
-  assert_eq "$(jq -r 'has("operators")' "${WORKSPACE}/revloop.config.json")" "false" \
-    "generated config omits operators when ALISSA_REVIEW_OPERATORS is unset (fails closed)"
+  assert_eq "$(jq -c '.operators' "${WORKSPACE}/revloop.config.json")" \
+    '["RHDZMOTA","ops-bot"]' \
+    "generated config carries ALISSA_REVIEW_OPERATORS (split, trimmed)"
   ui_pid=""
   for _ in $(seq 1 30); do
     # Match on the argv the entrypoint passes, not the program name: the

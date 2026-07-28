@@ -209,7 +209,10 @@ number.
 - **Fails closed.** No `operators` allowlist, no honoured acks. The reviewer
   identity is never an operator, however it is configured — the cap-out comment
   itself quotes the grammar, and a daemon that could ack its own page would lift
-  CR9's cap with nobody in the loop. Malformed directives, out-of-range `N`,
+  CR9's cap with nobody in the loop. The PR *author* is not excluded — an
+  operator who opened the PR by hand is the ordinary case — so putting an agent
+  identity on the allowlist is a deliberate choice, not something the daemon
+  does for you. Malformed directives, out-of-range `N`,
   contradictory lines in one comment, quoted (`>`) lines and non-operator
   authors are all ignored, each with one log line.
 - **Escalation stays once-only.** When the granted rounds are consumed without
