@@ -159,7 +159,7 @@ automatically; locally pass `--build-arg`):
 | ARG / env | default | meaning |
 | --- | --- | --- |
 | `ALISSA_REVIEW_REPOS` | *(required if no manifest mounted)* | allowlist as one `\|`-separated string (see below) |
-| `ALISSA_REVIEW_OPERATORS` | *(empty — no ack honoured)* | logins allowed to re-open a capped PR with `alissa-review: re-enter +N`, one `\|`-separated string; **pass-through**; needs `REVLOOP_VERSION` ≥ 0.16.0 (an older daemon rejects the key it does not know) |
+| `ALISSA_REVIEW_OPERATORS` | *(empty — no ack honoured)* | logins allowed to re-open a capped PR with `alissa-review: re-enter +N`, one `\|`-separated string; **pass-through** |
 | `ALISSA_WORKSPACE` | `alissa-review` | workspace name in the generated manifest |
 | `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
 | `ALISSA_POLL_INTERVAL` | *daemon default* (currently 60) | seconds between polls (≥10); **pass-through** — unset ⇒ library default |

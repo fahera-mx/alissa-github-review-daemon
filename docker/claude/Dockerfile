@@ -29,7 +29,7 @@ FROM python:3.12-slim-bookworm
 # release this repo publishes on merge; it is the first version whose console
 # script `alissa-revloop-ui` the entrypoint starts (0.14.0 added the script,
 # this release wires it into the container), so the pin must not go below it.
-ARG REVLOOP_VERSION=0.15.0
+ARG REVLOOP_VERSION=0.16.0
 # Node major version (must be >= 18 for the alissa CLI and claude-code).
 ARG NODE_MAJOR=22
 

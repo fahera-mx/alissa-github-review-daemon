@@ -154,7 +154,7 @@ ESCALATION_COMMENT = (
     "converging on `approve` (effective cap {cap}).{grant_note} Per the "
     "alissa-code-review skill the loop does not run past the cap and never "
     "silently merges, so it stops here: this needs an operator decision.\n\n"
-    "Last verdict: `{last_state}` at `{sha}`.\n"
+    "{verdict_line}\n"
     "{verification}"
     "\n**Operator re-entry — grant N more rounds.** Comment with a line that "
     "reads exactly:\n\n"
@@ -166,6 +166,16 @@ ESCALATION_COMMENT = (
     "line, another wording, a bigger N, any other author.\n\n"
     "Without an ack no further round runs. The other options are unchanged: "
     "merge with a recorded waiver, or park it."
+)
+
+# The last-verdict line. Two shapes, because one sha is not enough once the
+# head can have moved: the page has to say what was judged AND what is sitting
+# there now, or an operator reading "last verdict at <current head>" concludes
+# the verdict already covers the pushed fixes -- the exact opposite of what the
+# verification hint below is telling them.
+VERDICT_LINE = "Last verdict: `{last_state}` at `{sha}`."
+VERDICT_LINE_MOVED = (
+    "Last verdict: `{last_state}` on `{reviewed}` — the head is now `{sha}`."
 )
 
 # Only when the head has moved past the head the last verdict was written
@@ -496,6 +506,15 @@ class ReviewWatcher:
         reviewer identity itself: the daemon's own escalation comment carries
         the grammar, so an identity that could ack its own page would be able
         to lift CR9's cap without a human ever touching it.
+
+        The PR author is deliberately NOT excluded the same way. Refusing them
+        outright would block the ordinary case -- an operator who opened the PR
+        by hand -- and the protection that matters is structural rather than
+        per-identity: the allowlist is opt-in and empty by default, so putting
+        an AGENT identity on it (an implementer that can comment on its own PR
+        and has read the escalation) is an operator's deliberate choice, not
+        something the daemon does for them. The reviewer identity is different
+        in kind because it is not opt-in at all.
         """
         if not author or author.lower() == (self.github.login or "").lower():
             return False
@@ -508,10 +527,21 @@ class ReviewWatcher:
         under its comment id, so the same comment can never grant twice however
         many polls read it, and the log/announce side effects fire once.
 
+        With no operator allowlist -- the default, and what the container bakes
+        on purpose -- NO ack can ever be honoured, so the scan does not run at
+        all: a capped PR keeps its review request pending and therefore stays
+        in the search result set indefinitely, which would make this a full
+        comment-thread fetch (up to COMMENT_PAGE_LIMIT paged requests, on
+        exactly the long threads paging exists for) every poll, forever, to
+        discard everything it found. The fail-closed default stays free.
+
         Comment reads are best-effort: an unreadable comment list leaves the PR
         capped for this pass (the conservative direction -- it can only ever
         withhold rounds, never invent them) and the scan retries next poll.
         """
+        if not self.config.operators:
+            return granted
+
         try:
             comments = self.github.issue_comments(pr.owner, pr.repo, pr.number)
         except RateLimited:
@@ -600,17 +630,24 @@ class ReviewWatcher:
         authoritative state and must not hinge on a comment API call, while the
         audit line must survive one failing -- so it is retried here on later
         polls until it lands (see grant_activity_kind).
+
+        Walked OLDEST first (read_grants is newest-first, like its siblings)
+        with a running total, so each line reports its OWN transition rather
+        than the PR's total: two acks read in one pass -- or, more commonly, a
+        retried append landing beside a newer grant, which is the whole reason
+        this retries -- would otherwise both claim the same before/after cap
+        and go out in reverse order into an append-only log.
         """
-        granted = self.state.granted_rounds(pr.full_name, pr.number)
-        for row in self.state.read_grants(pr.full_name, pr.number):
+        running = self.config.round_cap
+        for row in reversed(self.state.read_grants(pr.full_name, pr.number)):
+            before, running = running, running + row["rounds"]
             kind = grant_activity_kind(row["comment_id"])
             if self.state.pinged(pr.full_name, pr.number, kind):
                 continue
             line = (
                 f"- {_now()} — operator `{row['author']}` — re-entry ack "
                 f"(comment {row['comment_id']}) — +{row['rounds']} round(s) — "
-                f"effective cap {self.config.round_cap} → "
-                f"{self.config.round_cap + granted}"
+                f"effective cap {before} → {running}"
             )
             if self._append_activity(pr, line):
                 self.state.record_ping(pr.full_name, pr.number, kind)
@@ -1155,12 +1192,18 @@ class ReviewWatcher:
         first.
         """
         last = my_reviews[-1] if my_reviews else None
+        last_state = (last.state if last else "none").lower()
         reviewed = (last.commit_id if last else "") or ""
+        moved = bool(reviewed) and reviewed != pr.head_sha
         verification = ""
-        if reviewed and reviewed != pr.head_sha:
+        if moved:
             verification = VERIFICATION_HINT.format(
                 sha=pr.head_sha[:8], reviewed=reviewed[:8]
             )
+        template = VERDICT_LINE_MOVED if moved else VERDICT_LINE
+        verdict_line = template.format(
+            last_state=last_state, sha=pr.head_sha[:8], reviewed=reviewed[:8]
+        )
         grant_note = ""
         if grant is not None:
             grant_note = GRANT_CONSUMED_NOTE.format(
@@ -1172,8 +1215,7 @@ class ReviewWatcher:
             rounds=rounds,
             cap=cap,
             grant_note=grant_note,
-            last_state=(last.state if last else "none").lower(),
-            sha=pr.head_sha[:8],
+            verdict_line=verdict_line,
             verification=verification,
             max_rounds=MAX_REENTRY_ROUNDS,
         )

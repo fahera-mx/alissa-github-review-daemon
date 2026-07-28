@@ -2251,6 +2251,27 @@ def test_the_activity_line_is_appended_once_per_grant(ack_config):
 # -- refusals --------------------------------------------------------------
 
 
+def test_two_grants_each_report_their_own_cap_transition_in_order(ack_config):
+    """The before/after cap is per grant, and an append-only log must not go
+    out backwards — the retry path (a failed append landing beside a newer
+    grant) has the same shape as two acks read in one pass."""
+    st = State(ack_config.state_db)
+    w, gh, _ = watcher(ack_config, make_pr(), capped_reviews(), state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.seed_comment(OPERATOR, ACK)                        # +1, comment 1001
+    gh.seed_comment(OPERATOR, "alissa-review: re-enter +2")  # +2, comment 1002
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    lines = [ln for ln in activity_comments(gh)[0].body.splitlines()
+             if "re-entry ack" in ln]
+    assert len(lines) == 2
+    assert "(comment 1001)" in lines[0] and "+1 round(s)" in lines[0]
+    assert "effective cap 3 → 4" in lines[0]
+    assert "(comment 1002)" in lines[1] and "+2 round(s)" in lines[1]
+    assert "effective cap 4 → 6" in lines[1]
+
+
 def test_an_ack_from_a_non_operator_is_ignored_with_a_log_line(ack_config, caplog):
     st = State(ack_config.state_db)
     w, gh, al = watcher(ack_config, make_pr(), capped_reviews(), state=st)
@@ -2335,6 +2356,23 @@ def test_no_ack_is_honoured_without_an_operator_allowlist(config):
 
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
     assert al.enqueued == []
+
+
+def test_an_empty_allowlist_costs_no_comment_fetch(config):
+    """A capped PR keeps its review request pending, so it is re-decided every
+    poll forever — scanning a thread whose every directive would be discarded
+    would be up to COMMENT_PAGE_LIMIT requests a minute, per PR, for nothing."""
+    st = State(config.state_db)
+    w, gh, _ = watcher(config, make_pr(), capped_reviews(), state=st)
+    fetches = []
+    real = gh.issue_comments
+    gh.issue_comments = lambda *a, **k: (fetches.append(1), real(*a, **k))[1]
+
+    w.evaluate(OWNER, REPO, NUMBER)   # escalates (the page IS posted)
+    w.evaluate(OWNER, REPO, NUMBER)   # capped
+    w.evaluate(OWNER, REPO, NUMBER)   # capped
+
+    assert fetches == [], "no allowlist, no ack, no fetch"
 
 
 def test_unreadable_comments_leave_the_pr_capped(ack_config):
@@ -2436,7 +2474,11 @@ def test_the_escalation_recommends_a_verification_round_when_the_head_moved(
     assert "head has moved" in page
     assert "one round is usually all this needs" in page
     assert "alissa-review: re-enter +1" in page
-    assert "0ldhead0" in page and "f1xedhead"[:8] in page
+    assert "0ldhead0" in page and "f1xedhea" in page
+    # The last-verdict line must not claim the verdict covers the CURRENT head
+    # — that is the opposite of what the hint below it is saying.
+    assert "Last verdict: `changes_requested` on `0ldhead0`" in page
+    assert "the head is now `f1xedhea`" in page
 
 
 def test_the_escalation_omits_the_verification_hint_on_an_unmoved_head(ack_config):
@@ -2445,6 +2487,9 @@ def test_the_escalation_omits_the_verification_hint_on_an_unmoved_head(ack_confi
 
     page = operator_comments(gh)[0]
     assert "head has moved" not in page
+    assert "Last verdict: `changes_requested` at `abc123`." in page, (
+        "one sha is enough when nothing moved"
+    )
     assert REENTRY_GRAMMAR in page, "the grammar is offered on every cap-out"
 
 
@@ -2497,10 +2542,15 @@ def test_operators_are_read_from_the_config_file(tmp_path):
     assert cfg.operators == ("rhdzmota", "ops-bot")
 
 
-def test_an_operators_string_is_rejected(tmp_path):
-    """A bare string would iterate into characters and allowlist nobody real."""
-    with pytest.raises(ValueError, match="operators must be a list"):
-        Config.build(tmp_path, {"operators": "rhdzmota"})
+@pytest.mark.parametrize("key,value", [
+    ("operators", "rhdzmota"),
+    ("repos", "acme/widgets"),
+])
+def test_a_string_list_key_is_rejected(tmp_path, key, value):
+    """A bare string iterates into single CHARACTERS: an allowlist of
+    one-character names that matches nothing, silently."""
+    with pytest.raises(ValueError, match=f"{key} must be a list"):
+        Config.build(tmp_path, {key: value})
 
 
 def test_the_dry_run_pass_never_records_a_grant(ack_config):

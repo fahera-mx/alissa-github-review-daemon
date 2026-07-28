@@ -340,7 +340,10 @@ class State:
         """The most recently recorded ack for this PR, or None.
 
         The escalation names it ("the re-entry granted by @x was consumed"),
-        and its timestamp is what `escalated_at` is compared against.
+        and it is the newest ack by `granted_at`, so a second grant supersedes
+        the first in the page's wording. Nothing compares that timestamp with
+        the escalation row -- the once-only dedupe is the ping-ledger key; see
+        loop.capout_kind for why not a wall-clock comparison.
         """
         return self._db.execute(
             "SELECT * FROM grants WHERE repo=? AND number=? "
@@ -348,21 +351,22 @@ class State:
             (repo, number),
         ).fetchone()
 
-    def read_grants(
-        self,
-        repo: str | None = None,
-        number: int | None = None,
-        limit: int | None = None,
-    ) -> list[dict]:
-        """Grant rows, newest first; narrowed to one PR when repo/number are
-        given (the loop's use) and unfiltered for a console-style read."""
-        sql = "SELECT repo, number, comment_id, author, rounds, granted_at FROM grants"
-        params: tuple = ()
-        if repo is not None and number is not None:
-            sql += " WHERE repo=? AND number=?"
-            params = (repo, number)
-        sql += " ORDER BY granted_at DESC, rowid DESC"
-        return self._read_rows(sql, limit, params)
+    def read_grants(self, repo: str, number: int) -> list[dict]:
+        """One PR's grant rows, newest first (like every reader here).
+
+        Deliberately narrow: no unfiltered form and no `limit` until something
+        needs them. The console does not read this table yet -- showing "this
+        PR was re-entered by @x" in the operator inbox wants rendering as well
+        as data, so it lands as its own change rather than as unused
+        parameters here.
+        """
+        return self._read_rows(
+            "SELECT repo, number, comment_id, author, rounds, granted_at "
+            "FROM grants WHERE repo=? AND number=? "
+            "ORDER BY granted_at DESC, rowid DESC",
+            None,
+            (repo, number),
+        )
 
     # -- poll snapshots (the console sidecar's exhaust buffer) -------------
 

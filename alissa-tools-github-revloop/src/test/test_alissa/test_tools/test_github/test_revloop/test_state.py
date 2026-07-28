@@ -271,18 +271,19 @@ def test_newest_grant_is_the_one_the_escalation_names(ledger, monkeypatch):
     assert newest["comment_id"] == 1002
 
 
-def test_grants_read_back_newest_first_and_bounded(ledger, monkeypatch):
+def test_grants_read_back_newest_first(ledger, monkeypatch):
+    """Newest first, like every reader here — the announce walk reverses it so
+    each activity line reports its own cap transition, in order."""
     clock = {"t": 1_700_000_000.0}
     monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
     for i in range(3):
         ledger.record_grant(REPO, 7, 1000 + i, "rhdzmota", 1)
         clock["t"] += 60
-
-    rows = ledger.read_grants(REPO, 7, limit=2)
-    assert [r["comment_id"] for r in rows] == [1002, 1001]
-    # Unfiltered: every PR's grants, still newest first.
     ledger.record_grant("other/repo", 9, 2001, "ops-bot", 1)
-    assert ledger.read_grants()[0]["repo"] == "other/repo"
+
+    rows = ledger.read_grants(REPO, 7)
+    assert [r["comment_id"] for r in rows] == [1002, 1001, 1000]
+    assert all(r["repo"] == REPO for r in rows), "another PR's grants never leak in"
 
 
 def test_grants_survive_reopen(tmp_path):
