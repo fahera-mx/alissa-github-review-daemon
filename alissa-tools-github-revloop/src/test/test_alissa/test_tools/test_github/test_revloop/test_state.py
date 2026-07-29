@@ -392,3 +392,37 @@ def test_the_new_snapshot_columns_are_altered_into_an_older_database(tmp_path):
     # Idempotent: a second open must not try to re-ALTER the same columns.
     with State(path) as st:
         assert len(st.read_snapshots()) == 2
+
+
+def test_an_abandoned_verdict_post_is_terminal(ledger):
+    """The exit for a post that can never succeed — the head it was pinned to
+    is gone from the PR. Without it the round is held open forever and the PR
+    leaves the review loop until a human edits this table."""
+    ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
+    assert ledger.verdict_post_abandoned(REPO, 7, 1) is False
+
+    ledger.record_verdict_post_abandoned(REPO, 7, 1, "abc123 is gone from the PR")
+
+    assert ledger.verdict_post_abandoned(REPO, 7, 1) is True
+    row = ledger.get_verdict_post(REPO, 7, 1)
+    assert row["posted_at"] is None, "abandoned is not posted"
+    assert "gone from the PR" in row["last_error"]
+    assert ledger.verdict_post_abandoned(REPO, 7, 2) is False, "per round"
+
+
+def test_a_failed_attempt_stamps_when_it_ran(ledger):
+    """The retry delay is measured from the last attempt, not from a fixed
+    origin — so the attempt has to record when it happened."""
+    ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
+    assert ledger.get_verdict_post(REPO, 7, 1)["last_attempt_at"] is None
+
+    ledger.record_verdict_post_failure(REPO, 7, 1, "boom")
+
+    assert ledger.get_verdict_post(REPO, 7, 1)["last_attempt_at"] is not None
+
+
+def test_the_judged_head_is_recorded_and_frozen(ledger):
+    ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
+    ledger.note_verdict_post_owed(REPO, 7, 1, "pushed-since")
+    assert ledger.get_verdict_post(REPO, 7, 1)["head_sha"] == "abc123"
+    assert ledger.read_verdict_posts(1)[0]["head_sha"] == "abc123"

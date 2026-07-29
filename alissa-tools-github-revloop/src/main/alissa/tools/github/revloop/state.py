@@ -97,7 +97,16 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     -- makes the next pass read it as a current approval.
     head_sha      TEXT    NOT NULL DEFAULT '',
     attempts      INTEGER NOT NULL DEFAULT 0,
+    -- When the last attempt ran. The retry delay is measured from HERE, not
+    -- from first_seen_at: a delay measured from a fixed origin and capped stops
+    -- bounding anything once the row is older than the cap, and the hot loop
+    -- comes back.
+    last_attempt_at INTEGER,
     posted_at     INTEGER,
+    -- Set when the post can never succeed -- the head this verdict judged is
+    -- no longer a commit of the PR (a force-push landed under it). The round is
+    -- then released rather than held open forever; see loop._abandon_verdict.
+    abandoned_at  INTEGER,
     review_url    TEXT,
     last_error    TEXT,
     PRIMARY KEY (repo, number, round)
@@ -463,15 +472,42 @@ class State:
     def record_verdict_post_failure(
         self, repo: str, number: int, round_: int, error: str
     ) -> int:
-        """Count one failed post attempt; return the new attempt total."""
+        """Count one failed post attempt; return the new attempt total.
+
+        Stamps `last_attempt_at`, which is what the retry delay is measured
+        from -- see the column comment.
+        """
         self._db.execute(
-            "UPDATE verdict_posts SET attempts = attempts + 1, last_error = ? "
-            "WHERE repo=? AND number=? AND round=?",
-            (error[:500], repo, number, round_),
+            "UPDATE verdict_posts SET attempts = attempts + 1, last_error = ?, "
+            "last_attempt_at = ? WHERE repo=? AND number=? AND round=?",
+            (error[:500], int(time.time()), repo, number, round_),
         )
         self._db.commit()
         row = self.get_verdict_post(repo, number, round_)
         return int(row["attempts"]) if row else 0
+
+    def record_verdict_post_abandoned(
+        self, repo: str, number: int, round_: int, why: str
+    ) -> None:
+        """Give up on this round's native verdict, permanently.
+
+        Reserved for a post that can never succeed: the head the round judged
+        is gone from the PR, so there is no commit left to record the verdict
+        against. Holding the round open then stalls the PR out of the loop
+        forever -- the abandonment releases it so a fresh round can run against
+        the new head.
+        """
+        self._db.execute(
+            "UPDATE verdict_posts SET abandoned_at = ?, last_error = ? "
+            "WHERE repo=? AND number=? AND round=?",
+            (int(time.time()), why[:500], repo, number, round_),
+        )
+        self._db.commit()
+
+    def verdict_post_abandoned(self, repo: str, number: int, round_: int) -> bool:
+        """Whether this round's owed native verdict was given up on."""
+        row = self.get_verdict_post(repo, number, round_)
+        return bool(row is not None and row["abandoned_at"])
 
     def record_verdict_post(
         self, repo: str, number: int, round_: int, review_url: str
@@ -491,7 +527,8 @@ class State:
         """Verdict-post rows, newest observation first."""
         return self._read_rows(
             "SELECT repo, number, round, first_seen_at, head_sha, attempts, "
-            "posted_at, review_url, last_error FROM verdict_posts "
+            "last_attempt_at, posted_at, abandoned_at, review_url, last_error "
+            "FROM verdict_posts "
             "ORDER BY first_seen_at DESC, number DESC",
             limit,
         )

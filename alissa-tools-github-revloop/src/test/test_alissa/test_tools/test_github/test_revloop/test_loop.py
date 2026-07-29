@@ -84,6 +84,11 @@ class FakeGitHub:
         self.submitted: list[dict] = []
         self.submit_error: BaseException | None = None
         self.identity_error: BaseException | None = None
+        # The PR's commit list, as the abandon probe reads it. Defaults to the
+        # head the fixtures use, so a pinned verdict is postable unless a test
+        # says otherwise (a force-push).
+        self.commits: list[str] = [pr.head_sha, "abc123"]
+        self.commits_error: BaseException | None = None
 
     def pull_request(self, owner, repo, number):
         self.pr_fetches += 1
@@ -95,6 +100,11 @@ class FakeGitHub:
             r for r in self._reviews if r.author == self.login and r.is_substantive
         ]
         return sorted(mine, key=lambda r: r.submitted_at)
+
+    def pull_request_commits(self, owner, repo, number):
+        if self.commits_error:
+            raise self.commits_error
+        return list(self.commits)
 
     def assert_review_identity(self):
         if self.identity_error:
@@ -253,7 +263,7 @@ def no_post_grace(monkeypatch):
     Both schedules are pinned by their own tests.
     """
     monkeypatch.setattr(loop_module, "VERDICT_POST_GRACE_SECONDS", 0)
-    monkeypatch.setattr(loop_module, "_post_due_after", lambda attempts: 0)
+    monkeypatch.setattr(loop_module, "_post_delay_after", lambda attempts: 0)
 
 
 @pytest.fixture
@@ -3589,13 +3599,22 @@ def test_an_unpostable_repo_holds_its_round_open_instead_of_stalling_the_pass(
 # -- round-1 findings: the retry backoff ------------------------------------
 
 
-def test_the_retry_schedule_starts_at_the_grace_window_and_is_capped():
-    assert loop_module._post_due_after(0) == VERDICT_POST_GRACE_SECONDS
-    # Early retries stay at poll cadence — the right answer to a blip...
-    assert loop_module._post_due_after(1) == VERDICT_POST_GRACE_SECONDS
-    # ...then back off, and settle at one attempt an hour.
-    assert loop_module._post_due_after(4) == 960
-    assert loop_module._post_due_after(99) == loop_module.MAX_VERDICT_POST_BACKOFF_SECONDS
+def test_the_retry_delay_grows_per_attempt_and_is_capped():
+    assert loop_module._post_delay_after(1) == 120
+    assert loop_module._post_delay_after(4) == 960
+    assert loop_module._post_delay_after(99) == loop_module.MAX_VERDICT_POST_BACKOFF_SECONDS
+
+
+def age_verdict_post(st, seconds, *, attempts=None):
+    """Age a verdict_posts row: both clocks, so an aged row is aged for the
+    grace window AND for the retry delay."""
+    stamp = int(time.time()) - int(seconds)
+    st._db.execute(
+        "UPDATE verdict_posts SET first_seen_at=?, last_attempt_at=?", (stamp, stamp)
+    )
+    if attempts is not None:
+        st._db.execute("UPDATE verdict_posts SET attempts=?", (attempts,))
+    st._db.commit()
 
 
 def test_a_failing_post_stops_retrying_every_poll(config, monkeypatch):
@@ -3613,6 +3632,31 @@ def test_a_failing_post_stops_retrying_every_poll(config, monkeypatch):
     assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 1, "no second POST"
     assert "backing off" in second.reason
     assert st.get_verdict_post(SLUG, NUMBER, 1)["posted_at"] is None
+
+
+@pytest.mark.parametrize("elapsed", [2 * 3600, 24 * 3600, 10 * 24 * 3600])
+def test_the_backoff_still_holds_long_past_its_cap(config, monkeypatch, elapsed):
+    """[minor, reopened in round 2] A capped deadline measured from a FIXED
+    origin stops bounding anything once the row outlives the cap — the hot loop
+    returns, an hour late. The delay has to be per-attempt."""
+    st = State(config.state_db)
+    monkeypatch.setattr(loop_module, "VERDICT_POST_GRACE_SECONDS", 0)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "401 Bad credentials")
+    w.evaluate(OWNER, REPO, NUMBER)                       # one real attempt
+    age_verdict_post(st, elapsed, attempts=20)            # ...now long stale
+
+    due = w.evaluate(OWNER, REPO, NUMBER)                 # one attempt is due
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 21
+
+    # ...and the NEXT poll, 30s later, is deferred again — that is the whole
+    # property. With a capped deadline off a fixed origin, every poll from here
+    # attempted the post forever.
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert due.action is d.action is Action.AWAITING_POST
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 21, "no hot loop"
+    assert "backing off" in d.reason
 
 
 # -- round-1 findings: a later session review closes its own round -----------
@@ -3696,3 +3740,147 @@ def test_the_credential_clause_tells_the_session_to_verify_first(config):
     assert 'GH_TOKEN="$REV_TOKEN" gh api user --jq .login' in directive
     assert "alissa-app" in directive, "the login to compare against"
     assert "do NOT post the review at all" in directive
+
+
+# -- round-2 findings: a verdict pinned to a commit that is gone -------------
+#
+# Pinning the verdict to the head its round judged (round 1's blocker fix) made
+# a new failure reachable: a force-push removes that commit, GitHub rejects the
+# review, and no retry can ever succeed. Without an exit the round stays open,
+# round k+1 is never spawned, and the PR leaves the loop until a human edits
+# sqlite — a worse outcome than any verdict-of-record concern here.
+
+REJECTED_COMMIT = CommandError(
+    ["gh"], 1, "HTTP 422: commit_id is not part of the pull request"
+)
+
+
+def force_pushed(config, state):
+    """Round 1 judged `abc123`; the implementer rebased and the PR now carries
+    `rebased` alone."""
+    seed_round(state, "abc123")
+    w, gh, al = watcher(
+        config, make_pr(sha="rebased"), [], state=state,
+        verdict=VERDICT_APPROVE, verdict_count=1,
+    )
+    gh.commits = ["rebased"]                 # abc123 is gone
+    gh.submit_error = REJECTED_COMMIT
+    return w, gh, al
+
+
+def test_an_unpostable_pinned_verdict_is_abandoned_not_retried_forever(
+    config, no_post_grace
+):
+    st = State(config.state_db)
+    w, gh, _ = force_pushed(config, st)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert "abandoned" in d.reason
+    assert st.verdict_post_abandoned(SLUG, NUMBER, 1)
+    assert "abandoned" in activity_comments(gh)[0].body, "never silent"
+
+
+def test_an_abandoned_round_releases_the_loop(config, no_post_grace):
+    """The point of abandoning: the PR rejoins the loop instead of stalling out
+    of it, and the fresh round runs against the NEW head."""
+    st = State(config.state_db)
+    w, gh, al = force_pushed(config, st)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 2
+    assert gh.submitted == [], "and never by posting against the new head"
+    assert st.get_spawn(SLUG, NUMBER, 2)["head_sha"] == "rebased"
+
+
+def test_a_rejection_is_not_abandoned_while_the_commit_is_still_there(
+    config, no_post_grace
+):
+    """The 422 only starts the question; the PR's commit list answers it. A
+    rejection for any other reason stays on the ordinary retry path —
+    abandoning wrongly discards a real verdict."""
+    st = State(config.state_db)
+    seed_round(st, "abc123")
+    w, gh, _ = watcher(
+        config, make_pr(sha="abc123"), [], state=st,
+        verdict=VERDICT_APPROVE, verdict_count=1,
+    )
+    gh.commits = ["abc123"]                  # the pin is fine
+    gh.submit_error = CommandError(["gh"], 1, "HTTP 422: Unprocessable Entity")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not st.verdict_post_abandoned(SLUG, NUMBER, 1)
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 1
+    assert "NOT closed" in d.reason
+
+
+def test_an_unreadable_commit_list_never_abandons(config, no_post_grace):
+    """Conservative on missing evidence: retry, do not discard."""
+    st = State(config.state_db)
+    w, gh, _ = force_pushed(config, st)
+    gh.commits_error = CommandError(["gh"], 1, "network is unreachable")
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not st.verdict_post_abandoned(SLUG, NUMBER, 1)
+
+
+def test_a_non_commit_failure_never_probes_the_commit_list(config, no_post_grace):
+    """A 401 is not about the pin, so it must not pay for a commit fetch."""
+    st = State(config.state_db)
+    w, gh, _ = force_pushed(config, st)
+    gh.submit_error = CommandError(["gh"], 1, "401 Bad credentials")
+    gh.commits_error = AssertionError("the commit list must not be read here")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert not st.verdict_post_abandoned(SLUG, NUMBER, 1)
+
+
+def test_a_truncated_commit_listing_cannot_prove_absence():
+    """`pull_request_commits` raises rather than returning a short list: a SHA
+    missing from a truncated read is not a SHA that is gone."""
+    from alissa.tools.github.revloop.ghclient import TruncatedListing
+    gh = GitHub("alissa-app")
+    gh._api = lambda *a, **k: [{"sha": f"c{i}"} for i in range(PER_PAGE)]  # always full
+    with pytest.raises(TruncatedListing):
+        gh.pull_request_commits(OWNER, REPO, NUMBER)
+
+
+# -- round-2 findings: the credential guard and its message ------------------
+
+
+@pytest.mark.parametrize("secret", [
+    "f1e2d3c4b5a67890abcdef0123456789abcdef01",   # legacy 40-char hex token
+    "a" * 40,
+    "s3cretValueNoPunctuation",                    # generic alnum API key
+])
+def test_a_punctuation_free_secret_is_rejected_too(tmp_path, secret):
+    """Length alone is not the discriminator — an undifferentiated alphanumeric
+    run is. Every plausible NAME carries an underscore or is short."""
+    with pytest.raises(ValueError, match="not a value or a token"):
+        Config.build(tmp_path, {"reviewer_token_env": secret})
+
+
+def test_an_innocent_typo_is_echoed_rather_than_redacted(tmp_path):
+    """[nit, round 2] Here the value IS the diagnostic — redacting it turns a
+    one-glance fix into a puzzle."""
+    with pytest.raises(ValueError) as exc:
+        Config.build(tmp_path, {"reviewer_token_env": "REVLOOP-REVIEWER-GH-TOKEN"})
+
+    assert "REVLOOP-REVIEWER-GH-TOKEN" in str(exc.value)
+    assert "rotate it" not in str(exc.value), "not a credential, so no rotate advice"
+
+
+def test_a_credential_is_still_redacted(tmp_path):
+    secret = "ghp_" + "a" * 36
+    with pytest.raises(ValueError) as exc:
+        Config.build(tmp_path, {"reviewer_token_env": secret})
+
+    assert secret not in str(exc.value)
+    assert "rotate it" in str(exc.value)

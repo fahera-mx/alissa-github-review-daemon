@@ -41,6 +41,12 @@ SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}
 PER_PAGE = 100
 COMMENT_PAGE_LIMIT = 20
 
+# Same bound for the PR's commit list. Read only when a review POST was
+# rejected (see pull_request_commits), and a partial answer there is worse than
+# none -- so unlike the comment list, exceeding this raises rather than
+# returning a truncated list a caller could misread as "the SHA is gone".
+COMMIT_PAGE_LIMIT = 20
+
 # Environment variables `gh` reads a token from. Both are cleared before an
 # explicitly-routed call, so an inherited implementer credential cannot win by
 # being the one variable we did not think to overwrite.
@@ -201,6 +207,10 @@ class IdentityMismatch(RuntimeError):
 
 class ReviewerTokenUnset(RuntimeError):
     """`reviewer_token_env` names a variable that is absent or empty."""
+
+
+class TruncatedListing(RuntimeError):
+    """A paged listing exceeded its page bound, so absence cannot be inferred."""
 
 
 class GitHub:
@@ -412,6 +422,47 @@ class GitHub:
             )
             for r in data
         ]
+
+    def pull_request_commits(self, owner: str, repo: str, number: int) -> list[str]:
+        """Every commit SHA currently in the PR, oldest first.
+
+        Read on ONE path only: after a review POST was rejected, to decide
+        whether the commit the verdict was pinned to is still part of the PR --
+        i.e. whether a force-push landed under it. That answer separates "retry
+        this" from "this can never succeed", so it is worth a call, but only
+        there; nothing on the common path reads it.
+
+        Paged like `issue_comments`, and bounded the same way. Truncation is
+        logged and matters here in one direction only: a SHA missing from a
+        truncated list would read as "gone" when it is merely on a later page.
+        The caller must therefore treat an empty/short read conservatively --
+        see loop._abandon_verdict, which only abandons on a complete read.
+        """
+        out: list[str] = []
+        for page in range(1, COMMIT_PAGE_LIMIT + 1):
+            data = (
+                self._api(
+                    "-X",
+                    "GET",
+                    f"repos/{owner}/{repo}/pulls/{number}/commits",
+                    "-f",
+                    f"per_page={PER_PAGE}",
+                    "-f",
+                    f"page={page}",
+                )
+                or []
+            )
+            out.extend(str(c.get("sha") or "") for c in data)
+            if len(data) < PER_PAGE:
+                return out
+        log.warning(
+            "%s/%s#%d has more than %d commits — the list is truncated, so a "
+            "missing SHA cannot be read as absent",
+            owner, repo, number, COMMIT_PAGE_LIMIT * PER_PAGE,
+        )
+        raise TruncatedListing(
+            f"{owner}/{repo}#{number} has more than {COMMIT_PAGE_LIMIT * PER_PAGE} commits"
+        )
 
     def my_reviews(self, owner: str, repo: str, number: int) -> list[Review]:
         """My substantive submitted reviews, oldest first -- one per round.

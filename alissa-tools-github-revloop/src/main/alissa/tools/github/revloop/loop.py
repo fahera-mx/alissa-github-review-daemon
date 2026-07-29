@@ -94,22 +94,21 @@ MAX_VERDICT_POST_ATTEMPTS = 5
 MAX_VERDICT_POST_BACKOFF_SECONDS = 60 * 60
 
 
-def _post_due_after(attempts: int) -> float:
-    """Seconds after `first_seen_at` before attempt number `attempts` may run.
+def _post_delay_after(attempts: int) -> float:
+    """Seconds to wait after attempt `attempts` before trying again.
 
-    Attempt 0 is exactly the grace window -- the "let the round's own session
-    submit its review first" wait, unchanged. After that the schedule is
-    exponential in the attempt count, floored at the grace window and capped,
-    so the first few retries still come at poll cadence (the right response to
-    a transient failure) and a hopeless one settles at a single attempt an
-    hour. The round never closes either way; only the cadence is bounded.
+    An inter-attempt DELAY, deliberately not a deadline measured from a fixed
+    origin: a capped absolute deadline stops bounding anything the moment the
+    row is older than the cap, and every later poll attempts the post again --
+    the hot loop back an hour late. Measured from `last_attempt_at`, the wait
+    keeps holding at any age.
+
+    Exponential in the attempt count and capped, so the first retries still
+    come at roughly poll cadence (the right answer to a blip) and a hopeless
+    post settles at a single attempt an hour. The round never closes either
+    way; only the cadence is bounded.
     """
-    if attempts <= 0:
-        return VERDICT_POST_GRACE_SECONDS
-    return max(
-        VERDICT_POST_GRACE_SECONDS,
-        min(2 ** attempts * 60, MAX_VERDICT_POST_BACKOFF_SECONDS),
-    )
+    return min(2 ** max(attempts, 0) * 60, MAX_VERDICT_POST_BACKOFF_SECONDS)
 
 
 # The native verdict review body. The verdict word is the payload; the round
@@ -618,7 +617,16 @@ class ReviewWatcher:
         # purpose: an approve envelope with no native APPROVE behind it would
         # otherwise close the loop with no verdict of record on GitHub and the
         # review request still dangling -- the studio #298 failure.
-        if task is not None and completed > native:
+        # ...unless the post was ABANDONED, which happens only when the head the
+        # round judged is gone from the PR. There is then no commit left to
+        # record that verdict against, and holding the round open would strand
+        # the PR outside the loop forever; the round is released instead and a
+        # fresh one is owed against the new head. See _abandon_verdict.
+        if (
+            task is not None
+            and completed > native
+            and not self.state.verdict_post_abandoned(pr.full_name, number, completed)
+        ):
             # Terminal for this pass either way. On a landed post the review
             # request it consumed drops the PR out of the search, so
             # convergence and the next round belong to the next pass, decided
@@ -728,16 +736,23 @@ class ReviewWatcher:
         row = self.state.note_verdict_post_owed(
             pr.full_name, pr.number, round_, self._judged_head(pr, round_)
         )
-        waited = time.time() - int(row["first_seen_at"])
-        due = _post_due_after(int(row["attempts"]))
-        if waited < due:
-            left = int(due - waited)
+        attempts = int(row["attempts"])
+        if attempts == 0:
+            # The grace window: measured from the first observation, because it
+            # is about the round's own session getting its chance, not about
+            # retrying.
+            left = VERDICT_POST_GRACE_SECONDS - (time.time() - int(row["first_seen_at"]))
+            reason = f"{int(left)}s of grace left for its own session to submit one"
+        else:
+            # Every later attempt is spaced from the PREVIOUS one; see
+            # _post_delay_after for why not from a fixed origin.
+            since = time.time() - int(row["last_attempt_at"] or row["first_seen_at"])
+            left = _post_delay_after(attempts) - since
             reason = (
-                f"{left}s of grace left for its own session to submit one"
-                if row["attempts"] == 0
-                else f"backing off after {row['attempts']} failed attempt(s), "
-                f"retrying in {left}s"
+                f"backing off after {attempts} failed attempt(s), "
+                f"retrying in {int(left)}s"
             )
+        if left > 0:
             return Decision(
                 Action.AWAITING_POST,
                 f"round {round_} has a {verdict} envelope but no native review "
@@ -775,7 +790,7 @@ class ReviewWatcher:
             # ones, and every one of them means the same thing: the round did
             # not close. An unexpected failure means that too, and must not
             # take down a poll pass that has other PRs to decide.
-            return self._verdict_post_failed(pr, task, round_, verdict, exc)
+            return self._verdict_post_failed(pr, task, round_, verdict, judged, exc)
 
         self.state.record_verdict_post(pr.full_name, pr.number, round_, url)
         log.info(
@@ -823,21 +838,104 @@ class ReviewWatcher:
             return str(row["head_sha"])
         return pr.head_sha
 
+    def _abandon_verdict(
+        self,
+        pr: PullRequest,
+        task: Task,
+        round_: int,
+        judged: str,
+        exc: BaseException,
+    ) -> Decision | None:
+        """Give up on a post that can never succeed, or None to keep retrying.
+
+        Pinning the verdict to the head its round judged (the fix for the
+        stale-approve latch) makes one new failure possible: a rebase or an
+        amended force-push removes that commit from the PR, GitHub rejects the
+        review, and no amount of retrying will change that. Without an exit the
+        round stays open forever -- which means round k+1 is never spawned and
+        the PR leaves the loop until a human edits sqlite. That is a worse
+        outcome than any verdict-of-record concern this path exists to serve.
+
+        The exit is to ABANDON the owed post, never to fall back to the current
+        head: the verdict judged code that no longer exists in the PR, so
+        restamping it forward is exactly the latch that was just removed.
+        Abandoning releases the round, and the next pass spawns a fresh one
+        against the new head -- the same place the head-moved path lands, minus
+        the unpostable POST.
+
+        Detection does not trust the error string. A rejection that mentions
+        the commit only *starts* the question; the answer comes from reading
+        the PR's commits and finding the judged SHA genuinely absent. Any other
+        422, an unreadable commit list, or a listing too long to prove absence
+        from all stay on the ordinary retry path -- the conservative direction,
+        since abandoning wrongly discards a real verdict.
+        """
+        blob = str(exc).lower()
+        if not ("422" in blob or "commit_id" in blob or "unprocessable" in blob):
+            return None
+        if not judged:
+            return None
+        try:
+            commits = self.github.pull_request_commits(pr.owner, pr.repo, pr.number)
+        except RateLimited:
+            raise
+        except Exception as probe_exc:
+            log.warning(
+                "%s round %d: the review POST was rejected and the PR's commit "
+                "list is unreadable (%s) — retrying rather than assuming the "
+                "judged head is gone",
+                pr.slug, round_, probe_exc,
+            )
+            return None
+        if judged in commits:
+            return None  # the pin is fine; the 422 is about something else
+
+        why = (
+            f"the head this round judged ({judged[:8]}) is no longer a commit of "
+            f"the PR — a force-push landed under it"
+        )
+        self.state.record_verdict_post_abandoned(pr.full_name, pr.number, round_, why)
+        log.error(
+            "%s round %d: ABANDONING its native verdict — %s. The round is "
+            "released so a fresh round can run against %s; the verdict stays on "
+            "%s as the record of what was judged.",
+            pr.slug, round_, why, pr.head_sha[:8], task.ref,
+        )
+        self._append_activity(
+            pr,
+            f"- {_now()} — round {round_} — native verdict abandoned: {why}. "
+            f"A fresh round is owed against `{pr.head_sha[:8]}`.",
+        )
+        return Decision(
+            Action.AWAITING_POST,
+            f"round {round_}'s native verdict was abandoned — {why}",
+            round_,
+            task_ref=task.ref,
+        )
+
     def _verdict_post_failed(
         self,
         pr: PullRequest,
         task: Task,
         round_: int,
         verdict: str,
+        judged: str,
         exc: BaseException,
     ) -> Decision:
         """Count a failed post, page once it stops looking transient, and keep
         the round OPEN. The page is the point: a silently missing native
         verdict is the exact defect this whole path exists to remove, so it
-        must not degrade into a quiet retry loop."""
+        must not degrade into a quiet retry loop.
+
+        One failure is NOT retryable and gets its own exit: the commit the
+        verdict was pinned to is no longer in the PR. See _abandon_verdict.
+        """
         attempts = self.state.record_verdict_post_failure(
             pr.full_name, pr.number, round_, str(exc)
         )
+        abandoned = self._abandon_verdict(pr, task, round_, judged, exc)
+        if abandoned is not None:
+            return abandoned
         log.error(
             "%s round %d: native %s review FAILED (attempt %d) — %s; the round "
             "stays open and the post retries next poll",

@@ -30,21 +30,48 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # its variable's NAME belongs -- sails through.
 _TOKEN_SHAPE_RE = re.compile(r"^(gh[pousr]_|github_pat_)", re.IGNORECASE)
 
-# No environment variable name comes close; every GitHub token exceeds it.
-MAX_ENV_NAME_LENGTH = 64
+# No environment variable name comes close (`REVLOOP_REVIEWER_GH_TOKEN` is 25);
+# every GitHub token, including the 40-character legacy hex ones, exceeds it.
+MAX_ENV_NAME_LENGTH = 32
+
+# Length is not the whole discriminator, because a secret can be short enough
+# to fit under the ceiling. The shape is: a long, undifferentiated run of
+# alphanumerics. Names are conventionally SCREAMING_SNAKE and separated -- the
+# underscore is what a legacy 40-hex token and a generic alnum API key lack.
+MIN_SECRET_RUN_LENGTH = 20
 
 
-def _redact(value: str) -> str:
-    """Describe a rejected value without reprinting it.
+def _is_credential_shaped(value: str) -> bool:
+    """Whether a `reviewer_token_env` value looks like a pasted secret.
 
-    The reachable way to trip `reviewer_token_env` validation is pasting a
-    secret, and `__main__` prints the resulting error to stderr as
-    `config error: …` -- straight into the container log. Length plus a short
-    prefix identifies the mistake without duplicating the credential into a
-    second place.
+    A heuristic, and deliberately one that errs toward accusing: the cost of a
+    false positive is renaming a variable, and the cost of a false negative is
+    a live credential sitting in a config file on a shared volume.
     """
-    head = value[:4]
-    return f'a {len(value)}-character value starting "{head}…"'
+    return bool(
+        _TOKEN_SHAPE_RE.match(value)
+        or len(value) > MAX_ENV_NAME_LENGTH
+        or (
+            len(value) >= MIN_SECRET_RUN_LENGTH
+            and "_" not in value
+            and value.isalnum()
+        )
+    )
+
+
+def _describe(value: str) -> str:
+    """Name a rejected value in the error -- redacted only when it has to be.
+
+    `__main__` prints this to stderr as `config error: …`, straight into the
+    container log, so a pasted secret must not be duplicated there: those get
+    length plus a short prefix. But the other way to fail this check is an
+    ordinary typo (`REVLOOP-REVIEWER-GH-TOKEN`), and there the value IS the
+    diagnostic -- redacting it turns a one-glance fix into a puzzle. The two
+    are separable now that credential shapes are identified explicitly.
+    """
+    if _is_credential_shaped(value):
+        return f'a {len(value)}-character value starting "{value[:4]}…"'
+    return repr(value)
 
 
 # What to do when a PR has a pending review request but no matching Alissa
@@ -295,16 +322,16 @@ class Config:
             # rather than exposed. So the check is two-sided: it must LOOK like
             # a name, and it must not look like a credential. The value itself
             # is never echoed back (see _redact).
-            if (
-                not _ENV_NAME_RE.match(token_env)
-                or _TOKEN_SHAPE_RE.match(token_env)
-                or len(token_env) > MAX_ENV_NAME_LENGTH
-            ):
+            if not _ENV_NAME_RE.match(token_env) or _is_credential_shaped(token_env):
+                rotate = (
+                    " If that is a credential, rotate it: it is now in a config file."
+                    if _is_credential_shaped(token_env)
+                    else ""
+                )
                 raise ValueError(
                     f"reviewer_token_env must be an environment variable NAME "
                     f"(e.g. 'REVLOOP_REVIEWER_GH_TOKEN'), not a value or a "
-                    f"token — got {_redact(token_env)}. If that is a "
-                    f"credential, rotate it: it is now in a config file."
+                    f"token — got {_describe(token_env)}.{rotate}"
                 )
 
         state_path = raw.get("state_path")
