@@ -3704,15 +3704,21 @@ def test_credential_shaped_values_are_rejected_as_a_token_env_name(tmp_path, tok
         Config.build(tmp_path, {"reviewer_token_env": token})
 
 
-def test_the_rejection_never_reprints_the_rejected_value(tmp_path):
-    """`__main__` prints this as `config error: …` — into the container log."""
-    secret = "ghp-uTCXx2m1YGfWNid84iK2xxxxxxxxxxxxxxxx"
+@pytest.mark.parametrize("secret", [
+    "ghp-uTCXx2m1YGfWNid84iK2xxxxxxxxxxxxxxxx",
+    "sk-proj-abc123def456ghi789",
+    "xoxb-1234-abcd",
+    "glpat-xxxxxxxxxxxxxxxxxxxx",
+])
+def test_the_rejection_never_reprints_the_rejected_value(tmp_path, secret):
+    """`__main__` prints this as `config error: …` — into the container log.
+    Punctuation-bearing secrets match no GitHub token shape, so the no-echo
+    guarantee cannot rest on recognising them."""
     with pytest.raises(ValueError) as exc:
         Config.build(tmp_path, {"reviewer_token_env": secret})
 
     assert secret not in str(exc.value)
     assert f"{len(secret)}-character value" in str(exc.value)
-    assert "rotate it" in str(exc.value)
 
 
 def test_an_ordinary_variable_name_is_still_accepted(tmp_path):
@@ -3776,7 +3782,7 @@ def test_an_unpostable_pinned_verdict_is_abandoned_not_retried_forever(
 
     d = w.evaluate(OWNER, REPO, NUMBER)
 
-    assert d.action is Action.AWAITING_POST
+    assert d.action is Action.ABANDONED, "not AWAITING_POST — it will never retry"
     assert "abandoned" in d.reason
     assert st.verdict_post_abandoned(SLUG, NUMBER, 1)
     assert "abandoned" in activity_comments(gh)[0].body, "never silent"
@@ -3867,14 +3873,17 @@ def test_a_punctuation_free_secret_is_rejected_too(tmp_path, secret):
         Config.build(tmp_path, {"reviewer_token_env": secret})
 
 
-def test_an_innocent_typo_is_echoed_rather_than_redacted(tmp_path):
-    """[nit, round 2] Here the value IS the diagnostic — redacting it turns a
-    one-glance fix into a puzzle."""
+def test_a_typo_is_diagnosed_by_character_without_echoing_the_value(tmp_path):
+    """The operator needs to know WHICH characters were rejected, not to see
+    the string back — that is what fixes the typo at a glance while keeping the
+    no-echo guarantee for a value that happens to be a secret."""
     with pytest.raises(ValueError) as exc:
         Config.build(tmp_path, {"reviewer_token_env": "REVLOOP-REVIEWER-GH-TOKEN"})
 
-    assert "REVLOOP-REVIEWER-GH-TOKEN" in str(exc.value)
-    assert "rotate it" not in str(exc.value), "not a credential, so no rotate advice"
+    message = str(exc.value)
+    assert "REVLOOP-REVIEWER-GH-TOKEN" not in message
+    assert "'-' at 7, 16, 19" in message, "the offending characters and where"
+    assert "rotate it" not in message, "not a credential, so no rotate advice"
 
 
 def test_a_credential_is_still_redacted(tmp_path):
@@ -3884,3 +3893,121 @@ def test_a_credential_is_still_redacted(tmp_path):
 
     assert secret not in str(exc.value)
     assert "rotate it" in str(exc.value)
+
+
+# -- round-3 findings (follow-up to PR #52) ---------------------------------
+
+
+def test_an_abandonment_does_not_leave_the_next_round_posted_twice(
+    config, no_post_grace
+):
+    """[minor, round 3] An abandoned round's envelope stays on the task forever
+    while its review record never exists, so the two counts are permanently off
+    by one. Uncorrected, that hole reads on the NEXT round as "no native
+    verdict" and stacks a duplicate APPROVE on a session that closed its own
+    round correctly — the outcome `countable_rounds` calls the worse one."""
+    st = State(config.state_db)
+    w, gh, al = force_pushed(config, st)
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ABANDONED
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED   # round 2
+
+    # Round 2's session submits its own review, correctly, at the new head.
+    gh.submit_error = None
+    gh._reviews.append(review(sha="rebased", at="2026-07-21T10:00:00Z"))
+    al.verdict_count = 2
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.submitted == [], "round 2 already has its reviewer review"
+    assert d.action is not Action.POSTED
+
+
+def test_an_abandonment_still_lets_the_daemon_close_a_later_round(
+    config, no_post_grace
+):
+    """...and the discount must not disable the post path outright: a round
+    after an abandonment whose session did NOT submit still gets its verdict."""
+    st = State(config.state_db)
+    w, gh, al = force_pushed(config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                       # round 1 abandoned
+    w.evaluate(OWNER, REPO, NUMBER)                       # round 2 spawned
+    gh.submit_error = None
+    al.verdict_count = 2                                  # round 2's envelope, no review
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED and d.round == 2
+    assert gh.submitted[0]["event"] == "APPROVE"
+
+
+def test_the_abandoned_round_is_countable_in_the_snapshot(config, no_post_grace):
+    """The action is what the snapshot aggregates and the console renders; a
+    round that gave up must not read as one that is still retrying."""
+    st = State(config.state_db)
+    w, _, _ = force_pushed(config, st)
+
+    w.poll_once()
+
+    snap = st.read_snapshots(1)[0]
+    assert snap["abandoned"] == 1
+    assert snap["awaiting_post"] == 0
+    assert snap["stages"][0]["stage"] == "abandoned"
+
+
+def test_the_commit_probe_refuses_to_prove_absence_at_githubs_own_cap(monkeypatch):
+    """[minor, round 3] GitHub caps this endpoint at 250 commits and returns
+    them OLDEST first, so on a longer PR a recent judged head is absent from
+    every read — the probe would report every verdict's commit as gone and
+    abandon real verdicts. 250 is where absence stops being provable."""
+    from alissa.tools.github.revloop.ghclient import PR_COMMIT_CAP, TruncatedListing
+
+    gh = GitHub("alissa-app")
+    pages = {
+        1: [{"sha": f"a{i}"} for i in range(PER_PAGE)],
+        2: [{"sha": f"b{i}"} for i in range(PER_PAGE)],
+        3: [{"sha": f"c{i}"} for i in range(PR_COMMIT_CAP - 2 * PER_PAGE)],
+    }
+    gh._api = lambda *a, **k: pages[int(a[-1].split("=")[1])]
+
+    with pytest.raises(TruncatedListing, match=str(PR_COMMIT_CAP)):
+        gh.pull_request_commits(OWNER, REPO, NUMBER)
+
+
+def test_a_short_pr_still_reads_its_whole_commit_list(monkeypatch):
+    gh = GitHub("alissa-app")
+    gh._api = lambda *a, **k: [{"sha": "abc123"}, {"sha": "def456"}]
+    assert gh.pull_request_commits(OWNER, REPO, NUMBER) == ["abc123", "def456"]
+
+
+@pytest.mark.parametrize("name", [
+    "REVLOOP_REVIEWER_GITHUB_TOKEN_ENV",            # 33 — the round-2 reply's own example
+    "ALISSA_REVLOOP_REVIEWER_GITHUB_TOKEN",         # 36
+])
+def test_a_long_but_plausible_name_is_accepted(tmp_path, name):
+    """[minor, round 3] A 32-char ceiling rejected names an operator can
+    plausibly write — and, because length fed the credential heuristic, told
+    them to rotate a variable name."""
+    assert Config.build(
+        tmp_path, {"reviewer_token_env": name}
+    ).reviewer_token_env == name
+
+
+def test_an_over_long_name_is_refused_without_being_accused(tmp_path):
+    """Over-length is still refused, but on its own message: length alone is
+    not evidence of a credential."""
+    over_long = "_".join(
+        ["ALISSA", "REVLOOP", "REVIEWER", "GITHUB", "TOKEN", "ENV", "NAME"]
+    )
+    assert len(over_long) > 40
+    with pytest.raises(ValueError) as exc:
+        Config.build(tmp_path, {"reviewer_token_env": over_long})
+
+    assert "at most 40 characters" in str(exc.value)
+    assert "rotate it" not in str(exc.value), "long is not evidence of a credential"
+
+
+def test_the_length_ceiling_no_longer_drives_redaction():
+    from alissa.tools.github.revloop.config import _is_credential_shaped
+    assert _is_credential_shaped("A_LONG_BUT_CLEARLY_DELIMITED_VARIABLE_NAME") is False
+    assert _is_credential_shaped("a" * 40) is True, "an undelimited alnum run is"
+    assert _is_credential_shaped("ghp_" + "a" * 36) is True

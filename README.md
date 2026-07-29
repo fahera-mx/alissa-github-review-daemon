@@ -166,10 +166,14 @@ review first, if it is going to):
 - the posting path re-reads `GET /user` and **refuses** to submit under any
   login other than the configured reviewer — a wrong-identity post is worse
   than a late one;
-- a post that fails is retried on every poll, and pages the PR after five
-  attempts. The round stays **open** throughout: no convergence, no next round,
-  no cap-out — a missing verdict of record stalls the loop visibly rather than
-  closing it invisibly;
+- a post that fails is retried on a growing backoff, and pages the PR after
+  five attempts. The round stays **open** throughout: no convergence, no next
+  round, no cap-out — a missing verdict of record stalls the loop visibly
+  rather than closing it invisibly. The one exception is a post that can never
+  succeed: if a force-push removed the commit the verdict judged, the post is
+  **abandoned** (recorded, and logged in the activity comment) and the round is
+  released, so a fresh round runs against the new head instead of the PR
+  stalling out of the loop forever;
 - each daemon post carries a hidden `round=k` marker, so a session's own review
   and the daemon's post for the same round count as **one** round against the
   cap.
@@ -224,7 +228,8 @@ Leave it on `skip` unless you want unattended clones.
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
 | a round's review has landed | its reviewer session is reaped (freed) — see below |
 | a round's verdict envelope exists but no reviewer-identity review does | the daemon submits it natively after a short grace; the round is **not** closed until it lands |
-| that post keeps failing | retried every poll, paged after 5 attempts — the round stays open |
+| that post keeps failing | retried with a growing backoff, paged after 5 attempts — the round stays open |
+| the head that round judged is gone (force-push) | the post is abandoned and the round released — a fresh round is owed against the new head |
 | approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | `round_cap` reviews, no approve | comment cap-out on the PR, escalate, stop |

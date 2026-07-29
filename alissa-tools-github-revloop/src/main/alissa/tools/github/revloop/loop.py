@@ -508,6 +508,11 @@ class Action(str, Enum):
     # window, or the post failed and is being retried. Either way the round is
     # NOT closed and nothing downstream of it runs.
     AWAITING_POST = "awaiting-post"
+    # The round's verdict can never be posted -- the head it judged is gone
+    # from the PR. Distinct from AWAITING_POST on purpose: that one retries,
+    # this one has given up, and the poll snapshot and console aggregate the
+    # action rather than the reason.
+    ABANDONED = "abandoned"
 
 
 @dataclass(frozen=True)
@@ -617,16 +622,21 @@ class ReviewWatcher:
         # purpose: an approve envelope with no native APPROVE behind it would
         # otherwise close the loop with no verdict of record on GitHub and the
         # review request still dangling -- the studio #298 failure.
-        # ...unless the post was ABANDONED, which happens only when the head the
-        # round judged is gone from the PR. There is then no commit left to
-        # record that verdict against, and holding the round open would strand
-        # the PR outside the loop forever; the round is released instead and a
-        # fresh one is owed against the new head. See _abandon_verdict.
-        if (
-            task is not None
-            and completed > native
-            and not self.state.verdict_post_abandoned(pr.full_name, number, completed)
-        ):
+        # ...discounting rounds whose post was ABANDONED, which happens only
+        # when the head the round judged is gone from the PR. There is then no
+        # commit left to record that verdict against, and holding the round
+        # open would strand the PR outside the loop forever; the round is
+        # released instead and a fresh one is owed against the new head (see
+        # _abandon_verdict).
+        #
+        # The discount is a SUBTRACTION, not just a check on the newest round.
+        # An abandoned round's envelope stays on the task forever while its
+        # review record never exists, so it leaves a permanent hole between the
+        # two counts -- and an uncorrected hole reads, on the NEXT round, as
+        # "that round has no native verdict", producing a duplicate post over a
+        # session that closed its own round correctly.
+        owed = completed - self.state.abandoned_rounds(pr.full_name, number)
+        if task is not None and owed > native:
             # Terminal for this pass either way. On a landed post the review
             # request it consumed drops the PR out of the search, so
             # convergence and the next round belong to the next pass, decided
@@ -737,6 +747,7 @@ class ReviewWatcher:
             pr.full_name, pr.number, round_, self._judged_head(pr, round_)
         )
         attempts = int(row["attempts"])
+        # `left` decides; `reason` only ever reaches a caller when left > 0.
         if attempts == 0:
             # The grace window: measured from the first observation, because it
             # is about the round's own session getting its chance, not about
@@ -907,7 +918,7 @@ class ReviewWatcher:
             f"A fresh round is owed against `{pr.head_sha[:8]}`.",
         )
         return Decision(
-            Action.AWAITING_POST,
+            Action.ABANDONED,
             f"round {round_}'s native verdict was abandoned — {why}",
             round_,
             task_ref=task.ref,
@@ -2154,6 +2165,7 @@ class ReviewWatcher:
             reaped=reaped,
             posted=counts[Action.POSTED],
             awaiting_post=counts[Action.AWAITING_POST],
+            abandoned=counts[Action.ABANDONED],
             stages=stages,
         )
 

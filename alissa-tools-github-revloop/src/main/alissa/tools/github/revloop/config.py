@@ -23,6 +23,10 @@ from typing import Any, Mapping
 # A POSIX-ish environment variable name -- what `reviewer_token_env` must be.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# The per-character half of the same rule, used to name the offending
+# characters in an error without echoing the value (see _describe).
+_ENV_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
+
 # ...which, on its own, accepts every GitHub credential format: `ghp_`, `gho_`,
 # `ghu_`, `ghs_`, `ghr_` and `github_pat_` tokens are `[A-Za-z0-9_]` throughout
 # and therefore valid identifiers. So the shape has to be rejected explicitly,
@@ -30,9 +34,13 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # its variable's NAME belongs -- sails through.
 _TOKEN_SHAPE_RE = re.compile(r"^(gh[pousr]_|github_pat_)", re.IGNORECASE)
 
-# No environment variable name comes close (`REVLOOP_REVIEWER_GH_TOKEN` is 25);
-# every GitHub token, including the 40-character legacy hex ones, exceeds it.
-MAX_ENV_NAME_LENGTH = 32
+# Generous on purpose. A tighter ceiling (32 was tried) rejects names an
+# operator can plausibly write -- `REVLOOP_REVIEWER_GITHUB_TOKEN_ENV` is 33 --
+# and this bound is NOT what catches credentials: MIN_SECRET_RUN_LENGTH is,
+# and it catches a 40-character hex token on its shape whatever the ceiling
+# says. So the ceiling exists only to refuse the obviously absurd, and it is
+# deliberately kept OUT of `_is_credential_shaped` (see there).
+MAX_ENV_NAME_LENGTH = 40
 
 # Length is not the whole discriminator, because a secret can be short enough
 # to fit under the ceiling. The shape is: a long, undifferentiated run of
@@ -47,10 +55,14 @@ def _is_credential_shaped(value: str) -> bool:
     A heuristic, and deliberately one that errs toward accusing: the cost of a
     false positive is renaming a variable, and the cost of a false negative is
     a live credential sitting in a config file on a shared volume.
+
+    Length is deliberately NOT one of the clauses. It was, and it made a merely
+    LONG name get classified as a credential -- rejected, redacted, and told to
+    rotate itself. Over-length is a separate refusal with its own message; only
+    an actual credential SHAPE drives redaction.
     """
     return bool(
         _TOKEN_SHAPE_RE.match(value)
-        or len(value) > MAX_ENV_NAME_LENGTH
         or (
             len(value) >= MIN_SECRET_RUN_LENGTH
             and "_" not in value
@@ -60,18 +72,30 @@ def _is_credential_shaped(value: str) -> bool:
 
 
 def _describe(value: str) -> str:
-    """Name a rejected value in the error -- redacted only when it has to be.
+    """Say what is wrong with a rejected value without reprinting a secret.
 
     `__main__` prints this to stderr as `config error: …`, straight into the
-    container log, so a pasted secret must not be duplicated there: those get
-    length plus a short prefix. But the other way to fail this check is an
-    ordinary typo (`REVLOOP-REVIEWER-GH-TOKEN`), and there the value IS the
-    diagnostic -- redacting it turns a one-glance fix into a puzzle. The two
-    are separable now that credential shapes are identified explicitly.
+    container log, so a pasted credential must never be echoed there. But the
+    other way to fail this check is an ordinary typo
+    (`REVLOOP-REVIEWER-GH-TOKEN`), and there the value IS the diagnostic.
+
+    Redacting everything loses the typo case; echoing whatever the GitHub-shape
+    heuristic does not recognise hands back the container-log disclosure for
+    every non-GitHub secret (`sk-proj-…`, `xoxb-…`, `glpat-…` all carry
+    punctuation and match no clause above). So neither branch prints the value:
+    what an operator needs is WHICH CHARACTERS were rejected, and those can be
+    named with their positions and nothing else.
     """
     if _is_credential_shaped(value):
-        return f'a {len(value)}-character value starting "{value[:4]}…"'
-    return repr(value)
+        return f"a {len(value)}-character value that looks like a credential"
+    offenders = sorted({c for c in value if not _ENV_CHAR_RE.match(c)})
+    if offenders:
+        where = ", ".join(
+            f"{c!r} at {', '.join(str(i) for i, ch in enumerate(value) if ch == c)}"
+            for c in offenders
+        )
+        return f"a {len(value)}-character value containing {where}"
+    return f"a {len(value)}-character value"
 
 
 # What to do when a PR has a pending review request but no matching Alissa
@@ -322,7 +346,11 @@ class Config:
             # rather than exposed. So the check is two-sided: it must LOOK like
             # a name, and it must not look like a credential. The value itself
             # is never echoed back (see _redact).
-            if not _ENV_NAME_RE.match(token_env) or _is_credential_shaped(token_env):
+            if (
+                not _ENV_NAME_RE.match(token_env)
+                or _is_credential_shaped(token_env)
+                or len(token_env) > MAX_ENV_NAME_LENGTH
+            ):
                 rotate = (
                     " If that is a credential, rotate it: it is now in a config file."
                     if _is_credential_shaped(token_env)
@@ -330,7 +358,8 @@ class Config:
                 )
                 raise ValueError(
                     f"reviewer_token_env must be an environment variable NAME "
-                    f"(e.g. 'REVLOOP_REVIEWER_GH_TOKEN'), not a value or a "
+                    f"(e.g. 'REVLOOP_REVIEWER_GH_TOKEN') of at most "
+                    f"{MAX_ENV_NAME_LENGTH} characters, not a value or a "
                     f"token — got {_describe(token_env)}.{rotate}"
                 )
 
