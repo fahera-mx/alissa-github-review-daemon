@@ -46,6 +46,11 @@ COMMENT_PAGE_LIMIT = 20
 # being the one variable we did not think to overwrite.
 GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
+# Stderr substrings that identify GitHub throttling however it is dressed up.
+# A secondary rate limit answers 403, so the status code alone cannot separate
+# throttling from an authorization failure -- these can. See `_api`.
+RATE_LIMIT_MARKERS = ("rate limit", "abuse detection", "429")
+
 # The review events the daemon may submit. COMMENT is deliberately absent: a
 # comment-mode review cannot express approval, which is the whole reason the
 # GitHub state was useless as a convergence signal in the first place.
@@ -148,20 +153,42 @@ def countable_rounds(reviews: list["Review"]) -> int:
     IS the round count: the daemon posts exactly one marked review per round,
     and it posts one for every round that lacks one.
 
-    Deliberately `max(marked)` rather than `len(marked) + len(unmarked)`. The
-    two disagree only when an unmarked review exists for a round the daemon
-    also marked -- precisely the double-count this exists to prevent -- and the
-    other direction self-corrects: an unmarked review for a round ABOVE the
-    highest marked one leaves envelopes > this count, which is the daemon's own
-    signal to post (and mark) that round on the next pass.
+    Deliberately NOT `len(marked) + len(unmarked)`: the two disagree exactly
+    when an unmarked review exists for a round the daemon also marked, which is
+    the double-count this exists to prevent.
+
+    But `max(marked)` alone is not enough either, because the daemon does not
+    post every round -- it posts the ones that lack a native review. Once round
+    k is daemon-closed, a LATER round whose session submitted its own review
+    correctly would be invisible, and the daemon would post a redundant second
+    verdict on top of it, every round, forever. So unmarked reviews submitted
+    strictly AFTER the newest marked one are counted on top.
+
+    Ordering is the only evidence available -- an unmarked review carries no
+    round number -- and it is sound in the normal flow: the daemon posts only
+    after VERDICT_POST_GRACE_SECONDS, so an unmarked review landing after a
+    marked round-k post belongs to round k+1. The residual error is a session
+    that posts its round-k review MORE than a grace window late, after the
+    daemon already marked round k: that overcounts by one, and the loop skips a
+    round NUMBER rather than emitting a duplicate approve. That is the better
+    failure -- a skipped number is visible in the activity comment, a duplicate
+    APPROVE record is a merge signal.
+
+    `reviews` must be oldest-first (what `my_reviews` returns).
 
     With no marked review at all this is the old count, byte for byte, so PRs
     reviewed before this shipped are unaffected.
     """
-    marked = [r.verdict_round for r in reviews if r.verdict_round is not None]
-    if marked:
-        return max(marked)
-    return len(reviews)
+    marked = [r for r in reviews if r.verdict_round is not None]
+    if not marked:
+        return len(reviews)
+    newest_marked = max(marked, key=lambda r: (r.submitted_at, r.verdict_round or 0))
+    later = sum(
+        1
+        for r in reviews
+        if r.verdict_round is None and r.submitted_at > newest_marked.submitted_at
+    )
+    return max(r.verdict_round or 0 for r in marked) + later
 
 
 class RateLimited(RuntimeError):
@@ -290,12 +317,29 @@ class GitHub:
             )
         return actual
 
-    def _api(self, *args: str, timeout: int = 60):
+    def _api(self, *args: str, timeout: int = 60, forbidden_is_rate_limit: bool = True):
+        """One `gh api` call, with GitHub's throttling mapped to RateLimited.
+
+        `forbidden_is_rate_limit` is about one ambiguity: GitHub answers a
+        secondary rate limit with 403, so a bare "403" in stderr is read as
+        throttling by default, and `run_forever` backs off. That default is
+        right for the READ path -- backing off is the correct response and a
+        skipped poll costs nothing.
+
+        It is wrong for a write whose failure has its own handling. A review
+        POST that 403s because the reviewer identity cannot review the repo is
+        an authorization failure, and collapsing it into RateLimited aborts the
+        whole poll pass (every other PR skipped, backoff doubled toward 900s)
+        while the round's retry-and-page path never runs at all. Callers like
+        that pass False: an explicit throttling marker still raises
+        RateLimited, and everything else stays a CommandError they can handle.
+        """
         try:
             return run_json(["gh", "api", *args], timeout=timeout, env=self._env())
         except CommandError as exc:
             blob = exc.stderr.lower()
-            if "rate limit" in blob or "403" in blob:
+            throttled = any(marker in blob for marker in RATE_LIMIT_MARKERS)
+            if throttled or (forbidden_is_rate_limit and "403" in blob):
                 raise RateLimited(exc.stderr.strip()[:300]) from exc
             raise
 
@@ -437,7 +481,10 @@ class GitHub:
         ]
         if commit_id:
             argv += ["-f", f"commit_id={commit_id}"]
-        data = self._api(*argv) or {}
+        # forbidden_is_rate_limit=False: a 403 here is the reviewer identity
+        # being unable to review this repo, and it must reach the caller's
+        # retry-and-page path instead of backing off the whole poll pass.
+        data = self._api(*argv, forbidden_is_rate_limit=False) or {}
         return str(data.get("html_url") or "")
 
     def comment(self, owner: str, repo: str, number: int, body: str) -> None:

@@ -225,6 +225,13 @@ ARG ALISSA_ROUND_CAP=""
 # environment for every `gh` call instead of inheriting the container default;
 # leave it empty and the daemon warns at startup, because this container holds
 # several identities and inheritance is how a verdict lands under the wrong one.
+#
+# BOTH REQUIRE REVLOOP_VERSION >= 0.16.3 (pinned at the top of this file). The
+# entrypoint renders them into revloop.config.json, and `Config.build` rejects
+# unknown keys — so setting either against an older pin fails config load with
+# `unknown config key(s): reviewer_token_env`, AFTER the entrypoint has already
+# logged a successful reviewer-identity preflight. That reads as a library bug
+# rather than the version skew it is. Bump the pin before setting these.
 ARG ALISSA_REVIEWER_LOGIN=""
 ARG ALISSA_REVIEWER_TOKEN_ENV=""
 # Reviewer-session reaper knobs, pass-through on the same contract: how long a

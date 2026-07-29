@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     number        INTEGER NOT NULL,
     round         INTEGER NOT NULL,
     first_seen_at INTEGER NOT NULL,
+    -- The head this round's verdict is ABOUT, captured when the gap was first
+    -- seen. Never re-read from the PR at post time: a review carries the
+    -- commit it judged, and stamping an old verdict onto a head pushed since
+    -- makes the next pass read it as a current approval.
+    head_sha      TEXT    NOT NULL DEFAULT '',
     attempts      INTEGER NOT NULL DEFAULT 0,
     posted_at     INTEGER,
     review_url    TEXT,
@@ -428,23 +433,32 @@ class State:
             (repo, number, round_),
         ).fetchone()
 
-    def note_verdict_post_owed(self, repo: str, number: int, round_: int) -> int:
-        """Record that this round is owed a native verdict; return first_seen_at.
+    def note_verdict_post_owed(
+        self, repo: str, number: int, round_: int, head_sha: str = ""
+    ) -> sqlite3.Row:
+        """Record that this round is owed a native verdict; return its row.
 
-        OR IGNORE keeps the FIRST observation's timestamp, because that is what
-        the pre-post grace window is measured from: a reviewer session that is
-        about to submit its own review must be given the chance, and a
-        timestamp that moved every poll would push the deadline out forever.
+        OR IGNORE keeps the FIRST observation on purpose, and both of the
+        columns it freezes matter:
+
+        * `first_seen_at` is what the pre-post grace window and the retry
+          backoff are measured from. A reviewer session about to submit its own
+          review must be given the chance, and a timestamp that moved every
+          poll would push both deadlines out forever.
+        * `head_sha` is the head the verdict is about. Re-reading it later
+          would defeat the point -- by post time the implementer may have
+          pushed, and a verdict stamped onto the new head reads as an approval
+          of code no reviewer has seen.
         """
-        now = int(time.time())
         self._db.execute(
             "INSERT OR IGNORE INTO verdict_posts "
-            "(repo, number, round, first_seen_at) VALUES (?,?,?,?)",
-            (repo, number, round_, now),
+            "(repo, number, round, first_seen_at, head_sha) VALUES (?,?,?,?,?)",
+            (repo, number, round_, int(time.time()), head_sha),
         )
         self._db.commit()
         row = self.get_verdict_post(repo, number, round_)
-        return int(row["first_seen_at"]) if row else now
+        assert row is not None  # just inserted, or already there
+        return row
 
     def record_verdict_post_failure(
         self, repo: str, number: int, round_: int, error: str
@@ -476,8 +490,8 @@ class State:
     def read_verdict_posts(self, limit: int | None = None) -> list[dict]:
         """Verdict-post rows, newest observation first."""
         return self._read_rows(
-            "SELECT repo, number, round, first_seen_at, attempts, posted_at, "
-            "review_url, last_error FROM verdict_posts "
+            "SELECT repo, number, round, first_seen_at, head_sha, attempts, "
+            "posted_at, review_url, last_error FROM verdict_posts "
             "ORDER BY first_seen_at DESC, number DESC",
             limit,
         )

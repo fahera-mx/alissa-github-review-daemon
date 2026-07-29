@@ -188,6 +188,14 @@ inject the token at runtime like any other secret. The entrypoint resolves the
 login at boot and refuses to start if the variable is empty, the token is
 rejected, or it belongs to someone other than `ALISSA_REVIEWER_LOGIN`.
 
+> **Version floor.** `ALISSA_REVIEWER_LOGIN` and `ALISSA_REVIEWER_TOKEN_ENV`
+> need `REVLOOP_VERSION >= 0.16.3` in the image. The entrypoint renders them
+> into `revloop.config.json` and the daemon rejects unknown config keys, so
+> setting either against an older pin fails config load with `unknown config
+> key(s): reviewer_token_env` — *after* a successful reviewer-identity
+> preflight, which makes a version skew read like a library bug. Bump the pin
+> first.
+
 ## Provisioning new repos
 
 By default a review for a repo with no worktree hub is **skipped**, with the

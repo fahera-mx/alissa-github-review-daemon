@@ -23,6 +23,30 @@ from typing import Any, Mapping
 # A POSIX-ish environment variable name -- what `reviewer_token_env` must be.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# ...which, on its own, accepts every GitHub credential format: `ghp_`, `gho_`,
+# `ghu_`, `ghs_`, `ghr_` and `github_pat_` tokens are `[A-Za-z0-9_]` throughout
+# and therefore valid identifiers. So the shape has to be rejected explicitly,
+# or the one mistake this validation exists to catch -- pasting the token where
+# its variable's NAME belongs -- sails through.
+_TOKEN_SHAPE_RE = re.compile(r"^(gh[pousr]_|github_pat_)", re.IGNORECASE)
+
+# No environment variable name comes close; every GitHub token exceeds it.
+MAX_ENV_NAME_LENGTH = 64
+
+
+def _redact(value: str) -> str:
+    """Describe a rejected value without reprinting it.
+
+    The reachable way to trip `reviewer_token_env` validation is pasting a
+    secret, and `__main__` prints the resulting error to stderr as
+    `config error: …` -- straight into the container log. Length plus a short
+    prefix identifies the mistake without duplicating the credential into a
+    second place.
+    """
+    head = value[:4]
+    return f'a {len(value)}-character value starting "{head}…"'
+
+
 # What to do when a PR has a pending review request but no matching Alissa
 # review task (CR2 is implementer-side, so a third-party PR may not have one).
 ON_MISSING_SPAWN = "spawn_anyway"  # review anyway, PR URL carries the context
@@ -264,16 +288,23 @@ class Config:
         token_env = raw.get("reviewer_token_env")
         if token_env is not None:
             token_env = str(token_env).strip()
-            if not _ENV_NAME_RE.match(token_env):
-                # The overwhelmingly likely way to get here is pasting the
-                # TOKEN in place of the variable's name, which would leave a
-                # live credential in a config file on a shared volume and then
-                # fail as "unset variable" — an error that reads as though the
-                # secret were missing rather than exposed. Say what it is.
+            # The overwhelmingly likely way to get here is pasting the TOKEN in
+            # place of the variable's name, which would leave a live credential
+            # in a config file on a shared volume and then fail as "unset
+            # variable" — an error that reads as though the secret were missing
+            # rather than exposed. So the check is two-sided: it must LOOK like
+            # a name, and it must not look like a credential. The value itself
+            # is never echoed back (see _redact).
+            if (
+                not _ENV_NAME_RE.match(token_env)
+                or _TOKEN_SHAPE_RE.match(token_env)
+                or len(token_env) > MAX_ENV_NAME_LENGTH
+            ):
                 raise ValueError(
                     f"reviewer_token_env must be an environment variable NAME "
                     f"(e.g. 'REVLOOP_REVIEWER_GH_TOKEN'), not a value or a "
-                    f"token, got {token_env!r}"
+                    f"token — got {_redact(token_env)}. If that is a "
+                    f"credential, rotate it: it is now in a config file."
                 )
 
         state_path = raw.get("state_path")

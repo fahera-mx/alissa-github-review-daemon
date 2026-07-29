@@ -41,7 +41,7 @@ def test_directive_formats_without_stray_braces(template):
     # The closing clause must not introduce unescaped {…} that break .format().
     out = template.format(
         assignment="a.", round=1, cap=3, session="review-x-pr1-r1",
-        credential=_POST_AS_REVIEWER.format(env_var="REV_TOKEN"),
+        credential=_POST_AS_REVIEWER.format(env_var="REV_TOKEN", reviewer="alissa-app"),
     )
     assert "{" not in out and "}" not in out
 
@@ -54,7 +54,9 @@ def test_directive_routes_gh_writes_through_the_reviewer_credential(template):
     never carries the token itself."""
     out = template.format(
         assignment="a.", round=1, cap=3, session="review-x-pr1-r1",
-        credential=_POST_AS_REVIEWER.format(env_var="REVLOOP_REVIEWER_GH_TOKEN"),
+        credential=_POST_AS_REVIEWER.format(
+            env_var="REVLOOP_REVIEWER_GH_TOKEN", reviewer="alissa-app"
+        ),
     )
     assert 'GH_TOKEN="$REVLOOP_REVIEWER_GH_TOKEN" gh' in out
     assert "not the round's verdict of record" in out

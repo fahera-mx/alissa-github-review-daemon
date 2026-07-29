@@ -87,6 +87,31 @@ VERDICT_POST_GRACE_SECONDS = 5 * 60
 # repo the reviewer identity cannot review) must not stay a log line.
 MAX_VERDICT_POST_ATTEMPTS = 5
 
+# Ceiling on the retry backoff below. "Keep retrying" is the invariant; "keep
+# retrying every poll forever" is not: at the deployed 30s interval a
+# permanently-failing post costs ~2,880 review POSTs and as many task reads a
+# day, per stuck PR, with the operator paged exactly once.
+MAX_VERDICT_POST_BACKOFF_SECONDS = 60 * 60
+
+
+def _post_due_after(attempts: int) -> float:
+    """Seconds after `first_seen_at` before attempt number `attempts` may run.
+
+    Attempt 0 is exactly the grace window -- the "let the round's own session
+    submit its review first" wait, unchanged. After that the schedule is
+    exponential in the attempt count, floored at the grace window and capped,
+    so the first few retries still come at poll cadence (the right response to
+    a transient failure) and a hopeless one settles at a single attempt an
+    hour. The round never closes either way; only the cadence is bounded.
+    """
+    if attempts <= 0:
+        return VERDICT_POST_GRACE_SECONDS
+    return max(
+        VERDICT_POST_GRACE_SECONDS,
+        min(2 ** attempts * 60, MAX_VERDICT_POST_BACKOFF_SECONDS),
+    )
+
+
 # The native verdict review body. The verdict word is the payload; the round
 # and the review task make it auditable, and the marker (invisible in the
 # rendered comment) is what keeps this from being counted as a second round
@@ -95,12 +120,24 @@ NATIVE_VERDICT_BODY = (
     "**Review round {round} — `{verdict}`**\n\n"
     "Submitted by the review daemon under the configured reviewer identity, so "
     "this round has a verdict of record on GitHub. The round's findings and "
-    "reasoning are in the reviewer session's own comments on this PR{task_note}.\n\n"
+    "reasoning are in the reviewer session's own comments on this PR{task_note}."
+    "{head_note}\n\n"
     "{marker}"
 )
 
 # Appended to the body when the round's review task is known.
 _VERDICT_TASK_NOTE = ", and the CR6 verdict envelope is on `{task_ref}`"
+
+# Appended when the head moved between the round being queued and this post.
+# The review record already says so (it is pinned to `{judged}`), but only a
+# reader who checks the commit would notice, and "an approve that does not
+# cover the current head" is the one thing about this record that changes what
+# happens next: the loop treats the PR as owing another round.
+HEAD_MOVED_NOTE = (
+    "\n\n> This verdict judged `{judged}`; the head is now `{head}`. It is "
+    "recorded against the commit it actually reviewed, so it does **not** "
+    "count as a verdict on the newer code — the next round is owed."
+)
 
 # The operator page for a native verdict post that keeps failing. Loud on
 # purpose: until it lands the round is NOT closed, so the loop is stalled on
@@ -124,12 +161,23 @@ VERDICT_POST_FAILED_COMMENT = (
 # default `gh` credential belongs to the IMPLEMENTER identity, which is how
 # round-1 verdicts landed under the wrong login on studio #298/#302; naming the
 # variable (never its value) is what lets a session route around the default.
+# It deliberately does NOT assume the variable is there: the daemon populates
+# its own environment, not the worker's, so an unexported variable would expand
+# to an empty string -- and `gh` reads an empty GH_TOKEN as "no token" and falls
+# back to the container default, which is the very identity this clause exists
+# to avoid. Verify, then write or skip; the daemon's own post closes the round
+# either way, so skipping costs nothing and a blind write costs the verdict.
 _POST_AS_REVIEWER = (
     "CREDENTIAL — this container's default `gh` credential is NOT the reviewer "
-    "identity. Prefix every `gh` call that WRITES to the PR with the reviewer "
-    "token explicitly: `GH_TOKEN=\"${env_var}\" gh …` (the variable, never its "
-    "value). A review posted under the default credential is not the round's "
-    "verdict of record. "
+    "identity. Before any `gh` call that WRITES to the PR, check that "
+    "`${env_var}` is non-empty AND that "
+    "`GH_TOKEN=\"${env_var}\" gh api user --jq .login` prints `{reviewer}`. If "
+    "both hold, prefix every write with `GH_TOKEN=\"${env_var}\" ` (the "
+    "variable, never its value). If either fails, do NOT post the review at "
+    "all — say so in your verdict evidence and stop: an empty GH_TOKEN falls "
+    "back to the default credential, and a review under it is not the round's "
+    "verdict of record. The daemon submits the native verdict either way, so "
+    "skipping the write loses nothing. "
 )
 
 # The closing contract is spelled out in both directives (not just the skill)
@@ -677,29 +725,45 @@ class ReviewWatcher:
                 task_ref=task.ref,
             )
 
-        first_seen = self.state.note_verdict_post_owed(pr.full_name, pr.number, round_)
-        waited = time.time() - first_seen
-        if waited < VERDICT_POST_GRACE_SECONDS:
+        row = self.state.note_verdict_post_owed(
+            pr.full_name, pr.number, round_, self._judged_head(pr, round_)
+        )
+        waited = time.time() - int(row["first_seen_at"])
+        due = _post_due_after(int(row["attempts"]))
+        if waited < due:
+            left = int(due - waited)
+            reason = (
+                f"{left}s of grace left for its own session to submit one"
+                if row["attempts"] == 0
+                else f"backing off after {row['attempts']} failed attempt(s), "
+                f"retrying in {left}s"
+            )
             return Decision(
                 Action.AWAITING_POST,
                 f"round {round_} has a {verdict} envelope but no native review "
-                f"yet — {int(VERDICT_POST_GRACE_SECONDS - waited)}s of grace left "
-                f"for its own session to submit one",
+                f"yet — {reason}",
                 round_,
                 task_ref=task.ref,
             )
 
+        judged = str(row["head_sha"] or pr.head_sha)
+        moved = bool(judged) and judged != pr.head_sha
         event = EVENT_APPROVE if verdict == VERDICT_APPROVE else EVENT_REQUEST_CHANGES
         body = NATIVE_VERDICT_BODY.format(
             round=round_,
             verdict=verdict,
             task_note=_VERDICT_TASK_NOTE.format(task_ref=task.ref),
+            head_note=(
+                HEAD_MOVED_NOTE.format(judged=judged[:8], head=pr.head_sha[:8])
+                if moved
+                else ""
+            ),
             marker=verdict_marker(round_),
         )
         try:
             url = self.github.submit_review(
                 pr.owner, pr.repo, pr.number,
-                event=event, body=body, commit_id=pr.head_sha,
+                event=event, body=body, commit_id=judged,
             )
         except RateLimited:
             # run_forever's backoff is the whole response to a rate limit.
@@ -730,6 +794,34 @@ class ReviewWatcher:
             round_,
             task_ref=task.ref,
         )
+
+    def _judged_head(self, pr: PullRequest, round_: int) -> str:
+        """The head round `round_`'s verdict is ABOUT — not the current one.
+
+        A review carries the commit it judged, and `_convergence_reason` reads
+        that commit to decide whether an approval still covers the code. Post
+        with the head at POST time and an old approve is restamped onto commits
+        no reviewer has seen, and the next pass converges on it: the #227 latch,
+        rebuilt inside the daemon's own post. The gap is not small -- it spans
+        an implementer triaging visible findings and pushing, a daemon restart,
+        or a rate-limit backoff.
+
+        The spawn ledger is the answer: its row for this round records the head
+        the round was QUEUED against. That is deliberately the conservative
+        choice over the current head. If a session actually reviewed a newer
+        head pushed mid-round, attributing to the queued head under-claims --
+        convergence is missed and one extra round runs. Over-claiming produces
+        a false approve. Only one of those is recoverable.
+
+        Falls back to the current head when there is no ledger row at all (a
+        hand-spawned round, or one whose ledger was lost); that is no worse
+        than the behaviour without a ledger, and the caller records whatever
+        this returns so the answer cannot drift between polls.
+        """
+        row = self.state.get_spawn(pr.full_name, pr.number, round_)
+        if row is not None and row["head_sha"]:
+            return str(row["head_sha"])
+        return pr.head_sha
 
     def _verdict_post_failed(
         self,
@@ -1603,7 +1695,9 @@ class ReviewWatcher:
         """
         if not self.config.reviewer_token_env:
             return ""
-        return _POST_AS_REVIEWER.format(env_var=self.config.reviewer_token_env)
+        return _POST_AS_REVIEWER.format(
+            env_var=self.config.reviewer_token_env, reviewer=self.github.login
+        )
 
     def _ensure_hub(self, pr: PullRequest) -> tuple[Path, str | None]:
         """Resolve the reviewer's cwd, hub-ifying the repo first if configured.
