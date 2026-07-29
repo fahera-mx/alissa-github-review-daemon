@@ -480,7 +480,7 @@ class ReviewWatcher:
         # (repo, number) pairs already warned about, so a fetch condition that
         # does not self-clear is reported on its transition rather than every
         # poll -- see _fetch_pr. Discarded the moment that fetch answers again.
-        self._warned_fetch: set[tuple[str, int]] = set()
+        self._warned_fetch: set[tuple[str, int, bool]] = set()
         # Session name -> consecutive passes whose probe could not be answered.
         # Bounded like _probe_cache (pruned against the live list); see
         # _note_probe_taint for what it guards against.
@@ -970,6 +970,7 @@ class ReviewWatcher:
             for name, count in self._probe_taint.items()
             if name in live_names
         }
+        self._prune_warned_fetch(sessions)
 
         # Per-sweep memos. The PR fetch is keyed per distinct (repo, number);
         # the round count additionally keys on the task ref, because two spawns
@@ -1042,6 +1043,34 @@ class ReviewWatcher:
 
         self._check_session_cap(sessions, reaped, holdouts)
         return len(reaped)
+
+    def _prune_warned_fetch(self, sessions: list[ManagedSession]) -> None:
+        """Bound `_warned_fetch` the way `_probe_cache` and `_probe_taint` are.
+
+        Those two are rebuilt against the live session names each sweep so
+        they stay bounded in a process that polls forever. This one cannot
+        ride that prune: it is keyed by (repo, number, condition), not by
+        session -- so it gets the equivalent, computed from the PR keys still
+        REACHABLE from a live session (its ledger row, or the probe target its
+        name resolved to). Without it this set is the only member of the three
+        that only ever shrinks when a fetch recovers, which for the conditions
+        it reports (repo deleted, transferred, renamed) never happens.
+
+        Reachability, not "fetched this pass", on purpose: a busy or in-grace
+        session is never fetched, so pruning against the pass's fetches would
+        drop its entry and re-warn every time a session flapped.
+        """
+        reachable = set()
+        for ses in sessions:
+            row = self.state.find_spawn_by_session(ses.name)
+            if row is not None:
+                reachable.add((row["repo"], row["number"]))
+            target = self._probe_cache.get(ses.name)
+            if target is not None:
+                reachable.add(target)
+        self._warned_fetch = {
+            entry for entry in self._warned_fetch if entry[:2] in reachable
+        }
 
     def _hold(self, holdouts: dict[str, str], ses: ManagedSession, why: str) -> None:
         """Record (and log at debug) why a live session was not reaped.
@@ -1214,8 +1243,14 @@ class ReviewWatcher:
         read as "did not answer", and that can persist indefinitely.
 
         Once per episode, like the cap alarm and for the same reason (this runs
-        every poll); the counter resets on any pass that answers, so a recovery
-        re-arms the alarm for the next episode.
+        every poll). The counter resets on any pass that answers -- but note
+        what that does and does not buy, because an earlier version of this
+        docstring claimed the wrong thing: a pass that answers also CACHES the
+        resolution, and a cached session short-circuits above without probing
+        ever again, so the same live session cannot open a second episode. The
+        reset keeps the map honest (and is what makes the count "consecutive"
+        rather than cumulative); re-arming happens for a NEW session name, or
+        after this one leaves the live list and the prune drops it.
 
         The unit is PROBE ATTEMPTS, not polls, and the page says so: a session
         that goes busy or falls back inside the reap grace returns above
@@ -1390,14 +1425,28 @@ class ReviewWatcher:
             # _note_probe_taint: fire on the transition, stay quiet while it
             # holds, re-arm when it clears.
             message = "no such PR" if missing else "could not fetch"
+            # Keyed on the CONDITION, not just the PR. Rate-limiting alone was
+            # the shape of the sibling alarms but not their content: both of
+            # those key on what the condition IS (_check_session_cap on the
+            # surviving-name set, _note_probe_taint reset by any pass that
+            # answers). Keyed on (repo, number) alone, the FIRST fact about a
+            # PR silences every later one about it forever -- and the two
+            # facts this path reports are exactly the pair worth telling
+            # apart: a transient failure (retry, look at the API) and then a
+            # definite 404 on the ledger path, which means the repo was
+            # deleted, transferred or renamed under the daemon. A blip before
+            # a real failure is not exotic on something that polls forever;
+            # FETCH_FAILED exists because blips happen.
+            warned = (repo_slug, number, missing)
             if quiet:
                 log.debug("reap sweep: %s %s#%d: %s", message, repo_slug, number, exc)
-            elif key not in self._warned_fetch:
-                self._warned_fetch.add(key)
+            elif warned not in self._warned_fetch:
+                self._warned_fetch.add(warned)
                 log.warning("reap sweep: %s %s#%d: %s", message, repo_slug, number, exc)
             prs[key] = None if missing else FETCH_FAILED
         else:
-            self._warned_fetch.discard(key)  # it answered -- re-arm
+            # It answered -- re-arm both conditions for this PR.
+            self._warned_fetch -= {(repo_slug, number, True), (repo_slug, number, False)}
         return prs[key]
 
     def _fetched_pr(
