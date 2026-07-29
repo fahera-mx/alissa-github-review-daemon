@@ -1981,7 +1981,7 @@ def test_the_probe_stops_at_the_first_candidate_that_will_not_answer(config):
     assert al.killed == []
 
 
-def test_a_probe_that_never_answers_pages_once_and_re_arms_on_recovery(config, caplog):
+def test_a_probe_that_never_answers_pages_once_and_clears_on_recovery(config, caplog):
     """Refusing to cache a tainted pass is unbounded on its own: a repo that
     HANGS (proc.run maps a 60s gh timeout to CommandError) keeps the session
     re-probing every poll, silently, since the probe is quiet and the taint log
@@ -2010,20 +2010,14 @@ def test_a_probe_that_never_answers_pages_once_and_re_arms_on_recovery(config, c
         w.sweep_sessions()  # still stuck — once per episode, not once per poll
         assert len(pages()) == 1
 
+        # Recovery: the counter clears. Deliberately NOT asserting a second
+        # episode on this session — see the test below for why that cannot
+        # happen, and why asserting it against a fresh session name would pin
+        # nothing.
         blip.clear()
         w.sweep_sessions()
         assert al.killed == ["review-pr-7"]
         assert w._probe_taint == {}, "a pass that answered clears the counter"
-
-        # Re-arm for real, which is what this test is named after: a fresh
-        # episode must page again, not stay silent behind the first one.
-        al.sessions = []
-        _live(al, "review-pr-8")
-        blip.add(SLUG)
-        for _ in range(PROBE_TAINT_ALARM):
-            w.sweep_sessions()
-        assert len(pages()) == 2
-        assert "review-pr-8" in pages()[1].getMessage()
 
 
 def test_the_stuck_probe_page_names_the_candidate_that_went_dark(config, caplog):
@@ -2071,6 +2065,89 @@ def test_a_ledger_backed_fetch_condition_warns_once_not_every_poll(config, caplo
         w.sweep_sessions()
 
     assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+
+
+def test_a_session_whose_probe_answered_never_probes_again(config, caplog):
+    """Why the counter reset cannot arm a second episode for the SAME session,
+    which is the property the round-1 nit asked for and neither of us noticed
+    was unreachable.
+
+    `_probe_cache[ses.name]` is written exactly once — immediately after a
+    probe answers — and cleared only by the live-list prune. So an answering
+    pass both resets the counter AND short-circuits every later resolution for
+    that session. A failure after that is a state-fetch failure, not a probe,
+    and must not be counted as probe taint.
+    """
+    open_pr = make_pr()
+    w, gh, al = watcher(_watched(config, "acme/a", SLUG), open_pr, [review()])
+    _resolve_prs(gh, {(SLUG, 7): open_pr})
+    _live(al, "review-pr-7")
+
+    w.sweep_sessions()
+    assert w._probe_cache == {"review-pr-7": (SLUG, 7)}
+    fetches_after_probe = gh.pr_fetches
+
+    # Now break everything and sweep well past the alarm floor.
+    _resolve_prs(gh, {}, failing={SLUG, "acme/a"})
+    with caplog.at_level(logging.ERROR):
+        for _ in range(PROBE_TAINT_ALARM + 2):
+            w.sweep_sessions()
+
+    assert w._probe_taint == {}, "a cached session contributes no probe taint"
+    assert [r for r in caplog.records if "PROBE STUCK" in r.message] == []
+    # One state fetch per sweep, never the two-repo allowlist probe again.
+    assert gh.pr_fetches == fetches_after_probe + PROBE_TAINT_ALARM + 2
+
+
+def test_a_changed_fetch_condition_warns_again(config, caplog):
+    """The gate rate-limits like its siblings but must key like them too: they
+    key on what the condition IS. Keyed on the PR alone, the first fact about
+    a PR silences every later one — so a transient 502 followed by the repo
+    being deleted leaves the operator holding a stale gateway error."""
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()], verdict_count=0)
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+    down = {SLUG}
+    _resolve_prs(gh, {(SLUG, NUMBER): pr}, failing=down)
+
+    with caplog.at_level(logging.WARNING):
+        w.sweep_sessions()
+        w.sweep_sessions()  # same condition — still one
+        assert len(caplog.records) == 1
+        assert "could not fetch" in caplog.records[0].getMessage()
+
+        down.clear()  # the repo is gone now: a definite 404, not a blip
+        _resolve_prs(gh, {}, failing=set())
+        w.sweep_sessions()
+        w.sweep_sessions()  # the new condition, also only once
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 2, "a changed condition re-fires exactly once"
+    assert "no such PR" in messages[1]
+
+
+def test_warned_fetch_is_pruned_like_its_two_siblings(config):
+    """`_probe_cache` and `_probe_taint` are rebuilt against the live sessions
+    every sweep so they stay bounded in a process that polls forever. This set
+    is keyed by PR rather than session, so it cannot ride that prune — and
+    without its own it only ever shrinks when a fetch recovers, which for a
+    deleted repo never happens."""
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()], verdict_count=0)
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+    _resolve_prs(gh, {}, failing={SLUG})
+
+    w.sweep_sessions()
+    assert w._warned_fetch, "the condition was warned about"
+
+    al.sessions = []  # the session is gone for good
+    for _ in range(3):
+        w.sweep_sessions()
+
+    assert w._warned_fetch == set()
+    assert w._probe_cache == {} and w._probe_taint == {}, "siblings still pruned"
 
 
 def test_the_taint_counter_is_pruned_with_the_live_list(config):
