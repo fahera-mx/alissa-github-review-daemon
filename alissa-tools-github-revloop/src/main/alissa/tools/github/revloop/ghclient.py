@@ -96,6 +96,12 @@ class PullRequest:
     # "open" or "closed"; merged PRs report state "closed" AND merged True.
     state: str = "open"
     merged: bool = False
+    # Logins GitHub currently holds a pending review request against. Read off
+    # the same PR payload as everything else here, so knowing whether this
+    # daemon's own request is still dangling costs no extra call. USERS only:
+    # `requested_teams` is a separate field and is deliberately not carried,
+    # because nothing in the loop may ever withdraw a team's request.
+    requested_reviewers: tuple[str, ...] = ()
 
     @property
     def full_name(self) -> str:
@@ -402,6 +408,11 @@ class GitHub:
             url=data.get("html_url", ""),
             state=data.get("state") or "open",
             merged=bool(data.get("merged")),
+            requested_reviewers=tuple(
+                str((u or {}).get("login") or "")
+                for u in (data.get("requested_reviewers") or [])
+                if (u or {}).get("login")
+            ),
         )
 
     def reviews(self, owner: str, repo: str, number: int) -> list[Review]:
@@ -546,6 +557,32 @@ class GitHub:
         # retry-and-page path instead of backing off the whole poll pass.
         data = self._api(*argv, forbidden_is_rate_limit=False) or {}
         return str(data.get("html_url") or "")
+
+    def remove_review_request(
+        self, owner: str, repo: str, number: int, login: str
+    ) -> None:
+        """Withdraw the pending review request held against ONE login.
+
+        The payload names exactly one reviewer, never the whole list: GitHub's
+        DELETE removes only what it is given, so a human reviewer or a second
+        bot sitting in the same `requested_reviewers` array is untouched. The
+        caller is the round close-out (loop._clear_own_review_request), and the
+        only login it ever passes is the daemon's own.
+
+        `forbidden_is_rate_limit=False` for the same reason `submit_review`
+        passes it: a 403 here is this identity not being allowed to edit the
+        PR's reviewers, which is a fact about the deployment that its caller
+        logs and degrades on -- not a throttle worth backing the whole poll
+        pass off for.
+        """
+        self._api(
+            "-X",
+            "DELETE",
+            f"repos/{owner}/{repo}/pulls/{number}/requested_reviewers",
+            "-f",
+            f"reviewers[]={login}",
+            forbidden_is_rate_limit=False,
+        )
 
     def comment(self, owner: str, repo: str, number: int, body: str) -> None:
         run_json(

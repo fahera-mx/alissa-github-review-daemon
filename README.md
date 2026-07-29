@@ -232,6 +232,7 @@ Leave it on `skip` unless you want unattended clones.
 | the head that round judged is gone (force-push) | the post is abandoned and the round released — a fresh round is owed against the new head |
 | approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
+| converged, and the daemon's own review request is *still* pending | that request is withdrawn, so the closed round leaves the poll set — see below |
 | `round_cap` reviews, no approve | comment cap-out on the PR, escalate, stop |
 | new commits after a cap-out | re-escalate (head moved, decision is about the new state) |
 | operator ack on a capped PR | grant N more rounds, log it, append to the activity comment |
@@ -243,6 +244,46 @@ Leave it on `skip` unless you want unattended clones.
 `COMMENTED` reviews close a round, not just `APPROVED`/`CHANGES_REQUESTED` —
 single-operator workspaces post comment-mode reviews per CR5, and the loop must
 still advance.
+
+### Round close-out: withdrawing a dangling self review request
+
+The poll's attention set *is* `review-requested:@me`, and GitHub clears a
+review request when the **requested** login submits a review. So the normal
+closed round drops out of the search by itself.
+
+It does not when the round's review was posted under some other login — studio
+#298 again. Nothing ever consumes the request, the PR stays in the search
+forever, and every poll pays a full re-verification (PR fetch, reviews, review
+task, envelope count) to reach the same no-op.
+
+So close-out withdraws it. Strictly in the **converged** branch — a verdict of
+record standing at the current head, where no further round can be owed — and
+never from any branch that could still open one: a moved head, a
+`request_changes` round, a round still owing its native verdict, an in-flight
+round, or a **capped** PR (a capped PR is precisely where an operator ack can
+still grant rounds, and the ack scan only runs while the PR is in the search).
+
+- **Only the daemon's own login is ever removed.** The DELETE names one
+  reviewer, so a human reviewer or a second bot in the same
+  `requested_reviewers` array is untouched.
+- One `INFO` line records the removal with its evidence: the PR, the head, the
+  verdict review's URL, why the round is closed, and who was left in place.
+- A failed DELETE is logged and dropped — never raised, not even on a
+  throttle. The decision is already made; the PR simply stays in the set and
+  the next poll retries. Withdrawing a request needs write/triage permission on
+  the repo, which is more than reviewing needs: a reviewer identity that only
+  has read access will see the DELETE 403 every poll and keep the pre-0.16.5
+  behaviour, with the failure named in the log rather than silent.
+- Round accounting, verdict envelopes, the cap and re-entry semantics are all
+  untouched. A fresh operator re-request after a withdrawal surfaces the PR
+  again and opens a round normally.
+
+**Identity drift.** If the round's newest review carries a different login than
+the one the request is held against, the daemon logs one loud warning naming
+both. That mismatch means GitHub-native request consumption can never work for
+that deployment's configuration — every closed round will leave a dangling
+request behind — so it is a config alarm, deduped on the pair of logins rather
+than repeated per poll.
 
 ### Operator re-entry after a cap-out
 

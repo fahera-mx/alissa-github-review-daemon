@@ -399,6 +399,20 @@ def capout_kind(head_sha: str, granted: int) -> str:
     return f"capout:{head_sha}:{granted}"
 
 
+def identity_drift_kind(requested: str, author: str) -> str:
+    """The ping-ledger kind that dedupes ONE request/author identity-drift warning.
+
+    Keyed on the CONDITION -- the ordered pair of logins -- and not merely on
+    the PR, so a deployment whose reviewer identity is later fixed (or broken a
+    second, different way) says so again instead of staying quiet because it
+    once warned about something else here. Durable rather than in-memory
+    because this is a configuration alarm: it is true of every PR the daemon
+    touches, so a restart re-stating it per PR would be a wall of noise, not
+    new information.
+    """
+    return f"reqdrift:{requested}->{author}"
+
+
 def _now() -> str:
     """The activity comment's timestamp format (UTC, seconds)."""
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
@@ -646,6 +660,13 @@ class ReviewWatcher:
 
         converged = self._convergence_reason(my_reviews, task, pr.head_sha)
         if converged is not None:
+            # THE terminal branch: a verdict of record exists at the current
+            # head, so no round k+1 can be owed from here -- every path that
+            # could open one (head moved, non-approve verdict, cap re-entry
+            # ack) is either upstream of this return or unreachable past it.
+            # That is what makes it the only safe place to withdraw a dangling
+            # self review request; see _clear_own_review_request.
+            self._clear_own_review_request(pr, my_reviews, converged)
             return Decision(Action.CONVERGED, converged, completed)
 
         # The effective cap is the configured one plus every re-entry an
@@ -1289,6 +1310,124 @@ class ReviewWatcher:
             return f"newest verdict envelope on {task.ref} reads approve"
 
         return None
+
+    # -- round close-out ---------------------------------------------------
+
+    def _clear_own_review_request(
+        self, pr: PullRequest, my_reviews: list[Review], why: str
+    ) -> None:
+        """Withdraw this daemon's own dangling review request on a closed round.
+
+        Normally there is nothing to do: GitHub consumes a review request the
+        moment the requested identity submits a review, so a converged PR has
+        no request left and drops straight out of `review_requests`. The
+        request survives when the review that closed the round was NOT posted
+        by the requested identity -- studio #298, where a ready-flip
+        auto-requested `alissa-app` while the round ran under another login.
+        Nothing then ever consumes it, so the PR stays in the search set and
+        every poll pays a full re-verification (PR fetch, reviews, task,
+        envelope count) to reach this same no-op. Removing the request is what
+        ends that: the search is the evaluation set, so the PR leaves it.
+
+        Three properties this must not violate:
+
+        * Only ever OUR login. Human reviewers and any second bot in the same
+          `requested_reviewers` array are somebody else's pending work, and a
+          daemon that withdrew them would silently cancel real reviews.
+        * Only from the terminal branch. The caller is the one return where a
+          verdict of record stands at the current head and no further round can
+          be owed; a request withdrawn while a round could still open would
+          delete the very trigger that surfaces the PR.
+        * Never blocking. The removal is a side effect of a decision already
+          made, so any failure -- including a throttled one -- is logged and
+          dropped rather than raised: the pass keeps walking and the next poll
+          retries, which is strictly better than converting a no-op into an
+          aborted pass. (Deliberately unlike the read paths, which let
+          RateLimited reach run_forever's backoff.)
+        """
+        mine = self.github.login
+        if mine not in pr.requested_reviewers:
+            return
+
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] would withdraw the dangling review request for %s on "
+                "%s — the round is closed (%s)",
+                mine, pr.slug, why,
+            )
+            return
+
+        # Before the removal, because it is a statement about the deployment's
+        # configuration and stays true whether or not the DELETE lands.
+        self._warn_identity_drift(pr)
+
+        verdict = my_reviews[-1] if my_reviews else None
+        try:
+            self.github.remove_review_request(pr.owner, pr.repo, pr.number, mine)
+        except Exception as exc:
+            log.warning(
+                "%s: could not withdraw the dangling review request for %s (%s) "
+                "— the closed round will be re-evaluated next poll and the "
+                "removal retried",
+                pr.slug, mine, exc,
+            )
+            return
+
+        others = [login for login in pr.requested_reviewers if login != mine]
+        log.info(
+            "%s round close-out: withdrew the dangling review request for %s — "
+            "%s; verdict of record %s at head %s. Left in place: %s",
+            pr.slug,
+            mine,
+            why,
+            (verdict.url if verdict is not None else "none on GitHub"),
+            pr.head_sha[:8],
+            ", ".join(others) if others else "no other reviewers",
+        )
+
+    def _warn_identity_drift(self, pr: PullRequest) -> None:
+        """Page once when the round's write-up landed under a login GitHub does
+        not hold the request against.
+
+        This is the #298 shape: the request names one identity, the newest
+        review on the PR carries another, and GitHub only ever consumes a
+        request when the REQUESTED login submits. Withdrawing the request
+        cleans up this PR; the config that produced it will produce the next
+        one too, so it is worth one loud line naming both identities.
+
+        Diagnostic only -- it never gates the removal, and an unreadable review
+        list just means no warning, not a stalled close-out.
+        """
+        try:
+            reviews = self.github.reviews(pr.owner, pr.repo, pr.number)
+        except Exception as exc:
+            log.debug("%s: could not read reviews for the drift check: %s", pr.slug, exc)
+            return
+
+        substantive = [r for r in reviews if r.is_substantive]
+        if not substantive:
+            return
+        newest = max(substantive, key=lambda r: r.submitted_at)
+        if newest.author == self.github.login:
+            return
+
+        kind = identity_drift_kind(self.github.login, newest.author)
+        if self.state.pinged(pr.full_name, pr.number, kind):
+            return
+        self.state.record_ping(pr.full_name, pr.number, kind)
+        log.warning(
+            "IDENTITY DRIFT on %s: the review request is held against %r but "
+            "the round's newest review was submitted by %r (%s). GitHub only "
+            "consumes a review request when the REQUESTED login submits, so "
+            "native review consumption cannot work for this deployment: every "
+            "closed round will leave a dangling request for the daemon to "
+            "withdraw. Point reviewer_login/reviewer_token_env at one identity "
+            "and have that identity post the verdict of record.",
+            pr.slug,
+            self.github.login,
+            newest.author,
+            newest.url or "no url",
+        )
 
     # -- reap sweep --------------------------------------------------------
 

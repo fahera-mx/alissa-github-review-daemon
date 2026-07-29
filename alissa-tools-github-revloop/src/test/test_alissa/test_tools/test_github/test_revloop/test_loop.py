@@ -89,10 +89,36 @@ class FakeGitHub:
         # says otherwise (a force-push).
         self.commits: list[str] = [pr.head_sha, "abc123"]
         self.commits_error: BaseException | None = None
+        # Review requests withdrawn through remove_review_request, and an
+        # optional failure to raise instead of withdrawing.
+        self.removed: list[str] = []
+        self.remove_error: BaseException | None = None
+        self.reviews_error: BaseException | None = None
 
     def pull_request(self, owner, repo, number):
         self.pr_fetches += 1
         return self._pr
+
+    def reviews(self, owner, repo, number):
+        if self.reviews_error:
+            raise self.reviews_error
+        return list(self._reviews)
+
+    def remove_review_request(self, owner, repo, number, login):
+        """Mirrors GitHub.remove_review_request AND what GitHub does next: the
+        request drops off the PR, and -- because the search IS
+        review-requested:@me -- withdrawing my own drops the PR out of it."""
+        if self.remove_error:
+            raise self.remove_error
+        self.removed.append(login)
+        self._pr = dataclasses.replace(
+            self._pr,
+            requested_reviewers=tuple(
+                r for r in self._pr.requested_reviewers if r != login
+            ),
+        )
+        if login == self.login:
+            self.requests = [r for r in self.requests if r != (owner, repo, number)]
 
     def my_reviews(self, owner, repo, number):
         # Mirrors GitHub.my_reviews: mine, substantive, oldest first.
@@ -209,7 +235,15 @@ class FakeTask:
     is_open = True
 
 
-def make_pr(*, draft=False, author="teammate", sha="abc123", state="open", merged=False) -> PullRequest:
+def make_pr(
+    *,
+    draft=False,
+    author="teammate",
+    sha="abc123",
+    state="open",
+    merged=False,
+    requested=(),
+) -> PullRequest:
     return PullRequest(
         owner=OWNER,
         repo=REPO,
@@ -221,6 +255,7 @@ def make_pr(*, draft=False, author="teammate", sha="abc123", state="open", merge
         url=f"https://github.com/{SLUG}/pull/{NUMBER}",
         state=state,
         merged=merged,
+        requested_reviewers=tuple(requested),
     )
 
 
@@ -4011,3 +4046,293 @@ def test_the_length_ceiling_no_longer_drives_redaction():
     assert _is_credential_shaped("A_LONG_BUT_CLEARLY_DELIMITED_VARIABLE_NAME") is False
     assert _is_credential_shaped("a" * 40) is True, "an undelimited alnum run is"
     assert _is_credential_shaped("ghp_" + "a" * 36) is True
+
+
+# -- round close-out: the dangling self review request (issue #54) ----------
+#
+# A review request is normally consumed by the requested identity submitting a
+# review. When it is not, the PR stays in review-requested:@me forever and
+# every poll pays a full re-verification to reach the same no-op. Close-out
+# withdraws the daemon's OWN request -- and only in the terminal branch.
+
+
+def _converged(config, **pr_kwargs):
+    """A PR whose round-1 approve stands at the current head."""
+    pr = make_pr(**pr_kwargs)
+    return watcher(config, pr, [review("APPROVED")])
+
+
+def test_a_closed_round_withdraws_its_own_dangling_review_request(config):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert gh.removed == ["alissa-app"]
+
+
+def test_close_out_removes_only_the_daemons_own_login(config):
+    """Human reviewers and any second bot are somebody else's pending work."""
+    w, gh, _ = _converged(
+        config, requested=("human-dev", "alissa-app", "other-bot")
+    )
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.removed == ["alissa-app"]
+    assert gh._pr.requested_reviewers == ("human-dev", "other-bot")
+
+
+def test_a_closed_round_with_no_dangling_request_calls_nothing(config):
+    """The normal case: the verdict post already consumed the request."""
+    w, gh, _ = _converged(config)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert gh.removed == []
+
+
+def test_no_removal_once_the_head_moved_past_the_verdict(config):
+    """Round k+1 is owed, and the request is what will surface it."""
+    pr = make_pr(sha="def456", requested=("alissa-app",))
+    w, gh, _ = watcher(config, pr, [review("APPROVED", sha="abc123")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert gh.removed == []
+
+
+def test_no_removal_on_a_request_changes_round(config):
+    w, gh, _ = watcher(
+        config,
+        make_pr(requested=("alissa-app",)),
+        [review("COMMENTED")],
+        verdict="request_changes",
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert gh.removed == []
+
+
+def test_no_removal_while_a_round_is_in_flight(config):
+    pr = make_pr(requested=("alissa-app",))
+    w, gh, _ = watcher(config, pr, [])
+    _record(w, pr, 1)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert gh.removed == []
+
+
+def test_no_removal_on_a_capped_pr(config):
+    """A capped PR is exactly where a re-entry ack can still open a round, and
+    the ack scan only runs while the PR is in the search — withdrawing its
+    request there would delete the operator's own way back in."""
+    reviews = [review("COMMENTED", at=f"2026-07-18T1{i}:00:00Z") for i in range(3)]
+    w, gh, _ = watcher(
+        config, make_pr(requested=("alissa-app",)), reviews, verdict=None
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+    assert gh.removed == []
+    # ...and again on the next poll, when the page is already delivered.
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert gh.removed == []
+
+
+def test_no_removal_when_a_round_still_owes_its_native_verdict(config):
+    """An envelope ahead of the native count means the round is not closed:
+    the post that is owed is what consumes the request."""
+    w, gh, _ = watcher(
+        config,
+        make_pr(requested=("alissa-app",)),
+        [review("COMMENTED")],
+        verdict="approve",
+        verdict_count=2,
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.removed == []
+
+
+def test_dry_run_withdraws_nothing(config, caplog):
+    config = dataclasses.replace(config, dry_run=True)
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    assert gh.removed == []
+    assert "[dry-run] would withdraw" in caplog.text
+
+
+def test_a_failed_delete_logs_and_never_blocks_the_walk(config, caplog):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "422 Unprocessable Entity")
+
+    with caplog.at_level(logging.WARNING):
+        results = w.poll_once()
+
+    assert [d.action for _, d in results] == [Action.CONVERGED]
+    assert "could not withdraw the dangling review request" in caplog.text
+
+
+def test_a_throttled_delete_does_not_abort_the_pass(config):
+    """RateLimited reaches run_forever's backoff from the READ paths. Here the
+    decision is already made and the removal is a side effect of it, so a
+    throttle must not turn a no-op into an aborted pass — the next poll
+    retries."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = RateLimited("secondary rate limit")
+
+    results = w.poll_once()
+
+    assert [d.action for _, d in results] == [Action.CONVERGED]
+    assert gh.removed == []
+
+
+def test_the_withdrawn_pr_leaves_the_per_poll_evaluation_set(config):
+    """AC2: no repeated full re-verification passes for a closed round."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    first = w.poll_once()
+    assert [d.action for _, d in first] == [Action.CONVERGED]
+    assert gh.pr_fetches == 1
+
+    second = w.poll_once()
+
+    assert second == [], "the closed round must not be evaluated again"
+    assert gh.pr_fetches == 1, "and must not be re-fetched"
+
+
+def test_a_failed_removal_keeps_the_pr_in_the_set_for_the_retry(config):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+
+    w.poll_once()
+    w.poll_once()
+
+    assert gh.pr_fetches == 2, "still evaluated — nothing was withdrawn"
+
+
+def test_identity_drift_warns_once_naming_both_identities(config, caplog):
+    """The #298 shape: the request is held against one login, the round's
+    newest review carries another, so GitHub can never consume it."""
+    reviews = [
+        review("APPROVED", at="2026-07-18T10:00:00Z"),
+        dataclasses.replace(
+            review("COMMENTED", at="2026-07-18T11:00:00Z"), author="RHDZMOTA"
+        ),
+    ]
+    w, gh, _ = watcher(
+        config, make_pr(requested=("alissa-app",)), reviews, verdict_count=1
+    )
+    # The removal keeps failing, so the drift path is walked twice.
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+
+    with caplog.at_level(logging.WARNING):
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    drift = [r for r in caplog.records if "IDENTITY DRIFT" in r.getMessage()]
+    assert len(drift) == 1, "a config alarm, not a per-poll line"
+    assert "'alissa-app'" in drift[0].getMessage()
+    assert "'RHDZMOTA'" in drift[0].getMessage()
+
+
+def test_no_drift_warning_when_the_verdict_of_record_is_ours(config, caplog):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    with caplog.at_level(logging.WARNING):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "IDENTITY DRIFT" not in caplog.text
+    assert gh.removed == ["alissa-app"]
+
+
+def test_an_unreadable_review_list_does_not_block_the_removal(config):
+    """The drift check is a diagnostic; close-out does not depend on it."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.reviews_error = CommandError(["gh"], 1, "500")
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.removed == ["alissa-app"]
+
+
+def test_the_removal_log_line_carries_its_evidence(config, caplog):
+    w, gh, _ = _converged(config, requested=("alissa-app", "human-dev"))
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    line = next(
+        r.getMessage() for r in caplog.records if "round close-out" in r.getMessage()
+    )
+    assert SLUG in line and str(NUMBER) in line       # which PR
+    assert "abc123"[:8] in line                       # at which head
+    assert "#r1" in line                              # the verdict of record
+    assert "APPROVED" in line                         # and why it is closed
+    assert "human-dev" in line                        # what was left alone
+
+
+def test_the_drift_kind_is_keyed_on_both_identities():
+    from alissa.tools.github.revloop.loop import identity_drift_kind
+    assert identity_drift_kind("alissa-app", "RHDZMOTA") != identity_drift_kind(
+        "alissa-app", "someone-else"
+    )
+
+
+def test_the_delete_names_exactly_one_reviewer():
+    """The wire shape the fake cannot check. GitHub's DELETE removes only what
+    the payload names, so naming one login is what makes the own-identity-only
+    guard true on the wire and not just in the caller."""
+    gh = GitHub("alissa-app")
+    seen: dict = {}
+
+    def fake_api(*args, **kwargs):
+        seen["argv"], seen["kwargs"] = args, kwargs
+        return None
+
+    gh._api = fake_api
+    gh.remove_review_request(OWNER, REPO, NUMBER, "alissa-app")
+
+    assert seen["argv"] == (
+        "-X",
+        "DELETE",
+        f"repos/{OWNER}/{REPO}/pulls/{NUMBER}/requested_reviewers",
+        "-f",
+        "reviewers[]=alissa-app",
+    )
+    assert seen["kwargs"] == {"forbidden_is_rate_limit": False}, (
+        "a 403 here is authorization, not throttling"
+    )
+
+
+def test_the_pr_carries_the_pending_review_requests():
+    """Read off the PR payload the loop already fetches — knowing whether the
+    request dangles costs no extra call. Users only: a requested TEAM is never
+    something this daemon may withdraw."""
+    gh = GitHub("alissa-app")
+    gh._api = lambda *a, **k: {
+        "title": "Add widget cache",
+        "user": {"login": "teammate"},
+        "head": {"sha": "abc123"},
+        "requested_reviewers": [{"login": "alissa-app"}, {"login": "human-dev"}, {}],
+        "requested_teams": [{"slug": "platform"}],
+    }
+
+    pr = gh.pull_request(OWNER, REPO, NUMBER)
+
+    assert pr.requested_reviewers == ("alissa-app", "human-dev")
+
+
+def test_a_pr_with_no_pending_requests_reads_as_empty():
+    gh = GitHub("alissa-app")
+    gh._api = lambda *a, **k: {"head": {"sha": "abc123"}}
+    assert gh.pull_request(OWNER, REPO, NUMBER).requested_reviewers == ()
