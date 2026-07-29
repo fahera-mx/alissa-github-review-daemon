@@ -47,8 +47,6 @@ from alissa.tools.github.revloop import ghclient as ghclient_module
 from alissa.tools.github.revloop import loop as loop_module
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
-    drift_probe_kind,
-    identity_drift_kind,
     MAX_REENTRY_ROUNDS,
     MAX_VERDICT_POST_ATTEMPTS,
     REENTRY_GRAMMAR,
@@ -58,6 +56,8 @@ from alissa.tools.github.revloop.loop import (
     Action,
     ReviewWatcher,
     deferral_activity_kind,
+    drift_probe_kind,
+    identity_drift_kind,
     parse_reentry_ack,
     session_name,
     stalled_kind,
@@ -4583,3 +4583,69 @@ def test_a_dry_run_does_not_silence_itself_either(config, caplog):
 
     assert "IDENTITY DRIFT" in caplog.text
     assert gh.removed == [], "still takes nothing on GitHub"
+
+
+# -- round-3 findings (follow-up to PR #55) --------------------------------
+
+
+def _dry(config):
+    return dataclasses.replace(config, dry_run=True)
+
+
+def test_a_dry_run_daemon_announces_a_drift_once_per_process(config, caplog):
+    """[minor] Skipping the durable gate left the block re-emitted every poll —
+    the round-1 arithmetic (~2,880/day at a 30s interval) moved into the
+    diagnostic lane. `dry_run` is a config key and composes with run_forever,
+    so `--once` being the documented recipe does not bound it."""
+    w, gh, _ = _drift_watcher(_dry(config))
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(10):
+            w.evaluate(OWNER, REPO, NUMBER)
+
+    drift = [r for r in caplog.records if "IDENTITY DRIFT" in r.getMessage()]
+    assert len(drift) == 1, "once per process, not once per poll"
+    assert gh.reviews_calls == 1, "and the read it needs is bounded with it"
+
+
+def test_a_fresh_dry_run_process_still_announces(config, caplog):
+    """The bound must not become a suppression: the gate is process-lifetime
+    precisely so a new run always says everything it has to say."""
+    state = State(config.state_db)
+    first, _, _ = _drift_watcher(_dry(config), state=state)
+    first.evaluate(OWNER, REPO, NUMBER)
+
+    second, _, _ = _drift_watcher(_dry(config), state=state)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        second.evaluate(OWNER, REPO, NUMBER)
+
+    assert "IDENTITY DRIFT" in caplog.text
+
+
+def test_the_dry_run_bound_is_not_written_to_the_ledger(config):
+    """Bounding dry-run must not reintroduce the round-2 regression."""
+    w, _, _ = _drift_watcher(_dry(config))
+
+    for _ in range(3):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not w.state.pinged(SLUG, NUMBER, drift_probe_kind("abc123"))
+    assert not w.state.pinged(
+        SLUG, NUMBER, identity_drift_kind("alissa-app", "RHDZMOTA")
+    )
+
+
+def test_a_production_pass_is_not_bounded_by_a_dry_run_one(config, caplog):
+    """The two gates share a shape, not a store — neither can close the other."""
+    state = State(config.state_db)
+    dry, _, _ = _drift_watcher(_dry(config), state=state)
+    dry.evaluate(OWNER, REPO, NUMBER)
+
+    live, gh, _ = _drift_watcher(config, state=state)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        live.evaluate(OWNER, REPO, NUMBER)
+
+    assert "IDENTITY DRIFT" in caplog.text
+    assert gh.removed == ["alissa-app"]

@@ -291,8 +291,12 @@ both. That mismatch means GitHub-native request consumption can never work for
 that deployment's configuration — every closed round will leave a dangling
 request behind. It is deduped once per PR per pair of logins (durable, so a
 restart does not re-announce it, and a *changed* drift does), and the read it
-needs runs at most once per PR per head. It is emitted in `--dry-run` too:
-that is the mode an operator reaches for to diagnose exactly this.
+needs runs at most once per PR per head. It is emitted in `--dry-run` too —
+that is the mode an operator reaches for to diagnose exactly this — where
+**neither bound is durable**: both are held for the life of the process
+instead, so a diagnostic pass cannot silence production and a production pass
+cannot silence the diagnostic, while a daemon left running in dry-run still
+says it only once.
 
 ### Operator re-entry after a cap-out
 
