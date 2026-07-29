@@ -472,3 +472,12 @@ actually reaching a tmux session. Both need a PR authored by an account *other*
 than the reviewer identity — GitHub forbids requesting review from the PR author,
 so a self-authored PR never fires the trigger at all. Run `--once --dry-run -v`
 against the first real request before letting it run unattended.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE) — the same license applies to
+the published `alissa-tools-github-revloop` distribution, which ships `LICENSE`
+and [`NOTICE`](NOTICE) alongside the code.
+
+"Alissa" and "Fahera" are trademarks of CORE FAHERA ENTERPRISE HOLDINGS S. DE
+R.L.; the license does not grant permission to use them.
