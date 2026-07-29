@@ -262,8 +262,12 @@ resolve a bare name at all. The probe is paid once per session name, not once pe
 poll (its answer, including "unresolvable", is cached for the session's lifetime)
 — *unless a candidate repo fails to answer*, in which case that pass is discarded
 uncached and re-probed next poll rather than pinning what it may have half-seen.
-A failure that does not clear (a repo that hangs rather than 404s) is bounded by
-a page-worthy log after three consecutive un-answerable probes.
+Each such pass stops at the first candidate that will not answer, so the cost is
+the allowlist prefix up to that repo rather than the whole list — and a failure
+that does not clear (a repo that hangs rather than 404s) is made *visible* by a
+page-worthy log, naming the repo, after three consecutive un-answerable probes.
+The probing itself continues at full cadence until it clears; the log bounds how
+long it stays invisible, not how long it runs.
 
 **Known v1 limits of bare-name resolution.** The allowlist *bounds the search*; it
 does not prove ownership, because a bare `review-pr-<n>` carries no repo. Two

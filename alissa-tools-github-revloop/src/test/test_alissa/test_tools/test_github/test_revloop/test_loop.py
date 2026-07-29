@@ -1992,23 +1992,85 @@ def test_a_probe_that_never_answers_pages_once_and_re_arms_on_recovery(config, c
     _resolve_prs(gh, {(SLUG, 7): merged}, failing=blip)
     _live(al, "review-pr-7")
 
+    def pages():
+        return [r for r in caplog.records if "PROBE STUCK" in r.message]
+
     with caplog.at_level(logging.ERROR):
         for _ in range(PROBE_TAINT_ALARM - 1):
             w.sweep_sessions()
         assert caplog.records == [], "a blip must not page"
 
         w.sweep_sessions()
-        pages = [r for r in caplog.records if "PROBE STUCK" in r.message]
-        assert len(pages) == 1
-        assert "review-pr-7" in pages[0].getMessage()
+        assert len(pages()) == 1
+        # The page must NAME the repo an operator has to go look at: with a
+        # 7-repo allowlist, "a watched repo" means bisecting it by hand.
+        assert "review-pr-7" in pages()[0].getMessage()
+        assert SLUG in pages()[0].getMessage()
 
         w.sweep_sessions()  # still stuck — once per episode, not once per poll
-        assert len([r for r in caplog.records if "PROBE STUCK" in r.message]) == 1
+        assert len(pages()) == 1
 
         blip.clear()
         w.sweep_sessions()
         assert al.killed == ["review-pr-7"]
         assert w._probe_taint == {}, "a pass that answered clears the counter"
+
+        # Re-arm for real, which is what this test is named after: a fresh
+        # episode must page again, not stay silent behind the first one.
+        al.sessions = []
+        _live(al, "review-pr-8")
+        blip.add(SLUG)
+        for _ in range(PROBE_TAINT_ALARM):
+            w.sweep_sessions()
+        assert len(pages()) == 2
+        assert "review-pr-8" in pages()[1].getMessage()
+
+
+def test_the_stuck_probe_page_names_the_candidate_that_went_dark(config, caplog):
+    """`_check_session_cap` set this standard one commit earlier: an alarm
+    whose explanation is invisible is an alarm an operator cannot act on. The
+    slug is known only inside `_probe_allowlist`, so the failure carries it
+    out rather than dropping it at the sentinel boundary."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, "acme/a", "acme/b", SLUG), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged}, failing={"acme/b"})
+    _live(al, "review-pr-7")
+
+    with caplog.at_level(logging.ERROR):
+        for _ in range(PROBE_TAINT_ALARM):
+            w.sweep_sessions()
+
+    page = next(r.getMessage() for r in caplog.records if "PROBE STUCK" in r.message)
+    assert "acme/b" in page, "the stuck repo must be named at ERROR, not only at DEBUG"
+    assert "consecutive probe attempts" in page, "attempts are not polls"
+
+
+def test_a_ledger_backed_fetch_condition_warns_once_not_every_poll(config, caplog):
+    """A ledger-backed 404 means the repo was deleted, transferred or renamed —
+    a condition that does not self-clear, on a path that re-fetches every
+    sweep by design. Same shape as the two sibling alarms: fire on the
+    transition, stay quiet while it holds, re-arm when it clears."""
+    pr = make_pr()
+    # verdict_count=0: round 1 is still in flight, so the recovery sweep below
+    # spares the session instead of reaping it — leaving something to re-warn
+    # about when the condition returns.
+    w, gh, al = watcher(config, pr, [review()], verdict_count=0)
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+    gone = {SLUG}
+    _resolve_prs(gh, {(SLUG, NUMBER): pr}, failing=gone)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            w.sweep_sessions()
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+        gone.clear()  # it answers again — the warning re-arms
+        w.sweep_sessions()
+        gone.add(SLUG)
+        w.sweep_sessions()
+
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
 
 
 def test_the_taint_counter_is_pruned_with_the_live_list(config):
@@ -2051,7 +2113,9 @@ def test_probe_allowlist_cannot_represent_a_target_it_does_not_trust(config):
     assert w._probe_allowlist(ses, ref, {}) is None  # definitely ambiguous
 
     _resolve_prs(gh, {(SLUG, 7): merged}, failing={SLUG})
-    assert w._probe_allowlist(ses, ref, {}) is FETCH_FAILED
+    failed = w._probe_allowlist(ses, ref, {})
+    assert isinstance(failed, type(FETCH_FAILED))
+    assert failed.repo == SLUG, "the failure names the candidate that went dark"
 
 
 def test_a_ledger_backed_404_stays_visible_at_the_containers_log_level(config, caplog):

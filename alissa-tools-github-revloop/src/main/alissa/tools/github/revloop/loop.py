@@ -41,18 +41,23 @@ from .state import State
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
 class _FetchFailed:
     """Sentinel: the PR fetch did not answer, as distinct from "no such PR".
 
-    A distinct type rather than a second None, because the reap sweep now
-    caches what a probe concluded: "GitHub says this repo has no PR #n" is a
-    fact worth pinning, "the call blew up" is not. See loop._fetch_pr.
+    A distinct type rather than a second None, because the reap sweep caches
+    what a probe concluded: "GitHub says this repo has no PR #n" is a fact
+    worth pinning, "the call blew up" is not. See loop._fetch_pr.
+
+    `repo` names the candidate that failed, when the failure was noticed
+    somewhere that knows which one it was (_probe_allowlist does; _fetch_pr's
+    caller always knows already, so it gets the bare singleton). It exists so
+    the stuck-probe page can NAME the repo an operator has to go look at --
+    without it the page says "a watched repo", and finding which one means
+    bisecting the allowlist by hand or raising a paging daemon to DEBUG.
     """
 
-    __slots__ = ()
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return "FETCH_FAILED"
+    repo: "str | None" = None
 
 
 FETCH_FAILED = _FetchFailed()
@@ -472,6 +477,10 @@ class ReviewWatcher:
         # The surviving-session set the cap alarm last paged on, so a standing
         # over-cap condition pages once per episode -- see _check_session_cap.
         self._paged_cap: frozenset[str] | None = None
+        # (repo, number) pairs already warned about, so a fetch condition that
+        # does not self-clear is reported on its transition rather than every
+        # poll -- see _fetch_pr. Discarded the moment that fetch answers again.
+        self._warned_fetch: set[tuple[str, int]] = set()
         # Session name -> consecutive passes whose probe could not be answered.
         # Bounded like _probe_cache (pruned against the live list); see
         # _note_probe_taint for what it guards against.
@@ -1077,23 +1086,21 @@ class ReviewWatcher:
 
         The probe is paid ONCE per session name -- unless a candidate fetch
         fails to answer, in which case that pass is discarded uncached and
-        re-probed next poll (see _probe_allowlist, and _note_probe_taint for
-        the alarm bounding a failure that does not clear). Its answer -- the
-        resolved
-        (repo, number), or a sticky None for "could not be resolved" -- is
-        cached on the watcher, because the resolution is a function of the
-        number and the repos allowlist, and the allowlist cannot change under
-        a running process. (It is NOT because the name is unique per spawn:
-        the nonce that makes it so belongs to ledger-backed daemon names,
-        which return above without touching this cache.) Without that, a
-        session spared on an open PR (the
-        common case: a finished round waits idle for the implementer) re-ran
-        the whole allowlist sweep on every poll for the life of the PR, which
-        at 7 repos and a 30s interval is ~840 REST calls an hour for one
-        session. The sticky None never re-probes within a process, so an
-        ambiguity that later clears is not noticed until a restart -- the safe
-        direction (spare, never guess), and the alternative is exactly the
-        cost above.
+        re-probed next attempt (see _probe_allowlist, and _note_probe_taint
+        for the alarm that surfaces a failure which does not clear). Its
+        answer -- the resolved (repo, number), or a sticky None for "could not
+        be resolved" -- is cached on the watcher, because the resolution is a
+        function of the number and the repos allowlist, and the allowlist
+        cannot change under a running process. (It is NOT because the name is
+        unique per spawn: the nonce that makes it so belongs to ledger-backed
+        daemon names, which return above without touching this cache.)
+        Without that, a session spared on an open PR -- the common case, a
+        finished round waiting idle for the implementer -- re-ran the whole
+        allowlist sweep on every poll for the life of the PR, which at 7 repos
+        and a 30s interval is ~840 REST calls an hour for one session. The
+        sticky None never re-probes within a process, so an ambiguity that
+        later clears is not noticed until a restart -- the safe direction
+        (spare, never guess), and the alternative is exactly the cost above.
         """
         if row is not None:
             return self._fetched_pr(ses, holdouts, prs, row["repo"], row["number"])
@@ -1107,7 +1114,7 @@ class ReviewWatcher:
         else:
             probed = self._probe_allowlist(ses, ref, prs)
             if isinstance(probed, _FetchFailed):
-                self._note_probe_taint(ses, ref)
+                self._note_probe_taint(ses, ref, probed.repo)
                 self._hold(
                     holdouts, ses,
                     f"a probe fetch for PR #{ref.number} failed — re-probing "
@@ -1179,7 +1186,9 @@ class ReviewWatcher:
                     "abandoning the pass rather than caching what it saw",
                     ref.number, ses.name, repo_slug,
                 )
-                return FETCH_FAILED
+                # Carries the slug: this is the only place that knows WHICH
+                # candidate went dark, and the page is useless without it.
+                return _FetchFailed(repo_slug)
             if isinstance(found, PullRequest):
                 hits.append(repo_slug)
         if len(hits) != 1:
@@ -1190,7 +1199,9 @@ class ReviewWatcher:
             return None
         return (hits[0], ref.number)
 
-    def _note_probe_taint(self, ses: ManagedSession, ref: SessionRef) -> None:
+    def _note_probe_taint(
+        self, ses: ManagedSession, ref: SessionRef, repo: "str | None"
+    ) -> None:
         """Count consecutive un-answerable probes, and page once past the floor.
 
         Refusing to cache an error-tainted pass is correct but unbounded on its
@@ -1205,16 +1216,24 @@ class ReviewWatcher:
         Once per episode, like the cap alarm and for the same reason (this runs
         every poll); the counter resets on any pass that answers, so a recovery
         re-arms the alarm for the next episode.
+
+        The unit is PROBE ATTEMPTS, not polls, and the page says so: a session
+        that goes busy or falls back inside the reap grace returns above
+        _resolve_pr and so neither increments nor resets the count, which then
+        survives the gap and resumes. That is deliberate -- a repo that will
+        not answer is no less stuck for the session having been briefly busy --
+        but it means N attempts can span an arbitrary stretch of wall clock.
         """
         count = self._probe_taint.get(ses.name, 0) + 1
         self._probe_taint[ses.name] = count
         if count == PROBE_TAINT_ALARM:
             log.error(
-                "REVIEWER SESSION PROBE STUCK: %s has been re-probed %d polls "
-                "running because a watched repo will not answer for PR #%d — "
-                "the whole allowlist is re-swept every poll and the session "
-                "cannot be resolved or reaped until it clears",
-                ses.name, count, ref.number,
+                "REVIEWER SESSION PROBE STUCK: %s has failed to resolve on %d "
+                "consecutive probe attempts because watched repo %s will not "
+                "answer for PR #%d — every attempt re-sweeps the allowlist up "
+                "to that repo, and the session cannot be resolved or reaped "
+                "until it clears",
+                ses.name, count, repo or "(unknown)", ref.number,
             )
 
     def _name_candidates(self, ref: SessionRef) -> list[str]:
@@ -1360,13 +1379,25 @@ class ReviewWatcher:
             # 404 on a PR this daemon recorded in its own spawn ledger means
             # the repo was deleted, transferred or renamed under it -- an
             # operator fact, and the container runs at INFO.
-            log.log(
-                logging.DEBUG if quiet else logging.WARNING,
-                "reap sweep: %s %s#%d: %s",
-                "no such PR" if missing else "could not fetch",
-                repo_slug, number, exc,
-            )
+            #
+            # Warned ONCE per episode, though. This path re-fetches every
+            # sweep by design (it is the fetch that can turn a session
+            # reapable), and the conditions it reports -- a repo deleted or
+            # renamed under the ledger, a candidate gone dark -- do not
+            # self-clear, so an ungated warning is ~2,880 identical lines a
+            # day per session at a 30s interval, in the same log as this
+            # sweep's two ERROR pages. Same shape as _check_session_cap and
+            # _note_probe_taint: fire on the transition, stay quiet while it
+            # holds, re-arm when it clears.
+            message = "no such PR" if missing else "could not fetch"
+            if quiet:
+                log.debug("reap sweep: %s %s#%d: %s", message, repo_slug, number, exc)
+            elif key not in self._warned_fetch:
+                self._warned_fetch.add(key)
+                log.warning("reap sweep: %s %s#%d: %s", message, repo_slug, number, exc)
             prs[key] = None if missing else FETCH_FAILED
+        else:
+            self._warned_fetch.discard(key)  # it answered -- re-arm
         return prs[key]
 
     def _fetched_pr(
