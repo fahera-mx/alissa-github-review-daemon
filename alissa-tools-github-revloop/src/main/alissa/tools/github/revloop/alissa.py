@@ -44,9 +44,86 @@ class Task:
         return self.status in OPEN_STATUSES
 
 
-# The namespace loop.session_name() spawns reviewers into; the reap sweep only
-# ever considers sessions under it.
+# The namespace loop.session_name() spawns reviewers into. Kept as the
+# display-level answer to "is this session in the reviewer namespace?" (the
+# console marks unmanaged sessions with it); the REAP path uses the stricter
+# grammar below, because a prefix is not a strong enough claim of ownership to
+# kill on.
 REVIEW_SESSION_PREFIX = "review-"
+
+# The reviewer-session GRAMMAR. The sweep kills sessions and the worker
+# container is shared with other lanes (`develop-*`, `fix-*`, `maintain-*`,
+# ...), so only a name that parses as one of the two shapes the review loop
+# itself produces is ever a reap candidate; anything else is another daemon's
+# (or a human's) and is never touched. Two shapes, both ours:
+#
+#   review-<repo>-pr<n>-r<k>-<nonce>   this daemon's spawns (loop.session_name)
+#   review-pr-<n>[-r<k>]               the alissa-code-review skill's own
+#                                      procedures (spawn-a-reviewer-session.md,
+#                                      run-the-review-loop.md) -- hand-driven
+#                                      rounds of the SAME loop. No spawn ledger
+#                                      knows about those and nothing reaped
+#                                      them: every session in the 2026-07-28
+#                                      memory incident was of this shape.
+#
+# The daemon shape is matched with a non-greedy repo so a hyphenated repo name
+# (`alissa-github-review-daemon`) still lands in the repo group, and it is
+# anchored on the `-pr<n>-r<k>-<nonce>` tail that loop.session_name always
+# emits. The skill shape carries no repo and no nonce -- that is the whole
+# reason a bare `review-pr-<n>` needs the repos allowlist to be resolvable at
+# all (see loop.ReviewWatcher._resolve_pr).
+_DAEMON_SESSION_RE = re.compile(
+    r"^review-(?P<repo>[a-z0-9-]+?)-pr(?P<number>\d+)-r(?P<round>\d+)-[0-9a-f]{4,16}$"
+)
+_SKILL_SESSION_RE = re.compile(
+    r"^review-pr-(?P<number>\d+)(?:-r(?P<round>\d+))?$"
+)
+
+
+@dataclass(frozen=True)
+class SessionRef:
+    """What a reviewer session's NAME says about the round it is running.
+
+    `repo` is the sanitized repo slug (`session_repo_slug`), not an
+    `owner/repo`: session names never carry the owner. `repo` and `round` are
+    None for the skill shape, which encodes neither.
+    """
+
+    number: int
+    repo: "str | None" = None
+    round: "int | None" = None
+
+
+def session_repo_slug(repo: str) -> str:
+    """The repo component of a session name: tmux-safe, lowercase, no dots.
+
+    Shared by the producer (loop.session_name) and the parser below so the two
+    can never drift -- a rename here that the matcher did not follow would make
+    the daemon stop recognizing its own sessions.
+    """
+    return re.sub(r"[^A-Za-z0-9-]", "-", repo).strip("-").lower()
+
+
+def parse_session_name(name: "str | None") -> "SessionRef | None":
+    """Parse a reviewer session name, or None when it is not one of ours.
+
+    None is the security-relevant answer: it is what keeps the sweep off every
+    other lane's sessions in a shared container.
+    """
+    if not isinstance(name, str):
+        return None
+    for pattern in (_SKILL_SESSION_RE, _DAEMON_SESSION_RE):
+        match = pattern.match(name)
+        if match is None:
+            continue
+        parts = match.groupdict()
+        round_ = parts.get("round")
+        return SessionRef(
+            number=int(parts["number"]),
+            repo=parts.get("repo"),
+            round=int(round_) if round_ else None,
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -61,6 +138,11 @@ class ManagedSession:
     @property
     def is_idle(self) -> bool:
         return self.status == "idle"
+
+    @property
+    def ref(self) -> "SessionRef | None":
+        """What the name says about the round -- see parse_session_name."""
+        return parse_session_name(self.name)
 
 
 def _title_pattern(owner: str, repo: str, number: int) -> re.Pattern[str]:
@@ -257,7 +339,7 @@ class Alissa:
             log.warning("could not set respawn off for %s", session)
 
     def list_review_sessions(self) -> list[ManagedSession]:
-        """The live `review-*` managed sessions, from `alissa tmux ls`.
+        """The live reviewer-grammar managed sessions, from `alissa tmux ls`.
 
         The reap sweep's starting point. Unlike the review-requested search,
         the live session list cannot lose a finished session, so every reap
@@ -265,6 +347,11 @@ class Alissa:
         already gone (self-killed, or killed by an operator) holds no worker
         slot and needs no reap. Raises CommandError upward -- the sweep skips
         this pass and tries again next poll.
+
+        The filter is `parse_session_name`, not the bare `review-` prefix: this
+        list is what the sweep kills from, the container is shared with other
+        daemons, and a name that does not parse as a reviewer session is never
+        enumerated here at all -- so no later bug in the sweep can reach one.
         """
         data = run_json(["alissa", "tmux", "ls", "--json", "--live"], timeout=60) or []
         sessions = []
@@ -272,7 +359,7 @@ class Alissa:
             if not isinstance(row, dict):
                 continue
             name = row.get("name")
-            if isinstance(name, str) and name.startswith(REVIEW_SESSION_PREFIX):
+            if isinstance(name, str) and parse_session_name(name) is not None:
                 last = row.get("lastActivity")
                 sessions.append(
                     ManagedSession(
@@ -284,7 +371,13 @@ class Alissa:
         return sessions
 
     def kill_session(self, session: str) -> None:
-        """Kill a finished reviewer's managed session to free its worker slot.
+        """Kill ONE finished reviewer's managed session to free its worker slot.
+
+        Per-session, always: `alissa tmux kill <name>` and never a server-wide
+        kill. The worker container is shared with every other lane, so a
+        `kill-server` here would take down unrelated daemons' sessions along
+        with the one that is actually finished. A test pins the absence of that
+        verb across the whole package.
 
         Best-effort and idempotent-friendly: the session may already be gone (the
         reviewer self-killed), so a non-zero exit is not an error here. Dry-run

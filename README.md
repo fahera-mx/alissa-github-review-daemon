@@ -112,6 +112,8 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `state_path` | `<workspace-root>/.revloop/state.db` | spawn ledger; per-workspace by default so parallel daemons never share one |
 | `on_missing_review_task` | `spawn_anyway` | `spawn_anyway` \| `warn_and_spawn` \| `skip` |
 | `on_missing_hub` | `skip` | `skip` \| `add` — see *Provisioning new repos* |
+| `reap_grace_seconds` | `1800` | how long a reviewer session must be idle **and** quiet before the sweep reaps it (and before a stale round reads it as dead) |
+| `reap_session_cap` | `6` | more live reviewer sessions than this after a sweep and the daemon logs page-worthy; an alarm threshold, not a capacity limit |
 
 ### Config file discovery
 
@@ -229,18 +231,57 @@ grant).
 
 Reviewers are one-shot per round (CR3), but a finished `claude` sits idle at its
 prompt — the session is not *empty*, so `alissa tmux cleanup` (which only reaps
-empty sessions after a long idle) never frees it, and slots pile up. Two things
+empty sessions after a long idle) never frees it, and slots pile up. Three things
 prevent that:
 
 - **Fast path — the reviewer self-kills.** Its directive's final action, once the
   round is fully closed, is `alissa tmux kill <its own session>`.
-- **Backstop — the daemon reaps.** On each poll it kills the session of any round
-  whose review has already landed (round ≤ submitted-review count), idempotently
-  (a per-session `reaps` ledger), skipped in `--dry-run`. This covers the case
-  where the reviewer forgets to self-kill.
+- **Backstop — the daemon reaps its own finished rounds.** On each poll it kills
+  the session of any round whose verdict has already landed (round ≤ completed
+  rounds), read off the spawn ledger, idempotently (a per-session `reaps`
+  ledger), skipped in `--dry-run`. This covers the case where the reviewer
+  forgets to self-kill.
+- **Terminal-PR reaper — the daemon reaps rounds it never spawned.** The
+  alissa-code-review procedures also spawn reviewers *by hand*
+  (`review-pr-<n>`, `review-pr-<n>-r<k>`); no ledger knows them, and until
+  0.16.2 nothing reaped them. Those are reaped once their **PR is merged or
+  closed**, which ends every round on it without needing any round accounting.
 
 `enqueue_reviewer` sets the reviewer queue's `respawn off`, so a kill (from either
 path) can never trigger a respawn loop.
+
+**What the sweep may touch.** Only sessions whose *name parses* as one of the two
+reviewer shapes above — the worker container is shared with other lanes
+(`develop-*`, `fix-*`, `maintain-*`, …) and a prefix is not a strong enough claim
+of ownership to kill on. Names that do not parse are never even enumerated. For a
+session with no ledger row the number in the name is resolved against the `repos`
+allowlist, which doubles as the ownership boundary: a name carrying a repo picks
+its entry, a bare `review-pr-<n>` is probed across the allowlist and must hit
+**exactly one** PR — zero or several is a guess, and the sweep spares rather than
+guesses. An empty allowlist can never resolve a bare name at all.
+
+**Guards, all of which must hold before anything is killed.**
+
+| guard | why |
+| --- | --- |
+| the session is **idle** | a busy reviewer is never killed, *even on a merged PR* — scoped post-merge re-reviews of fold commits are an established pattern; busy is logged, not reaped |
+| quiet for `reap_grace_seconds` | a claude session between turns also reports "idle"; the grace period leaves a just-merged PR's reviewer time to finish its close-out (CR6 envelope, task move) |
+| terminal PR, for a ledger-less session | the name's `-r<k>` cannot tell a superseded round from an in-flight one, and an operator re-entry may still want the earlier context — superseded-round reaping on an *open* PR is out of scope |
+
+Kills are always **per session** (`alissa tmux kill <name>`), never a server-wide
+kill: the container is shared, and a test pins that no other kill verb exists
+anywhere in the package. Reaps are logged with evidence (name, PR state, idle
+duration); holdouts and undecidable sessions are logged at debug and retried next
+poll; a failed fetch or kill is logged and skipped, never fatal to the walk.
+Reaping is bookkeeping-only as far as the loop is concerned — rounds are counted
+from CR6 verdict envelopes and the effective cap from the grants table, so a PR
+whose earlier sessions were reaped decides exactly like one whose were not.
+
+**When the sweep cannot keep up**, i.e. more than `reap_session_cap` reviewer
+sessions are still live after a pass, the daemon logs page-worthy (`ERROR`) with
+the names. Each idle agent session holds hundreds of MB forever; the 2026-07-28
+incident was this drift, past 10 GB, with every review session idle and its PR
+long merged.
 
 ### Poll snapshots (console exhaust)
 

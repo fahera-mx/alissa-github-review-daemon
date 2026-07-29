@@ -171,6 +171,8 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
 | `ALISSA_POLL_INTERVAL` | *daemon default* (currently 60) | seconds between polls (≥10); **pass-through** — unset ⇒ library default |
 | `ALISSA_ROUND_CAP` | *daemon default* (currently 10) | CR9 round cap; **pass-through** — unset ⇒ library default |
+| `ALISSA_REAP_GRACE_SECONDS` | *daemon default* (currently 1800) | how long a reviewer session must be idle **and** quiet before the reap sweep kills it; **pass-through** — unset ⇒ library default |
+| `ALISSA_REAP_SESSION_CAP` | *daemon default* (currently 6) | live reviewer sessions after a sweep above which the daemon logs page-worthy; **pass-through** — unset ⇒ library default |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
 | `ALISSA_AGENT_MODEL` | `opus` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
@@ -180,7 +182,8 @@ automatically; locally pass `--build-arg`):
 
 #### Config precedence: env var > daemon library default
 
-The optional tuning knobs `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP` and
+The optional tuning knobs `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`,
+`ALISSA_REAP_GRACE_SECONDS`, `ALISSA_REAP_SESSION_CAP` and
 `ALISSA_REVIEW_OPERATORS` are
 **pass-through**: their build `ARG` default is empty, and when they are unset the
 entrypoint **omits the key entirely** from the generated `revloop.config.json`

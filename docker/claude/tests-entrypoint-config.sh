@@ -42,9 +42,12 @@ assert_eq() {
 
 echo "== pass-through: optional knobs omitted when env unset =="
 out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
+        -u ALISSA_REAP_GRACE_SECONDS -u ALISSA_REAP_SESSION_CAP \
         bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
 assert_key_absent "${out}" poll_interval "poll_interval omitted when ALISSA_POLL_INTERVAL unset"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP unset"
+assert_key_absent "${out}" reap_grace_seconds "reap_grace_seconds omitted when ALISSA_REAP_GRACE_SECONDS unset"
+assert_key_absent "${out}" reap_session_cap   "reap_session_cap omitted when ALISSA_REAP_SESSION_CAP unset"
 assert_eq "${out}" '.on_missing_hub' '"add"'    "on_missing_hub always emitted (structural: add)"
 assert_eq "${out}" '.agent_profile'  '"claude"' "agent_profile always emitted (structural: claude)"
 assert_eq "${out}" '.repos'          "${REPOS}" "repos emitted from allowlist"
@@ -65,6 +68,9 @@ echo "== override: set env still wins, emitted as a JSON number =="
 out="$(ALISSA_ROUND_CAP=7 ALISSA_POLL_INTERVAL=90 render_revloop_config "${REPOS}")"
 assert_eq "${out}" '.round_cap'     '7'  "round_cap override present as number"
 assert_eq "${out}" '.poll_interval' '90' "poll_interval override present as number"
+out="$(ALISSA_REAP_GRACE_SECONDS=900 ALISSA_REAP_SESSION_CAP=3 render_revloop_config "${REPOS}")"
+assert_eq "${out}" '.reap_grace_seconds' '900' "reap_grace_seconds override present as number"
+assert_eq "${out}" '.reap_session_cap'   '3'   "reap_session_cap override present as number"
 
 echo "== override: structural keys still overridable =="
 out="$(ALISSA_ON_MISSING_HUB=skip ALISSA_AGENT_PROFILE=custom render_revloop_config "${REPOS}")"
