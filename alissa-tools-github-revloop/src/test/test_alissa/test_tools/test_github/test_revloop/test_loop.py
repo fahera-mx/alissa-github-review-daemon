@@ -47,6 +47,8 @@ from alissa.tools.github.revloop import ghclient as ghclient_module
 from alissa.tools.github.revloop import loop as loop_module
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
+    drift_probe_kind,
+    identity_drift_kind,
     MAX_REENTRY_ROUNDS,
     MAX_VERDICT_POST_ATTEMPTS,
     REENTRY_GRAMMAR,
@@ -4295,7 +4297,6 @@ def test_the_removal_log_line_carries_its_evidence(config, caplog):
 
 
 def test_the_drift_kind_is_keyed_on_both_identities():
-    from alissa.tools.github.revloop.loop import identity_drift_kind
     assert identity_drift_kind("alissa-app", "RHDZMOTA") != identity_drift_kind(
         "alissa-app", "someone-else"
     )
@@ -4384,6 +4385,9 @@ def test_a_different_failure_class_announces_itself_once_more(config, caplog):
     w, gh, _ = _converged(config, requested=("alissa-app",))
     gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
     w.evaluate(OWNER, REPO, NUMBER)
+    # caplog's handler is live for the whole test, so the first pass's warning
+    # is already in `records` — without this the assertion below cannot fail.
+    caplog.clear()
 
     gh.remove_error = RateLimited("secondary rate limit")
     with caplog.at_level(logging.WARNING):
@@ -4508,3 +4512,74 @@ def test_run_actually_feeds_stdin_to_the_child():
     from alissa.tools.github.revloop.proc import run
     body = json.dumps({"reviewers": ["alissa-app"]})
     assert run(["cat"], stdin=body) == body
+
+
+# -- round-2 findings (PR #55) ---------------------------------------------
+
+
+def _drifted_reviews():
+    """Our approve at head, and a NEWER write-up by another identity — the
+    #298 shape the drift alarm exists for."""
+    return [
+        review("APPROVED", at="2026-07-18T10:00:00Z"),
+        dataclasses.replace(
+            review("COMMENTED", at="2026-07-18T11:00:00Z"), author="RHDZMOTA"
+        ),
+    ]
+
+
+def _drift_watcher(config, state=None):
+    return watcher(
+        config=config,
+        pr=make_pr(requested=("alissa-app",)),
+        reviews=_drifted_reviews(),
+        state=state,
+        verdict_count=1,
+    )
+
+
+def test_a_dry_run_pass_leaves_the_ping_ledger_clean(config):
+    """[major] `state_db` has no dry-run branch, so a ledger row written by a
+    diagnostic pass lands in the file the production daemon reads."""
+    w, _, _ = _drift_watcher(dataclasses.replace(config, dry_run=True))
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not w.state.pinged(SLUG, NUMBER, drift_probe_kind("abc123"))
+    assert not w.state.pinged(
+        SLUG, NUMBER, identity_drift_kind("alissa-app", "RHDZMOTA")
+    )
+
+
+def test_a_dry_run_does_not_silence_the_production_alarm(config, caplog):
+    """The half that actually matters: an operator diagnosing with --dry-run
+    must not make the daemon that runs next permanently quiet."""
+    state = State(config.state_db)
+    dry, _, _ = _drift_watcher(dataclasses.replace(config, dry_run=True), state=state)
+    dry.evaluate(OWNER, REPO, NUMBER)
+
+    live, gh, _ = _drift_watcher(config, state=state)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        live.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.removed == ["alissa-app"]
+    assert "IDENTITY DRIFT" in caplog.text
+
+
+def test_a_dry_run_does_not_silence_itself_either(config, caplog):
+    """Not reading the ledger matters as much as not writing it: a production
+    pass that already probed this head must not make the operator's dry-run
+    print nothing."""
+    state = State(config.state_db)
+    live, _, _ = _drift_watcher(config, state=state)
+    live.evaluate(OWNER, REPO, NUMBER)
+    assert state.pinged(SLUG, NUMBER, drift_probe_kind("abc123"))
+
+    dry, gh, _ = _drift_watcher(dataclasses.replace(config, dry_run=True), state=state)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        dry.evaluate(OWNER, REPO, NUMBER)
+
+    assert "IDENTITY DRIFT" in caplog.text
+    assert gh.removed == [], "still takes nothing on GitHub"

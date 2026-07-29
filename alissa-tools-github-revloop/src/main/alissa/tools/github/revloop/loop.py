@@ -1494,9 +1494,23 @@ class ReviewWatcher:
 
         The extra read it needs is bounded to once per (PR, head); see
         drift_probe_kind for why that bound exists at all.
+
+        In `--dry-run` this touches the ping ledger in NEITHER direction: it
+        always probes, always warns, and records nothing. Both halves matter.
+        Writing would let a diagnostic pass durably silence the daemon it was
+        run to diagnose -- `state_db` has no dry-run branch, so the rows land in
+        the same `state.db` production reads, and the alarm is once-per-PR. And
+        reading would silence the DIAGNOSTIC instead: a production pass that
+        already probed this head would make the operator's dry-run print
+        nothing. The cost is one review read per dry-run poll, which is the
+        right trade -- dry-run withdraws nothing, so the PR stays in the poll
+        set regardless, and the probe bound exists to protect the production
+        failure loop, not a run an operator is watching.
         """
+        record = not self.config.dry_run
+
         probe = drift_probe_kind(pr.head_sha)
-        if self.state.pinged(pr.full_name, pr.number, probe):
+        if record and self.state.pinged(pr.full_name, pr.number, probe):
             return
 
         try:
@@ -1505,7 +1519,8 @@ class ReviewWatcher:
             # Deliberately not recorded: a read that failed settles nothing.
             log.debug("%s: could not read reviews for the drift check: %s", pr.slug, exc)
             return
-        self.state.record_ping(pr.full_name, pr.number, probe)
+        if record:
+            self.state.record_ping(pr.full_name, pr.number, probe)
 
         substantive = [r for r in reviews if r.is_substantive]
         if not substantive:
@@ -1515,9 +1530,10 @@ class ReviewWatcher:
             return
 
         kind = identity_drift_kind(self.github.login, newest.author)
-        if self.state.pinged(pr.full_name, pr.number, kind):
-            return
-        self.state.record_ping(pr.full_name, pr.number, kind)
+        if record:
+            if self.state.pinged(pr.full_name, pr.number, kind):
+                return
+            self.state.record_ping(pr.full_name, pr.number, kind)
         log.warning(
             "IDENTITY DRIFT on %s: the review request is held against %r but "
             "the round's newest review was submitted by %r (%s). GitHub only "
