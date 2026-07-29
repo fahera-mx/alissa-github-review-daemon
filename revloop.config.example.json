@@ -15,7 +15,12 @@
   "operators": [],
 
   "agent_profile": "claude",
+
+  "_reviewer_login": "The GitHub login every verdict must be posted under. null auto-detects it from the gh credential at startup. Either way the daemon re-checks the login before every review it submits and refuses to post as anyone else.",
   "reviewer_login": null,
+
+  "_reviewer_token_env": "NAME of the environment variable holding the reviewer identity's GitHub token — never the token itself. Set it and every `gh` call runs under that credential explicitly, with the inherited GH_TOKEN/GITHUB_TOKEN stripped. Leave it null and the daemon inherits whatever the process was given, and warns at startup: on a host that holds more than one GitHub identity, inheritance is how a round's verdict ends up posted under the wrong login.",
+  "reviewer_token_env": null,
 
   "_state_path": "Omit to default to <workspace-root>/.revloop/state.db, which keeps daemons on different workspaces from sharing a spawn ledger.",
 

@@ -206,8 +206,10 @@ section.panel {
   border-color: var(--status-committed); background: var(--status-committed-bg); }
 .pill.deferred { color: var(--status-pending);
   border-color: var(--status-pending); background: var(--status-pending-bg); }
-.pill.converged { color: var(--status-in-progress);
+.pill.converged, .pill.posted { color: var(--status-in-progress);
   border-color: var(--status-in-progress); background: var(--status-in-progress-bg); }
+.pill.awaiting-post { color: var(--status-blocked);
+  border-color: var(--status-blocked); background: var(--status-blocked-bg); }
 .pill.capped { color: var(--status-cancelled);
   border-color: var(--status-cancelled); background: var(--status-cancelled-bg); }
 .pill.escalated { color: var(--status-blocked);

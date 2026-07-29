@@ -94,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
     over.add_argument("--hub-template", metavar="TEMPLATE")
     over.add_argument("--agent-profile", metavar="NAME")
     over.add_argument("--reviewer-login", metavar="LOGIN")
+    over.add_argument(
+        "--reviewer-token-env",
+        metavar="VAR",
+        help="NAME of the environment variable holding the reviewer "
+        "identity's GitHub token (never the token itself). Set it and every "
+        "`gh` call runs under that credential explicitly instead of whatever "
+        "the container happened to export",
+    )
     over.add_argument("--state-path", type=Path, metavar="PATH")
     over.add_argument(
         "--on-missing-review-task",
@@ -143,6 +151,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "hub_template": args.hub_template,
         "agent_profile": args.agent_profile,
         "reviewer_login": args.reviewer_login,
+        "reviewer_token_env": args.reviewer_token_env,
         "state_path": args.state_path,
         "on_missing_review_task": args.on_missing_review_task,
         "on_missing_hub": args.on_missing_hub,

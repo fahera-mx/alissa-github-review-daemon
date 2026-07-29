@@ -91,6 +91,36 @@ GH_LOGIN="$(gh api user -q .login 2>/dev/null)" \
   || die "gh token rejected by GitHub (gh api user failed)"
 log "gh authenticated as: ${GH_LOGIN}"
 
+# 2b-ii. The REVIEWER identity, explicitly (issue #51).
+#
+# This container holds more than one GitHub identity, and the default gh
+# credential above belongs to whichever one was injected as GH_TOKEN — which on
+# studio was the IMPLEMENTER's, so review verdicts posted from here landed under
+# the wrong login and never consumed the PR's review request. Setting
+# ALISSA_REVIEWER_TOKEN_ENV to the NAME of the variable carrying the reviewer's
+# token routes every daemon `gh` call through it explicitly. We resolve it here
+# so a bad credential fails at boot with a login in the log, not silently at the
+# first verdict; the daemon re-asserts the same identity before every post.
+if [ -n "${ALISSA_REVIEWER_TOKEN_ENV:-}" ]; then
+  # Indirect expansion: read the variable whose NAME is in
+  # ALISSA_REVIEWER_TOKEN_ENV. The `:-` keeps `set -u` from aborting when that
+  # variable does not exist, so the empty check below is what reports it.
+  REVIEWER_TOKEN="${!ALISSA_REVIEWER_TOKEN_ENV:-}"
+  [ -n "${REVIEWER_TOKEN}" ] \
+    || die "ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} but that variable is empty — inject the reviewer identity's token there, or unset ALISSA_REVIEWER_TOKEN_ENV to inherit the default credential (and accept that verdicts may post under the wrong login)"
+  REVIEWER_LOGIN="$(GH_TOKEN="${REVIEWER_TOKEN}" GITHUB_TOKEN="${REVIEWER_TOKEN}" gh api user -q .login 2>/dev/null)" \
+    || die "the reviewer token in ${ALISSA_REVIEWER_TOKEN_ENV} was rejected by GitHub"
+  log "reviewer identity: ${REVIEWER_LOGIN} (from \$${ALISSA_REVIEWER_TOKEN_ENV})"
+  if [ -n "${ALISSA_REVIEWER_LOGIN:-}" ] && [ "${ALISSA_REVIEWER_LOGIN}" != "${REVIEWER_LOGIN}" ]; then
+    die "ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} but \$${ALISSA_REVIEWER_TOKEN_ENV} belongs to ${REVIEWER_LOGIN} — a review posted under the wrong identity is not a verdict of record"
+  fi
+  [ "${REVIEWER_LOGIN}" = "${GH_LOGIN}" ] \
+    && log "NOTE: the reviewer token resolves to the same login as the default gh credential (${GH_LOGIN})" \
+    || log "reviewer (${REVIEWER_LOGIN}) and default gh credential (${GH_LOGIN}) are DIFFERENT identities — as intended"
+else
+  log "WARN: ALISSA_REVIEWER_TOKEN_ENV unset — the daemon will post reviews with the inherited credential (${GH_LOGIN}). In a container holding several identities that is how a round's verdict lands under the wrong login (issue #51)."
+fi
+
 # The API token above is enough for `gh api` calls, but NOT for git itself:
 # hub-ifying a repo (on_missing_hub:add) does a `git clone`, which needs a git
 # credential helper. Wire gh in as that helper so https clones/fetches of

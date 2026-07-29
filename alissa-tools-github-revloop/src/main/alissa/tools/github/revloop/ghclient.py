@@ -2,11 +2,22 @@
 
 Note: this targets gh 2.4.0, which predates `gh search`. Every query goes
 through `gh api` against the REST v3 endpoints instead.
+
+**Credential routing.** The daemon runs in a container shared with the
+implementer lane, so several GitHub identities are present at once and `gh`
+resolves whichever `GH_TOKEN`/`GITHUB_TOKEN` it happens to inherit. That is not
+a theoretical hazard: it is how studio #298/#302 round-1 verdicts landed under
+the DEV login instead of the reviewer's (issue #51). With `token_env` set every
+`gh` call this client makes runs under an environment built HERE, with the
+reviewer's token read from the named variable and the inherited ones stripped;
+without it the client inherits, exactly as it always did.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import re
 from dataclasses import dataclass
 
 from .proc import CommandError, run, run_json
@@ -29,6 +40,32 @@ SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}
 # concatenates one JSON document per page and would not parse.
 PER_PAGE = 100
 COMMENT_PAGE_LIMIT = 20
+
+# Environment variables `gh` reads a token from. Both are cleared before an
+# explicitly-routed call, so an inherited implementer credential cannot win by
+# being the one variable we did not think to overwrite.
+GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+
+# The review events the daemon may submit. COMMENT is deliberately absent: a
+# comment-mode review cannot express approval, which is the whole reason the
+# GitHub state was useless as a convergence signal in the first place.
+EVENT_APPROVE = "APPROVE"
+EVENT_REQUEST_CHANGES = "REQUEST_CHANGES"
+
+# The hidden marker the daemon stamps into every native verdict review it
+# submits, carrying the round it closes. Two jobs, both load-bearing:
+#
+#   * it names the round, so a reviewer session's OWN review of the same round
+#     and the daemon's native post are not counted as two rounds against the
+#     cap (see `countable_rounds`);
+#   * it makes the daemon's posts identifiable in the reviews list, which is
+#     what the PR evidence for issue #51 is read from.
+_VERDICT_MARKER_RE = re.compile(r"<!--\s*alissa-revloop:verdict\s+round=(\d+)\s*-->")
+
+
+def verdict_marker(round_: int) -> str:
+    """The hidden round marker for a native verdict review body."""
+    return f"<!-- alissa-revloop:verdict round={round_} -->"
 
 
 @dataclass(frozen=True)
@@ -89,6 +126,43 @@ class Review:
         """
         return bool(self.body.strip())
 
+    @property
+    def verdict_round(self) -> int | None:
+        """The round this review closes, when the daemon posted it.
+
+        None for every review the daemon did not submit -- a reviewer
+        session's own review, or anything a human wrote.
+        """
+        match = _VERDICT_MARKER_RE.search(self.body)
+        return int(match.group(1)) if match else None
+
+
+def countable_rounds(reviews: list["Review"]) -> int:
+    """Rounds represented by the reviewer's substantive reviews.
+
+    The naive count -- one round per review record -- double-counts as soon as
+    BOTH a reviewer session's own review and the daemon's native verdict post
+    exist for the same round, which is the normal state once the daemon closes
+    rounds itself (issue #51, requirement 5). The daemon's posts carry the
+    round in a hidden marker, so when any is present the highest marked round
+    IS the round count: the daemon posts exactly one marked review per round,
+    and it posts one for every round that lacks one.
+
+    Deliberately `max(marked)` rather than `len(marked) + len(unmarked)`. The
+    two disagree only when an unmarked review exists for a round the daemon
+    also marked -- precisely the double-count this exists to prevent -- and the
+    other direction self-corrects: an unmarked review for a round ABOVE the
+    highest marked one leaves envelopes > this count, which is the daemon's own
+    signal to post (and mark) that round on the next pass.
+
+    With no marked review at all this is the old count, byte for byte, so PRs
+    reviewed before this shipped are unaffected.
+    """
+    marked = [r.verdict_round for r in reviews if r.verdict_round is not None]
+    if marked:
+        return max(marked)
+    return len(reviews)
+
 
 class RateLimited(RuntimeError):
     pass
@@ -98,14 +172,59 @@ class IdentityMismatch(RuntimeError):
     """Configured reviewer identity disagrees with the gh token."""
 
 
+class ReviewerTokenUnset(RuntimeError):
+    """`reviewer_token_env` names a variable that is absent or empty."""
+
+
 class GitHub:
-    def __init__(self, login: str | None = None):
+    def __init__(self, login: str | None = None, token_env: str | None = None):
         self._login = login
+        self._token_env = token_env
+        # The login this process ASSERTED at start (preflight). Distinct from
+        # `_login`, which may be a configured-but-unverified value: only a
+        # login that has been compared against `GET /user` lands here, and it
+        # is what the posting gate holds later calls to.
+        self._asserted_login: str | None = None
+
+    # -- credential routing ------------------------------------------------
+
+    @property
+    def token_env(self) -> str | None:
+        return self._token_env
+
+    def _env(self) -> "dict[str, str] | None":
+        """The environment every `gh` call of this client runs under.
+
+        None -- inherit the process environment -- when no `reviewer_token_env`
+        is configured, which is the pre-#51 behaviour and stays the default so
+        an existing deployment is not broken by an upgrade.
+
+        Otherwise the reviewer's token is read from the named variable and
+        placed in BOTH variables `gh` consults, with nothing inherited into
+        either. Building the mapping (rather than merging into os.environ) is
+        the guarantee: there is no ordering by which a container-default
+        credential can survive.
+        """
+        if self._token_env is None:
+            return None
+        token = (os.environ.get(self._token_env) or "").strip()
+        if not token:
+            raise ReviewerTokenUnset(
+                f"reviewer_token_env={self._token_env!r} but that variable is "
+                f"unset or empty. It must carry the REVIEWER identity's GitHub "
+                f"token — the daemon refuses to fall back to whatever "
+                f"credential the container happens to have inherited, because "
+                f"that is how a review lands under the wrong login."
+            )
+        env = {k: v for k, v in os.environ.items() if k not in GH_TOKEN_VARS}
+        for var in GH_TOKEN_VARS:
+            env[var] = token
+        return env
 
     def token_login(self) -> str:
         """Who the gh token actually belongs to. `gh api --jq` prints scalars
         raw (unquoted), so this is deliberately not parsed as JSON."""
-        return run(["gh", "api", "user", "--jq", ".login"]).strip()
+        return run(["gh", "api", "user", "--jq", ".login"], env=self._env()).strip()
 
     @property
     def login(self) -> str:
@@ -118,7 +237,11 @@ class GitHub:
         round counting filters reviews by `self.login`. If a configured
         reviewer_login disagrees with the token, the daemon would search one
         account's queue and count another's reviews — every round would look
-        like round 1 and respawn forever. Fail loudly instead."""
+        like round 1 and respawn forever. Fail loudly instead.
+
+        Called once per process (preflight); the login it resolves is the
+        identity `assert_review_identity` holds every later post to.
+        """
         actual = self.token_login()
         if self._login is not None and self._login != actual:
             raise IdentityMismatch(
@@ -128,11 +251,48 @@ class GitHub:
                 f"to auto-detect), or re-authenticate gh."
             )
         self._login = actual
+        self._asserted_login = actual
+        return actual
+
+    def assert_review_identity(self) -> str:
+        """The gate in front of every review this daemon submits.
+
+        A review is the one call whose AUTHOR is the payload: post it under the
+        implementer's login and the round has no verdict of record, the
+        pending review request is never consumed, and the daemon re-verifies
+        the closed round forever (studio #298). So the login is re-read from
+        `GET /user` at post time and compared against the identity this process
+        asserted at start — a wrong-identity post is worse than a late one, and
+        the failure mode being defended against is precisely a credential that
+        was right at boot and is wrong now.
+
+        Raises IdentityMismatch (never posts) on disagreement. With no
+        `reviewer_login` configured the reviewer IS whoever the token resolved
+        to at preflight, so the comparison still catches mid-process drift.
+        """
+        expected = self._asserted_login or self._login or self.verify_identity()
+        actual = self.token_login()
+        if actual != expected:
+            raise IdentityMismatch(
+                f"refusing to submit a review: the gh credential now resolves "
+                f"to {actual!r}, but the configured reviewer identity is "
+                f"{expected!r}. A review posted under the wrong login is not "
+                f"the round's verdict of record and does not consume the "
+                f"review request"
+                + (
+                    f" — check that {self._token_env} still carries the "
+                    f"reviewer's token"
+                    if self._token_env
+                    else " — the daemon has no reviewer_token_env configured, "
+                    "so it is using whatever credential it inherited"
+                )
+                + "."
+            )
         return actual
 
     def _api(self, *args: str, timeout: int = 60):
         try:
-            return run_json(["gh", "api", *args], timeout=timeout)
+            return run_json(["gh", "api", *args], timeout=timeout, env=self._env())
         except CommandError as exc:
             blob = exc.stderr.lower()
             if "rate limit" in blob or "403" in blob:
@@ -235,6 +395,51 @@ class GitHub:
         ]
         return sorted(mine, key=lambda r: r.submitted_at)
 
+    def submit_review(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        event: str,
+        body: str,
+        commit_id: str | None = None,
+    ) -> str:
+        """Submit ONE native review, as the reviewer identity. Returns its URL.
+
+        This is the round's verdict of record. A reviewer session's own
+        write-up is a transcript artifact however good it is: only a review
+        submitted by the CONFIGURED reviewer login expresses APPROVE /
+        REQUEST_CHANGES on GitHub and consumes the pending review request.
+
+        The identity is asserted first and the call refuses rather than posting
+        under any other login (see assert_review_identity). `commit_id` pins
+        the review to the head it judged, so a later push cannot make an old
+        verdict look current.
+        """
+        if event not in (EVENT_APPROVE, EVENT_REQUEST_CHANGES):
+            raise ValueError(
+                f"event must be {EVENT_APPROVE} or {EVENT_REQUEST_CHANGES}, "
+                f"got {event!r} — a COMMENT review cannot close a round"
+            )
+        login = self.assert_review_identity()
+        log.info(
+            "submitting %s review on %s/%s#%d as %s", event, owner, repo, number, login
+        )
+        argv = [
+            "-X",
+            "POST",
+            f"repos/{owner}/{repo}/pulls/{number}/reviews",
+            "-f",
+            f"event={event}",
+            "-f",
+            f"body={body}",
+        ]
+        if commit_id:
+            argv += ["-f", f"commit_id={commit_id}"]
+        data = self._api(*argv) or {}
+        return str(data.get("html_url") or "")
+
     def comment(self, owner: str, repo: str, number: int, body: str) -> None:
         run_json(
             [
@@ -243,7 +448,8 @@ class GitHub:
                 f"repos/{owner}/{repo}/issues/{number}/comments",
                 "-f",
                 f"body={body}",
-            ]
+            ],
+            env=self._env(),
         )
 
     def issue_comments(self, owner: str, repo: str, number: int) -> list[IssueComment]:

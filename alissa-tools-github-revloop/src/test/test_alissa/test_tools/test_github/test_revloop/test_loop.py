@@ -22,6 +22,8 @@ from alissa.tools.github.revloop.config import (
     resolve_config_path,
 )
 from alissa.tools.github.revloop.alissa import (
+    VERDICT_APPROVE,
+    VERDICT_REQUEST_CHANGES,
     ManagedSession,
     SessionRef,
     parse_session_name,
@@ -36,19 +38,26 @@ from alissa.tools.github.revloop.ghclient import (
     PullRequest,
     RateLimited,
     Review,
+    ReviewerTokenUnset,
+    countable_rounds,
+    verdict_marker,
 )
+from alissa.tools.github.revloop import loop as loop_module
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     MAX_REENTRY_ROUNDS,
+    MAX_VERDICT_POST_ATTEMPTS,
     REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
+    VERDICT_POST_GRACE_SECONDS,
     Action,
     ReviewWatcher,
     deferral_activity_kind,
     parse_reentry_ack,
     session_name,
     stalled_kind,
+    verdict_post_kind,
 )
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
@@ -70,6 +79,11 @@ class FakeGitHub:
         self._next_comment_id = 1000
         self.requests = [(OWNER, REPO, NUMBER)]
         self.pr_fetches = 0
+        # Native verdict posts: what was submitted, and an optional failure to
+        # raise instead of submitting (the credential-broken case).
+        self.submitted: list[dict] = []
+        self.submit_error: BaseException | None = None
+        self.identity_error: BaseException | None = None
 
     def pull_request(self, owner, repo, number):
         self.pr_fetches += 1
@@ -81,6 +95,33 @@ class FakeGitHub:
             r for r in self._reviews if r.author == self.login and r.is_substantive
         ]
         return sorted(mine, key=lambda r: r.submitted_at)
+
+    def assert_review_identity(self):
+        if self.identity_error:
+            raise self.identity_error
+        return self.login
+
+    def submit_review(self, owner, repo, number, *, event, body, commit_id=None):
+        """Mirrors GitHub.submit_review: assert the identity, then land a real
+        review record — so a posted verdict shows up in my_reviews exactly as
+        GitHub would show it on the next poll."""
+        self.assert_review_identity()
+        if self.submit_error:
+            raise self.submit_error
+        self.submitted.append(
+            {"event": event, "body": body, "commit_id": commit_id}
+        )
+        self._reviews.append(
+            Review(
+                author=self.login,
+                state="APPROVED" if event == "APPROVE" else "CHANGES_REQUESTED",
+                commit_id=commit_id or "",
+                submitted_at=f"2026-07-20T0{len(self.submitted)}:00:00Z",
+                url=f"https://github.com/{SLUG}/pull/{NUMBER}#pullrequestreview-{len(self.submitted)}",
+                body=body,
+            )
+        )
+        return self._reviews[-1].url
 
     def comment(self, owner, repo, number, body):
         self.comments.append(body)
@@ -199,6 +240,18 @@ def operator_comments(gh):
 
 def activity_comments(gh):
     return [c for c in gh.issue_store if ACTIVITY_MARKER in c.body]
+
+
+@pytest.fixture
+def no_post_grace(monkeypatch):
+    """Collapse the pre-post grace window.
+
+    The window exists to let a reviewer session submit its OWN review before
+    the daemon posts one; every test below is about what happens once that
+    chance has passed, so waiting it out would only be waiting. The window
+    itself is pinned by its own test.
+    """
+    monkeypatch.setattr(loop_module, "VERDICT_POST_GRACE_SECONDS", 0)
 
 
 @pytest.fixture
@@ -2159,6 +2212,7 @@ def test_spawns_append_lines_to_one_activity_comment(config):
 
     assert w.evaluate(OWNER, REPO, NUMBER).round == 1
     al.verdict_count = 1  # round 1's verdict envelope landed
+    gh._reviews.append(review())  # ...and so did its native review
     assert w.evaluate(OWNER, REPO, NUMBER).round == 2
 
     acts = activity_comments(gh)
@@ -2363,13 +2417,22 @@ def test_round_number_comes_from_envelopes_when_github_overcounts(config):
     assert al.enqueued[-1]["session"].startswith("review-widgets-pr7-r2-")
 
 
-def test_empty_body_round_still_counts_via_envelope(config):
+def test_empty_body_round_still_counts_via_envelope(config, no_post_grace):
     # The prior round's GitHub review had an empty body (is_substantive False),
-    # so github shows 0 reviews -- but its verdict envelope was recorded. Without
-    # the envelope count the daemon would repeat round 1 (name collision -> stuck);
-    # with it, the next round is correctly round 2.
+    # so github shows 0 countable reviews -- but its verdict envelope was
+    # recorded. Two things follow, in order: that round has no verdict of
+    # record, so the daemon posts one natively (issue #51); and the NEXT round
+    # is numbered from the envelope, so it is round 2 and not a repeat of
+    # round 1 (a repeat collides on the session name -> the worker wedges).
     pr = make_pr()
-    w, _, al = watcher(config, pr, [], verdict_count=1)
+    w, gh, al = watcher(
+        config, pr, [], verdict_count=1, verdict=VERDICT_REQUEST_CHANGES
+    )
+
+    posted = w.evaluate(OWNER, REPO, NUMBER)
+    assert posted.action is Action.POSTED
+    assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
+
     d = w.evaluate(OWNER, REPO, NUMBER)
     assert d.action is Action.SPAWNED
     assert d.round == 2
@@ -3072,3 +3135,309 @@ def test_the_dry_run_pass_never_records_a_grant(ack_config):
     assert al.enqueued[0]["dry_run"] is True, "...without really enqueuing it"
     assert st.get_spawn(SLUG, NUMBER, 4) is None
     assert st.granted_rounds(SLUG, NUMBER) == 0, "and records nothing"
+
+
+# -- reviewer identity: the round's verdict of record (issue #51) -----------
+#
+# The defect these pin: a round's verdict reached GitHub only as a COMMENT
+# review by the IMPLEMENTER identity (studio #298/#302 round 1). Nothing then
+# expressed approve/request_changes on the PR, the pending review request was
+# never consumed, and the daemon re-verified a closed round every poll. The
+# rule is now flat: a round is not complete until the verdict exists as a
+# native review submitted by the configured reviewer identity.
+
+
+def envelope_ahead(config, verdict, *, reviews=None, state=None):
+    """A PR whose review task carries a round-1 verdict envelope that no
+    countable reviewer review backs — the #298 shape."""
+    return watcher(
+        config,
+        make_pr(),
+        list(reviews or []),
+        state=state,
+        verdict=verdict,
+        verdict_count=1,
+    )
+
+
+def test_an_envelope_with_no_native_review_is_posted_as_one(config, no_post_grace):
+    w, gh, _ = envelope_ahead(config, VERDICT_REQUEST_CHANGES)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED
+    assert d.round == 1
+    assert len(gh.submitted) == 1
+    assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
+    assert gh.submitted[0]["commit_id"] == "abc123", "pinned to the head it judged"
+    assert verdict_marker(1) in gh.submitted[0]["body"]
+    assert "TASK-500" in gh.submitted[0]["body"]
+
+
+def test_an_approve_envelope_posts_a_native_approve(config, no_post_grace):
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "APPROVE"
+
+
+def test_an_approve_envelope_does_not_converge_before_its_native_review(config):
+    """The ordering that matters most. An approve envelope with no native
+    APPROVE behind it must NOT close the loop: doing so leaves the PR with no
+    verdict of record and its review request dangling forever — #298 exactly."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST, "not CONVERGED"
+    assert gh.submitted == [], "still inside the grace window"
+
+
+def test_the_round_is_not_closed_while_the_post_is_owed(config, no_post_grace):
+    """No next round, either: round 2 cannot be owed while round 1 has no
+    verdict of record."""
+    st = State(config.state_db)
+    w, gh, al = envelope_ahead(config, VERDICT_REQUEST_CHANGES, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "422 Unprocessable Entity")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert al.enqueued == [], "round 2 must not be queued over an unclosed round 1"
+    assert st.get_spawn(SLUG, NUMBER, 2) is None
+
+
+def test_the_grace_window_lets_the_session_post_its_own_review_first(config):
+    """A reviewer session writes its envelope and submits its own review
+    moments apart. A poll landing between the two must not race it."""
+    w, gh, _ = envelope_ahead(config, VERDICT_REQUEST_CHANGES)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert "grace" in d.reason
+    assert gh.submitted == []
+
+
+def test_the_post_refuses_under_a_foreign_login(config, no_post_grace):
+    """The assertion is the whole point: a review posted under the wrong
+    identity is not the round's verdict and does not consume the request, so
+    refusing to post is strictly better than posting."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    gh.identity_error = IdentityMismatch("resolves to 'RHDZMOTA', not 'alissa-app'")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.submitted == [], "refused, not posted under the wrong login"
+
+
+def test_a_missing_reviewer_token_is_a_failed_post_not_a_silent_fallback(
+    config, no_post_grace
+):
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    gh.submit_error = ReviewerTokenUnset("REVLOOP_REVIEWER_GH_TOKEN is unset")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert "NOT closed" in d.reason
+
+
+def test_a_failed_post_is_retried_and_then_escalated(config, no_post_grace):
+    st = State(config.state_db)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "401 Bad credentials")
+
+    for _ in range(MAX_VERDICT_POST_ATTEMPTS):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
+
+    pages = [c for c in operator_comments(gh) if "cannot be closed" in c]
+    assert len(pages) == 1, "paged once, loudly"
+    assert "alissa-app" in pages[0]
+    assert st.pinged(SLUG, NUMBER, verdict_post_kind(1))
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["posted_at"] is None
+
+    # ...and it keeps retrying without re-paging: the round stays OPEN.
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
+    assert len([c for c in operator_comments(gh) if "cannot be closed" in c]) == 1
+
+
+def test_a_landed_post_is_recorded_and_announced(config, no_post_grace):
+    st = State(config.state_db)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    row = st.get_verdict_post(SLUG, NUMBER, 1)
+    assert row["posted_at"] is not None and row["review_url"]
+    assert "verdict of record" in activity_comments(gh)[0].body
+
+
+def test_the_dry_run_pass_never_submits_a_review(config, no_post_grace):
+    dry = dataclasses.replace(config, dry_run=True)
+    w, gh, _ = envelope_ahead(dry, VERDICT_APPROVE)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.submitted == []
+
+
+def test_a_session_review_and_the_native_post_are_one_round(config, no_post_grace):
+    """Requirement 5. Once a session's own review carries the reviewer
+    identity, its record and the daemon's native post both describe round 1 —
+    and counting two would spend a cap slot on a round that never ran."""
+    st = State(config.state_db)
+    w, gh, al = watcher(
+        config, make_pr(), [review()], state=st,
+        verdict=VERDICT_REQUEST_CHANGES, verdict_count=2,
+    )
+    # Round 2's envelope landed with no native review; the daemon posts it.
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.round == 3, "two rounds are done, not three"
+    assert countable_rounds(gh.my_reviews(OWNER, REPO, NUMBER)) == 2
+
+
+def test_a_marked_post_and_an_unmarked_one_for_the_same_round_count_once():
+    marked = review(body="verdict\n" + verdict_marker(1))
+    unmarked = review(body="the session's own write-up")
+    assert countable_rounds([unmarked, marked]) == 1
+    assert countable_rounds([unmarked]) == 1, "legacy PRs count exactly as before"
+    assert countable_rounds([]) == 0
+
+
+def test_an_unreadable_verdict_is_never_guessed_onto_the_pr(config, no_post_grace):
+    """`request_changes` and `approve` are not interchangeable. With an
+    envelope counted but no verdict word parseable, the round stays open."""
+    w, gh, al = envelope_ahead(config, None)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.submitted == []
+    assert al.enqueued == []
+
+
+def test_the_post_only_happens_for_the_reviewer_identity_gap(config, no_post_grace):
+    """No gap, no post: the healthy path is untouched, and every round the
+    session closed itself stays closed by its own review."""
+    w, gh, al = watcher(config, make_pr(), [review()], verdict=VERDICT_REQUEST_CHANGES)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.submitted == []
+    assert d.action is Action.SPAWNED and d.round == 2
+
+
+def test_the_grace_window_is_pinned():
+    """Long enough to lose a race, short enough that a genuinely missing post
+    heals within one operator's attention span."""
+    assert 60 <= VERDICT_POST_GRACE_SECONDS <= 15 * 60
+
+
+def test_the_snapshot_counts_the_new_stages(config, no_post_grace):
+    st = State(config.state_db)
+    w, _, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+
+    w.poll_once()
+
+    snap = st.read_snapshots(1)[0]
+    assert snap["posted"] == 1
+    assert snap["awaiting_post"] == 0
+    assert snap["stages"][0]["stage"] == "posted"
+
+
+# -- credential routing: no inherited container default --------------------
+
+
+def test_the_gh_env_carries_the_reviewer_token_and_nothing_inherited(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "the-implementer-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "the-implementer-token")
+    monkeypatch.setenv("REV_TOKEN", "the-reviewer-token")
+
+    env = GitHub("alissa-app", token_env="REV_TOKEN")._env()
+
+    assert env["GH_TOKEN"] == "the-reviewer-token"
+    assert env["GITHUB_TOKEN"] == "the-reviewer-token", "both, or gh picks the other"
+
+
+def test_an_unset_reviewer_token_refuses_rather_than_falling_back(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "the-implementer-token")
+    monkeypatch.delenv("REV_TOKEN", raising=False)
+
+    with pytest.raises(ReviewerTokenUnset, match="REV_TOKEN"):
+        GitHub("alissa-app", token_env="REV_TOKEN")._env()
+
+
+def test_no_token_env_inherits_exactly_as_before():
+    assert GitHub("alissa-app")._env() is None
+
+
+def test_the_posting_gate_reads_the_login_fresh(monkeypatch):
+    """Asserted once at boot, re-read at post time: the failure being defended
+    against is a credential that was right at boot and is wrong now."""
+    gh = GitHub("alissa-app")
+    logins = iter(["alissa-app", "RHDZMOTA"])
+    monkeypatch.setattr(GitHub, "token_login", lambda self: next(logins))
+
+    assert gh.verify_identity() == "alissa-app"
+    with pytest.raises(IdentityMismatch, match="RHDZMOTA"):
+        gh.assert_review_identity()
+
+
+def test_submit_review_refuses_a_comment_event():
+    with pytest.raises(ValueError, match="cannot close a round"):
+        GitHub("alissa-app").submit_review(
+            OWNER, REPO, NUMBER, event="COMMENT", body="x"
+        )
+
+
+def test_the_directive_names_the_credential_variable_by_name(config):
+    cfg = dataclasses.replace(config, reviewer_token_env="REVLOOP_REVIEWER_GH_TOKEN")
+    w, _, al = watcher(cfg, make_pr(), [])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    directive = al.enqueued[0]["directive"]
+    assert 'GH_TOKEN="$REVLOOP_REVIEWER_GH_TOKEN"' in directive
+    assert "verdict of record" in directive
+
+
+def test_the_directive_omits_the_clause_with_nothing_to_name(config):
+    w, _, al = watcher(config, make_pr(), [])
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert "CREDENTIAL" not in al.enqueued[0]["directive"]
+
+
+def test_reviewer_token_env_must_be_a_name_not_a_token(tmp_path):
+    with pytest.raises(ValueError, match="variable NAME"):
+        Config.build(tmp_path, {"reviewer_token_env": "ghp_liveTokenPastedHere!"})
+    assert Config.build(
+        tmp_path, {"reviewer_token_env": "REVLOOP_REVIEWER_GH_TOKEN"}
+    ).reviewer_token_env == "REVLOOP_REVIEWER_GH_TOKEN"
+
+
+def test_preflight_logs_the_resolved_login_and_warns_on_an_inherited_credential(
+    config, caplog
+):
+    w, gh, _ = watcher(config, make_pr(), [])
+    gh.verify_identity = lambda: "alissa-app"
+    gh.login = "alissa-app"
+
+    with caplog.at_level(logging.INFO):
+        warnings = w.preflight()
+
+    assert "reviewing as GitHub user alissa-app" in caplog.text
+    assert any("reviewer_token_env" in warning for warning in warnings)
+
+
+def test_preflight_is_quiet_once_the_credential_is_routed(config):
+    cfg = dataclasses.replace(config, reviewer_token_env="REV_TOKEN")
+    w, gh, _ = watcher(cfg, make_pr(), [])
+    gh.verify_identity = lambda: "alissa-app"
+
+    assert not any("reviewer_token_env" in w_ for w_ in w.preflight())

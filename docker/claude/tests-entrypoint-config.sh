@@ -59,6 +59,18 @@ assert_key_absent "${out}" operators "operators omitted when the list is empty"
 out="$(render_revloop_config "${REPOS}" '["RHDZMOTA","ops-bot"]')"
 assert_eq "${out}" '.operators' '["RHDZMOTA","ops-bot"]' "operators emitted from allowlist"
 
+echo "== reviewer identity: pass-through, and the NAME never the token (#51) =="
+out="$(env -u ALISSA_REVIEWER_LOGIN -u ALISSA_REVIEWER_TOKEN_ENV \
+        bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
+assert_key_absent "${out}" reviewer_login     "reviewer_login omitted when unset"
+assert_key_absent "${out}" reviewer_token_env "reviewer_token_env omitted when unset"
+out="$(ALISSA_REVIEWER_LOGIN=alissa-app \
+       ALISSA_REVIEWER_TOKEN_ENV=REVLOOP_REVIEWER_GH_TOKEN \
+       render_revloop_config "${REPOS}")"
+assert_eq "${out}" '.reviewer_login'     '"alissa-app"' "reviewer_login emitted verbatim"
+assert_eq "${out}" '.reviewer_token_env' '"REVLOOP_REVIEWER_GH_TOKEN"' \
+  "reviewer_token_env carries the variable NAME"
+
 echo "== empty-string env is treated as unset (Dockerfile bakes empty ENV) =="
 out="$(ALISSA_ROUND_CAP="" ALISSA_POLL_INTERVAL="" render_revloop_config "${REPOS}")"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP is empty"

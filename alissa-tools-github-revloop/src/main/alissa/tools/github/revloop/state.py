@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS pings (
     PRIMARY KEY (repo, number, kind)
 );
 
+CREATE TABLE IF NOT EXISTS verdict_posts (
+    repo          TEXT    NOT NULL,
+    number        INTEGER NOT NULL,
+    round         INTEGER NOT NULL,
+    first_seen_at INTEGER NOT NULL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    posted_at     INTEGER,
+    review_url    TEXT,
+    last_error    TEXT,
+    PRIMARY KEY (repo, number, round)
+);
+
 CREATE TABLE IF NOT EXISTS poll_snapshots (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                INTEGER NOT NULL,
@@ -100,9 +112,21 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
     escalated         INTEGER NOT NULL,
     skipped           INTEGER NOT NULL,
     reaped            INTEGER NOT NULL,
+    posted            INTEGER NOT NULL DEFAULT 0,
+    awaiting_post     INTEGER NOT NULL DEFAULT 0,
     stages_json       TEXT    NOT NULL
 );
 """
+
+# Columns added to `poll_snapshots` after it first shipped. CREATE TABLE IF NOT
+# EXISTS is not a migration: an existing database keeps the ORIGINAL table, so
+# these are ALTERed in on open. Each carries a NOT NULL default, which is what
+# lets an ALTER backfill every historical row without a rewrite -- an old pass
+# genuinely posted no verdicts, so 0 is the true value, not a placeholder.
+_SNAPSHOT_ADDED_COLUMNS = (
+    ("posted", "INTEGER NOT NULL DEFAULT 0"),
+    ("awaiting_post", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 class State:
@@ -141,7 +165,27 @@ class State:
         if self._spawns_keyed_by_round():
             self._migrate_spawns()
         self._db.executescript(SCHEMA)
+        self._migrate_snapshot_columns()
         self._db.commit()
+
+    def _migrate_snapshot_columns(self) -> None:
+        """Add any `poll_snapshots` column a pre-existing database predates.
+
+        Runs after the schema script (which creates the table with the full
+        column list on a fresh database, making this a no-op there) and is
+        idempotent: the existing columns are read first, so a restart never
+        re-ALTERs. Read-only openers never reach it -- the console must not
+        migrate a database the daemon owns.
+        """
+        existing = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(poll_snapshots)").fetchall()
+        }
+        for name, decl in _SNAPSHOT_ADDED_COLUMNS:
+            if name not in existing:
+                self._db.execute(
+                    f"ALTER TABLE poll_snapshots ADD COLUMN {name} {decl}"
+                )
 
     def _migrate_spawns(self) -> None:
         """Re-key an old round-keyed `spawns` by session, in ONE transaction.
@@ -368,6 +412,76 @@ class State:
             (repo, number),
         )
 
+    # -- native verdict posts ----------------------------------------------
+    #
+    # One row per (PR, round) whose verdict envelope exists but whose native
+    # reviewer-identity review does not yet. The row is the daemon's memory of
+    # an OPEN obligation: when the gap was first seen (which is what the grace
+    # window before posting is measured from), how many post attempts have
+    # failed, and -- once one lands -- that the round is finally closed.
+
+    def get_verdict_post(
+        self, repo: str, number: int, round_: int
+    ) -> sqlite3.Row | None:
+        return self._db.execute(
+            "SELECT * FROM verdict_posts WHERE repo=? AND number=? AND round=?",
+            (repo, number, round_),
+        ).fetchone()
+
+    def note_verdict_post_owed(self, repo: str, number: int, round_: int) -> int:
+        """Record that this round is owed a native verdict; return first_seen_at.
+
+        OR IGNORE keeps the FIRST observation's timestamp, because that is what
+        the pre-post grace window is measured from: a reviewer session that is
+        about to submit its own review must be given the chance, and a
+        timestamp that moved every poll would push the deadline out forever.
+        """
+        now = int(time.time())
+        self._db.execute(
+            "INSERT OR IGNORE INTO verdict_posts "
+            "(repo, number, round, first_seen_at) VALUES (?,?,?,?)",
+            (repo, number, round_, now),
+        )
+        self._db.commit()
+        row = self.get_verdict_post(repo, number, round_)
+        return int(row["first_seen_at"]) if row else now
+
+    def record_verdict_post_failure(
+        self, repo: str, number: int, round_: int, error: str
+    ) -> int:
+        """Count one failed post attempt; return the new attempt total."""
+        self._db.execute(
+            "UPDATE verdict_posts SET attempts = attempts + 1, last_error = ? "
+            "WHERE repo=? AND number=? AND round=?",
+            (error[:500], repo, number, round_),
+        )
+        self._db.commit()
+        row = self.get_verdict_post(repo, number, round_)
+        return int(row["attempts"]) if row else 0
+
+    def record_verdict_post(
+        self, repo: str, number: int, round_: int, review_url: str
+    ) -> None:
+        """Mark the round's native verdict as landed. Bookkeeping and evidence
+        only: GitHub's reviews list stays the authority on whether a native
+        verdict exists, so a row lost behind the daemon's back costs one
+        duplicate post, never a round that silently counts as closed."""
+        self._db.execute(
+            "UPDATE verdict_posts SET posted_at = ?, review_url = ?, last_error = NULL "
+            "WHERE repo=? AND number=? AND round=?",
+            (int(time.time()), review_url, repo, number, round_),
+        )
+        self._db.commit()
+
+    def read_verdict_posts(self, limit: int | None = None) -> list[dict]:
+        """Verdict-post rows, newest observation first."""
+        return self._read_rows(
+            "SELECT repo, number, round, first_seen_at, attempts, posted_at, "
+            "review_url, last_error FROM verdict_posts "
+            "ORDER BY first_seen_at DESC, number DESC",
+            limit,
+        )
+
     # -- poll snapshots (the console sidecar's exhaust buffer) -------------
 
     def record_snapshot(
@@ -384,6 +498,8 @@ class State:
         escalated: int = 0,
         skipped: int = 0,
         reaped: int = 0,
+        posted: int = 0,
+        awaiting_post: int = 0,
         stages: list[dict],
     ) -> None:
         """Append one poll-pass observation, then prune to the newest
@@ -399,8 +515,8 @@ class State:
             "INSERT INTO poll_snapshots "
             "(ts, duration_ms, candidates, spawned, stale_reenqueued, "
             "in_flight, deferred, converged, capped, escalated, skipped, "
-            "reaped, stages_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "reaped, posted, awaiting_post, stages_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 int(time.time()),
                 duration_ms,
@@ -414,6 +530,8 @@ class State:
                 escalated,
                 skipped,
                 reaped,
+                posted,
+                awaiting_post,
                 json.dumps(stages, separators=(",", ":")),
             ),
         )

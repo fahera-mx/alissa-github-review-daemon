@@ -15,9 +15,13 @@ daemons over different workspaces on the same machine, each pointed with
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+# A POSIX-ish environment variable name -- what `reviewer_token_env` must be.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # What to do when a PR has a pending review request but no matching Alissa
 # review task (CR2 is implementer-side, so a third-party PR may not have one).
@@ -44,6 +48,7 @@ CONFIG_KEYS = (
     "operators",
     "agent_profile",
     "reviewer_login",
+    "reviewer_token_env",
     "state_path",
     "on_missing_review_task",
     "on_missing_hub",
@@ -116,6 +121,15 @@ class Config:
 
     agent_profile: str = "claude"
     reviewer_login: str | None = None  # None -> resolve once via `gh api user`
+
+    # NAME of the environment variable holding the reviewer identity's GitHub
+    # token -- never the token itself, which has no business in a config file
+    # on a mounted volume. Set it and every `gh` call the daemon makes runs
+    # under that credential explicitly, with the container's inherited
+    # GH_TOKEN/GITHUB_TOKEN stripped; leave it None and the daemon inherits,
+    # which is the pre-#51 behaviour and warns loudly at preflight because a
+    # shared container is exactly where inheritance picks the wrong identity.
+    reviewer_token_env: str | None = None
 
     # None means "derive from the workspace" -- read `state_db` for the
     # resolved location, never this field.
@@ -247,6 +261,21 @@ class Config:
             # state of a working loop -- an alarm that always fires is noise.
             raise ValueError(f"reap_session_cap must be >= 1, got {session_cap}")
 
+        token_env = raw.get("reviewer_token_env")
+        if token_env is not None:
+            token_env = str(token_env).strip()
+            if not _ENV_NAME_RE.match(token_env):
+                # The overwhelmingly likely way to get here is pasting the
+                # TOKEN in place of the variable's name, which would leave a
+                # live credential in a config file on a shared volume and then
+                # fail as "unset variable" — an error that reads as though the
+                # secret were missing rather than exposed. Say what it is.
+                raise ValueError(
+                    f"reviewer_token_env must be an environment variable NAME "
+                    f"(e.g. 'REVLOOP_REVIEWER_GH_TOKEN'), not a value or a "
+                    f"token, got {token_env!r}"
+                )
+
         state_path = raw.get("state_path")
         return cls(
             workspace_root=Path(workspace_root),
@@ -257,6 +286,7 @@ class Config:
             operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),
+            reviewer_token_env=token_env or None,
             state_path=Path(state_path).expanduser() if state_path else None,
             on_missing_review_task=mode,
             on_missing_hub=hub_mode,

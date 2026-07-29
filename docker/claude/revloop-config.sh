@@ -37,6 +37,18 @@
 # `repos` is required (env-driven mode only calls this with a non-empty
 # allowlist) and always emitted.
 #
+# The two reviewer-identity keys are pass-through for the same reason as the
+# tuning knobs -- unset means "the library decides" -- but they are worth
+# calling out because the container is where their absence bites (issue #51):
+#   - reviewer_login      the identity every review MUST be posted under.
+#                          Unset, the daemon adopts whatever the gh credential
+#                          resolves to at boot.
+#   - reviewer_token_env  the NAME of the variable carrying that identity's
+#                          token. Unset, every `gh` call inherits the
+#                          container's default credential -- and this container
+#                          holds more than one identity, which is exactly how a
+#                          round's verdict landed under the implementer's login.
+#
 # Usage:  revloop-config.sh '<repos-json-array>' ['<operators-json-array>']
 # Or source it and call render_revloop_config '<repos-json>' '<operators-json>'.
 # =============================================================================
@@ -59,11 +71,15 @@ render_revloop_config() {
     --arg     cap    "${ALISSA_ROUND_CAP:-}" \
     --arg     grace  "${ALISSA_REAP_GRACE_SECONDS:-}" \
     --arg     scap   "${ALISSA_REAP_SESSION_CAP:-}" \
+    --arg     rlogin "${ALISSA_REVIEWER_LOGIN:-}" \
+    --arg     rtoken "${ALISSA_REVIEWER_TOKEN_ENV:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
      + (if $poll  == "" then {} else { poll_interval:      ($poll  | tonumber) } end)
      + (if $cap   == "" then {} else { round_cap:          ($cap   | tonumber) } end)
      + (if $grace == "" then {} else { reap_grace_seconds: ($grace | tonumber) } end)
      + (if $scap  == "" then {} else { reap_session_cap:   ($scap  | tonumber) } end)
+     + (if $rlogin == "" then {} else { reviewer_login:     $rlogin } end)
+     + (if $rtoken == "" then {} else { reviewer_token_env: $rtoken } end)
      + (if ($operators | length) == 0 then {} else { operators: $operators } end)'
 }
 
