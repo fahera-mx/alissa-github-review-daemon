@@ -41,11 +41,15 @@ SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}
 PER_PAGE = 100
 COMMENT_PAGE_LIMIT = 20
 
-# Same bound for the PR's commit list. Read only when a review POST was
-# rejected (see pull_request_commits), and a partial answer there is worse than
-# none -- so unlike the comment list, exceeding this raises rather than
-# returning a truncated list a caller could misread as "the SHA is gone".
-COMMIT_PAGE_LIMIT = 20
+# GitHub's OWN cap on the pull-request commits endpoint: it "lists a maximum of
+# 250 commits" and refers callers with more to the repository commits endpoint.
+# That, not a page count of ours, is where absence stops being provable -- a
+# 250-entry answer looks complete (the last page is short) while saying nothing
+# about commit 251. And the direction is hostile: the endpoint returns commits
+# OLDEST first, so on a longer PR the 250 returned are the oldest and a recent
+# `judged` head is absent from every read. Unguarded, the "is the pinned commit
+# gone?" probe would answer yes on every large PR and abandon real verdicts.
+PR_COMMIT_CAP = 250
 
 # Environment variables `gh` reads a token from. Both are cleared before an
 # explicitly-routed call, so an inherited implementer credential cannot win by
@@ -432,14 +436,15 @@ class GitHub:
         this" from "this can never succeed", so it is worth a call, but only
         there; nothing on the common path reads it.
 
-        Paged like `issue_comments`, and bounded the same way. Truncation is
-        logged and matters here in one direction only: a SHA missing from a
-        truncated list would read as "gone" when it is merely on a later page.
-        The caller must therefore treat an empty/short read conservatively --
-        see loop._abandon_verdict, which only abandons on a complete read.
+        Raises `TruncatedListing` rather than returning a possibly-incomplete
+        list, because the caller uses ABSENCE as evidence and a short answer
+        cannot support that. The bound is GitHub's own 250 (PR_COMMIT_CAP), not
+        a page count of ours: at 250 the last page is short and the listing
+        looks complete while saying nothing about the commits past it.
         """
         out: list[str] = []
-        for page in range(1, COMMIT_PAGE_LIMIT + 1):
+        page = 1
+        while True:
             data = (
                 self._api(
                     "-X",
@@ -453,16 +458,20 @@ class GitHub:
                 or []
             )
             out.extend(str(c.get("sha") or "") for c in data)
+            if len(out) >= PR_COMMIT_CAP:
+                log.warning(
+                    "%s/%s#%d reached GitHub's %d-commit listing cap — the "
+                    "commit list is not complete, so a missing SHA cannot be "
+                    "read as absent",
+                    owner, repo, number, PR_COMMIT_CAP,
+                )
+                raise TruncatedListing(
+                    f"{owner}/{repo}#{number} reached GitHub's {PR_COMMIT_CAP}-commit "
+                    f"listing cap; absence cannot be proven from it"
+                )
             if len(data) < PER_PAGE:
                 return out
-        log.warning(
-            "%s/%s#%d has more than %d commits — the list is truncated, so a "
-            "missing SHA cannot be read as absent",
-            owner, repo, number, COMMIT_PAGE_LIMIT * PER_PAGE,
-        )
-        raise TruncatedListing(
-            f"{owner}/{repo}#{number} has more than {COMMIT_PAGE_LIMIT * PER_PAGE} commits"
-        )
+            page += 1
 
     def my_reviews(self, owner: str, repo: str, number: int) -> list[Review]:
         """My substantive submitted reviews, oldest first -- one per round.

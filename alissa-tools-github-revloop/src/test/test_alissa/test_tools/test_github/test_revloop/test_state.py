@@ -426,3 +426,17 @@ def test_the_judged_head_is_recorded_and_frozen(ledger):
     ledger.note_verdict_post_owed(REPO, 7, 1, "pushed-since")
     assert ledger.get_verdict_post(REPO, 7, 1)["head_sha"] == "abc123"
     assert ledger.read_verdict_posts(1)[0]["head_sha"] == "abc123"
+
+
+def test_abandoned_rounds_counts_the_permanent_holes(ledger):
+    """Each abandonment leaves an envelope with no review record forever, so
+    every later comparison of the two counts has to subtract it."""
+    assert ledger.abandoned_rounds(REPO, 7) == 0
+
+    ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
+    ledger.record_verdict_post_abandoned(REPO, 7, 1, "gone")
+    ledger.note_verdict_post_owed(REPO, 7, 2, "def456")
+    ledger.record_verdict_post(REPO, 7, 2, "url")
+
+    assert ledger.abandoned_rounds(REPO, 7) == 1, "a posted round is not a hole"
+    assert ledger.abandoned_rounds(REPO, 8) == 0, "per PR"

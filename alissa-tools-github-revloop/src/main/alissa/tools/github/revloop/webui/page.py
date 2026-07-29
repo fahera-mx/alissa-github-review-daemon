@@ -208,6 +208,8 @@ section.panel {
   border-color: var(--status-pending); background: var(--status-pending-bg); }
 .pill.converged, .pill.posted { color: var(--status-in-progress);
   border-color: var(--status-in-progress); background: var(--status-in-progress-bg); }
+.pill.abandoned { color: var(--status-cancelled);
+  border-color: var(--status-cancelled); background: var(--status-cancelled-bg); }
 .pill.awaiting-post { color: var(--status-blocked);
   border-color: var(--status-blocked); background: var(--status-blocked-bg); }
 .pill.capped { color: var(--status-cancelled);

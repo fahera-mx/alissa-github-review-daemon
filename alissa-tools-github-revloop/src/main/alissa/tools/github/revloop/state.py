@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
     reaped            INTEGER NOT NULL,
     posted            INTEGER NOT NULL DEFAULT 0,
     awaiting_post     INTEGER NOT NULL DEFAULT 0,
+    abandoned         INTEGER NOT NULL DEFAULT 0,
     stages_json       TEXT    NOT NULL
 );
 """
@@ -140,6 +141,7 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
 _SNAPSHOT_ADDED_COLUMNS = (
     ("posted", "INTEGER NOT NULL DEFAULT 0"),
     ("awaiting_post", "INTEGER NOT NULL DEFAULT 0"),
+    ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -509,6 +511,23 @@ class State:
         row = self.get_verdict_post(repo, number, round_)
         return bool(row is not None and row["abandoned_at"])
 
+    def abandoned_rounds(self, repo: str, number: int) -> int:
+        """How many of this PR's rounds will never have a native verdict.
+
+        Each one leaves a permanent hole between the envelope count and the
+        review count -- the envelope is on the task forever, the review record
+        never exists -- so every later comparison of the two has to subtract
+        it. Without that the daemon reads the hole as "the newest round has no
+        native verdict" and posts a redundant one on the round AFTER each
+        abandonment.
+        """
+        row = self._db.execute(
+            "SELECT COUNT(*) AS n FROM verdict_posts "
+            "WHERE repo=? AND number=? AND abandoned_at IS NOT NULL",
+            (repo, number),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
     def record_verdict_post(
         self, repo: str, number: int, round_: int, review_url: str
     ) -> None:
@@ -551,6 +570,7 @@ class State:
         reaped: int = 0,
         posted: int = 0,
         awaiting_post: int = 0,
+        abandoned: int = 0,
         stages: list[dict],
     ) -> None:
         """Append one poll-pass observation, then prune to the newest
@@ -566,8 +586,8 @@ class State:
             "INSERT INTO poll_snapshots "
             "(ts, duration_ms, candidates, spawned, stale_reenqueued, "
             "in_flight, deferred, converged, capped, escalated, skipped, "
-            "reaped, posted, awaiting_post, stages_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "reaped, posted, awaiting_post, abandoned, stages_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 int(time.time()),
                 duration_ms,
@@ -583,6 +603,7 @@ class State:
                 reaped,
                 posted,
                 awaiting_post,
+                abandoned,
                 json.dumps(stages, separators=(",", ":")),
             ),
         )
