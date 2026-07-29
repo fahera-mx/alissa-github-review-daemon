@@ -212,6 +212,28 @@ ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 # they are documented in the README, not duplicated here.
 ARG ALISSA_POLL_INTERVAL=""
 ARG ALISSA_ROUND_CAP=""
+# Reviewer IDENTITY, and where its credential comes from (issue #51). Both are
+# pass-through (empty ARG default -> key omitted -> library default).
+#
+# ALISSA_REVIEWER_LOGIN pins the GitHub login every verdict must be posted
+# under; the daemon refuses to submit a review as anyone else. Unset, it adopts
+# whatever the gh credential resolved to at boot.
+#
+# ALISSA_REVIEWER_TOKEN_ENV is the NAME of the variable holding that identity's
+# token — never the token, which stays a runtime secret like GH_TOKEN (see the
+# "NOT here (by design)" note above). Set it and the daemon builds an explicit
+# environment for every `gh` call instead of inheriting the container default;
+# leave it empty and the daemon warns at startup, because this container holds
+# several identities and inheritance is how a verdict lands under the wrong one.
+#
+# BOTH REQUIRE REVLOOP_VERSION >= 0.16.3 (pinned at the top of this file). The
+# entrypoint renders them into revloop.config.json, and `Config.build` rejects
+# unknown keys — so setting either against an older pin fails config load with
+# `unknown config key(s): reviewer_token_env`, AFTER the entrypoint has already
+# logged a successful reviewer-identity preflight. That reads as a library bug
+# rather than the version skew it is. Bump the pin before setting these.
+ARG ALISSA_REVIEWER_LOGIN=""
+ARG ALISSA_REVIEWER_TOKEN_ENV=""
 # Reviewer-session reaper knobs, pass-through on the same contract: how long a
 # session must be idle AND quiet before the sweep reaps it, and the page-worthy
 # threshold for live reviewer sessions left after a sweep.
@@ -243,6 +265,8 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
     ALISSA_REAP_GRACE_SECONDS=${ALISSA_REAP_GRACE_SECONDS} \
     ALISSA_REAP_SESSION_CAP=${ALISSA_REAP_SESSION_CAP} \
+    ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} \
+    ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \
     ALISSA_AGENT_MODEL=${ALISSA_AGENT_MODEL} \
     ALISSA_ON_MISSING_HUB=${ALISSA_ON_MISSING_HUB} \

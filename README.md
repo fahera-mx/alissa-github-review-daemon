@@ -108,7 +108,8 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `repos` | `[]` | allowlist of `owner/repo`; empty = all |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
-| `reviewer_login` | `null` | resolved from `gh api user` when null |
+| `reviewer_login` | `null` | the identity every verdict is posted under; resolved from `gh api user` when null |
+| `reviewer_token_env` | `null` | **name** of the env var holding the reviewer's GitHub token (never the token). Set it and every `gh` call runs under that credential explicitly; leave it null and the daemon inherits — and warns |
 | `state_path` | `<workspace-root>/.revloop/state.db` | spawn ledger; per-workspace by default so parallel daemons never share one |
 | `on_missing_review_task` | `spawn_anyway` | `spawn_anyway` \| `warn_and_spawn` \| `skip` |
 | `on_missing_hub` | `skip` | `skip` \| `add` — see *Provisioning new repos* |
@@ -142,6 +143,59 @@ Because of that, a `reviewer_login` that disagrees with the token is **fatal at
 startup**, not a warning: the search would follow the token while round counting
 followed the config, so every round would look like round 1 and respawn forever.
 
+### The verdict of record, and whose credential writes it
+
+A round is **not complete until its verdict exists as a native GitHub review
+submitted by the reviewer identity** — `approve` → `APPROVE`,
+`request_changes` → `REQUEST_CHANGES`. Anything else a session writes is a
+transcript artifact, however complete: only a review by the *requested*
+reviewer expresses the verdict on GitHub and consumes the pending review
+request.
+
+That is not a formality. On studio #298 the round's only artifact was a
+`COMMENTED` review by the **implementer** identity, because the reviewer
+session's `gh` inherited the container's default credential. Consequences, all
+silent: the PR showed no verdict, the ready-flip review request was never
+consumed, and the daemon re-verified the closed round on every poll.
+
+So the daemon owns that post itself. When a review task carries more verdict
+envelopes than the PR has reviewer reviews, the daemon submits the missing one
+after a short grace window (long enough for the session to submit its own
+review first, if it is going to):
+
+- the posting path re-reads `GET /user` and **refuses** to submit under any
+  login other than the configured reviewer — a wrong-identity post is worse
+  than a late one;
+- a post that fails is retried on every poll, and pages the PR after five
+  attempts. The round stays **open** throughout: no convergence, no next round,
+  no cap-out — a missing verdict of record stalls the loop visibly rather than
+  closing it invisibly;
+- each daemon post carries a hidden `round=k` marker, so a session's own review
+  and the daemon's post for the same round count as **one** round against the
+  cap.
+
+`reviewer_token_env` is the other half. It names the environment variable
+holding the reviewer's token, and with it set every `gh` call the daemon makes
+runs under an environment built from that variable with the inherited
+`GH_TOKEN`/`GITHUB_TOKEN` stripped — no ordering by which a container default
+can win. Reviewer *sessions* are told the variable's name in their directive
+(`GH_TOKEN="$VAR" gh …`), since `alissa tmux queue add` has no env-injection
+flag and a session otherwise inherits the worker's environment; the daemon's own
+post is the guarantee either way.
+
+In the container, set `ALISSA_REVIEWER_TOKEN_ENV` to the variable name and
+inject the token at runtime like any other secret. The entrypoint resolves the
+login at boot and refuses to start if the variable is empty, the token is
+rejected, or it belongs to someone other than `ALISSA_REVIEWER_LOGIN`.
+
+> **Version floor.** `ALISSA_REVIEWER_LOGIN` and `ALISSA_REVIEWER_TOKEN_ENV`
+> need `REVLOOP_VERSION >= 0.16.3` in the image. The entrypoint renders them
+> into `revloop.config.json` and the daemon rejects unknown config keys, so
+> setting either against an older pin fails config load with `unknown config
+> key(s): reviewer_token_env` — *after* a successful reviewer-identity
+> preflight, which makes a version skew read like a library bug. Bump the pin
+> first.
+
 ## Provisioning new repos
 
 By default a review for a repo with no worktree hub is **skipped**, with the
@@ -169,6 +223,8 @@ Leave it on `skip` unless you want unattended clones.
 | round already enqueued | in-flight, no-op |
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
 | a round's review has landed | its reviewer session is reaped (freed) — see below |
+| a round's verdict envelope exists but no reviewer-identity review does | the daemon submits it natively after a short grace; the round is **not** closed until it lands |
+| that post keeps failing | retried every poll, paged after 5 attempts — the round stays open |
 | approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | `round_cap` reviews, no approve | comment cap-out on the PR, escalate, stop |

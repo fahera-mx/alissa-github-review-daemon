@@ -7,7 +7,10 @@ on: [pull_request]
 #     structural keys pinned) — docker/claude/tests-entrypoint-config.sh;
 #   * the reviewer-console wiring (ALISSA_UI_ENABLED / ALISSA_UI_PASSCODE /
 #     ${PORT} / /healthz), by booting the real entrypoint against stubbed CLIs
-#     with the real sidecar — docker/claude/tests-entrypoint-ui.sh.
+#     with the real sidecar — docker/claude/tests-entrypoint-ui.sh;
+#   * the reviewer-identity preflight (ALISSA_REVIEWER_TOKEN_ENV /
+#     ALISSA_REVIEWER_LOGIN), likewise by booting the real entrypoint —
+#     docker/claude/tests-entrypoint-identity.sh.
 jobs:
   entrypoint-config-check:
     name: Entrypoint config renderer + console wiring
@@ -47,6 +50,13 @@ jobs:
           fi
       - name: Execute Entrypoint Config Tests
         run: bash docker/claude/tests-entrypoint-config.sh
+      - name: Execute Entrypoint Reviewer-Identity Tests
+        # Boots the entrypoint four times against a `gh` stub that answers with
+        # the login owning the token it was called with — so a call carrying the
+        # inherited credential and one carrying the reviewer's token disagree,
+        # which is the container condition behind issue #51.
+        timeout-minutes: 3
+        run: bash docker/claude/tests-entrypoint-identity.sh
       - name: Execute Entrypoint Console Wiring Tests
         # Boots the entrypoint four times (console off / enabled-without-passcode
         # / enabled / sidecar killed under it). No docker needed: the CLIs the

@@ -15,9 +15,64 @@ daemons over different workspaces on the same machine, each pointed with
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+# A POSIX-ish environment variable name -- what `reviewer_token_env` must be.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# ...which, on its own, accepts every GitHub credential format: `ghp_`, `gho_`,
+# `ghu_`, `ghs_`, `ghr_` and `github_pat_` tokens are `[A-Za-z0-9_]` throughout
+# and therefore valid identifiers. So the shape has to be rejected explicitly,
+# or the one mistake this validation exists to catch -- pasting the token where
+# its variable's NAME belongs -- sails through.
+_TOKEN_SHAPE_RE = re.compile(r"^(gh[pousr]_|github_pat_)", re.IGNORECASE)
+
+# No environment variable name comes close (`REVLOOP_REVIEWER_GH_TOKEN` is 25);
+# every GitHub token, including the 40-character legacy hex ones, exceeds it.
+MAX_ENV_NAME_LENGTH = 32
+
+# Length is not the whole discriminator, because a secret can be short enough
+# to fit under the ceiling. The shape is: a long, undifferentiated run of
+# alphanumerics. Names are conventionally SCREAMING_SNAKE and separated -- the
+# underscore is what a legacy 40-hex token and a generic alnum API key lack.
+MIN_SECRET_RUN_LENGTH = 20
+
+
+def _is_credential_shaped(value: str) -> bool:
+    """Whether a `reviewer_token_env` value looks like a pasted secret.
+
+    A heuristic, and deliberately one that errs toward accusing: the cost of a
+    false positive is renaming a variable, and the cost of a false negative is
+    a live credential sitting in a config file on a shared volume.
+    """
+    return bool(
+        _TOKEN_SHAPE_RE.match(value)
+        or len(value) > MAX_ENV_NAME_LENGTH
+        or (
+            len(value) >= MIN_SECRET_RUN_LENGTH
+            and "_" not in value
+            and value.isalnum()
+        )
+    )
+
+
+def _describe(value: str) -> str:
+    """Name a rejected value in the error -- redacted only when it has to be.
+
+    `__main__` prints this to stderr as `config error: …`, straight into the
+    container log, so a pasted secret must not be duplicated there: those get
+    length plus a short prefix. But the other way to fail this check is an
+    ordinary typo (`REVLOOP-REVIEWER-GH-TOKEN`), and there the value IS the
+    diagnostic -- redacting it turns a one-glance fix into a puzzle. The two
+    are separable now that credential shapes are identified explicitly.
+    """
+    if _is_credential_shaped(value):
+        return f'a {len(value)}-character value starting "{value[:4]}…"'
+    return repr(value)
+
 
 # What to do when a PR has a pending review request but no matching Alissa
 # review task (CR2 is implementer-side, so a third-party PR may not have one).
@@ -44,6 +99,7 @@ CONFIG_KEYS = (
     "operators",
     "agent_profile",
     "reviewer_login",
+    "reviewer_token_env",
     "state_path",
     "on_missing_review_task",
     "on_missing_hub",
@@ -116,6 +172,15 @@ class Config:
 
     agent_profile: str = "claude"
     reviewer_login: str | None = None  # None -> resolve once via `gh api user`
+
+    # NAME of the environment variable holding the reviewer identity's GitHub
+    # token -- never the token itself, which has no business in a config file
+    # on a mounted volume. Set it and every `gh` call the daemon makes runs
+    # under that credential explicitly, with the container's inherited
+    # GH_TOKEN/GITHUB_TOKEN stripped; leave it None and the daemon inherits,
+    # which is the pre-#51 behaviour and warns loudly at preflight because a
+    # shared container is exactly where inheritance picks the wrong identity.
+    reviewer_token_env: str | None = None
 
     # None means "derive from the workspace" -- read `state_db` for the
     # resolved location, never this field.
@@ -247,6 +312,28 @@ class Config:
             # state of a working loop -- an alarm that always fires is noise.
             raise ValueError(f"reap_session_cap must be >= 1, got {session_cap}")
 
+        token_env = raw.get("reviewer_token_env")
+        if token_env is not None:
+            token_env = str(token_env).strip()
+            # The overwhelmingly likely way to get here is pasting the TOKEN in
+            # place of the variable's name, which would leave a live credential
+            # in a config file on a shared volume and then fail as "unset
+            # variable" — an error that reads as though the secret were missing
+            # rather than exposed. So the check is two-sided: it must LOOK like
+            # a name, and it must not look like a credential. The value itself
+            # is never echoed back (see _redact).
+            if not _ENV_NAME_RE.match(token_env) or _is_credential_shaped(token_env):
+                rotate = (
+                    " If that is a credential, rotate it: it is now in a config file."
+                    if _is_credential_shaped(token_env)
+                    else ""
+                )
+                raise ValueError(
+                    f"reviewer_token_env must be an environment variable NAME "
+                    f"(e.g. 'REVLOOP_REVIEWER_GH_TOKEN'), not a value or a "
+                    f"token — got {_describe(token_env)}.{rotate}"
+                )
+
         state_path = raw.get("state_path")
         return cls(
             workspace_root=Path(workspace_root),
@@ -257,6 +344,7 @@ class Config:
             operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),
+            reviewer_token_env=token_env or None,
             state_path=Path(state_path).expanduser() if state_path else None,
             on_missing_review_task=mode,
             on_missing_hub=hub_mode,

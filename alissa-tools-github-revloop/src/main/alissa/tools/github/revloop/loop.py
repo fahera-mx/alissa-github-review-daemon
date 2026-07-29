@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .alissa import (
     VERDICT_APPROVE,
+    VERDICT_REQUEST_CHANGES,
     Alissa,
     ManagedSession,
     SessionRef,
@@ -34,7 +35,17 @@ from .config import (
     STALE_ROUND_SECONDS,
     Config,
 )
-from .ghclient import GitHub, IssueComment, PullRequest, RateLimited, Review
+from .ghclient import (
+    EVENT_APPROVE,
+    EVENT_REQUEST_CHANGES,
+    GitHub,
+    IssueComment,
+    PullRequest,
+    RateLimited,
+    Review,
+    countable_rounds,
+    verdict_marker,
+)
 from .proc import CommandError
 from .state import State
 
@@ -59,6 +70,114 @@ STALLED_DEFER_MULTIPLE = 2
 # turns" from "done". Recent tmux activity can. The same number answers the
 # stale-round liveness probe, which asks the same question; see
 # config.DEFAULT_REAP_GRACE_SECONDS.
+
+# How long the daemon waits, after first seeing a round whose verdict envelope
+# has no native reviewer-identity review, before posting that review itself.
+# The window exists for one race: the reviewer session writes its envelope and
+# submits its own review moments apart, and a poll landing between the two
+# would post a second record for a round that was about to close itself. Five
+# minutes is far longer than that gap and far shorter than a round, so a
+# genuinely missing post (the studio #298 shape) still heals within one cycle
+# of the operator noticing nothing.
+VERDICT_POST_GRACE_SECONDS = 5 * 60
+
+# Failed post attempts before the daemon stops treating it as transient and
+# pages a human. It keeps retrying afterwards -- the round stays OPEN either
+# way, which is the invariant -- but a permanent failure (a revoked token, a
+# repo the reviewer identity cannot review) must not stay a log line.
+MAX_VERDICT_POST_ATTEMPTS = 5
+
+# Ceiling on the retry backoff below. "Keep retrying" is the invariant; "keep
+# retrying every poll forever" is not: at the deployed 30s interval a
+# permanently-failing post costs ~2,880 review POSTs and as many task reads a
+# day, per stuck PR, with the operator paged exactly once.
+MAX_VERDICT_POST_BACKOFF_SECONDS = 60 * 60
+
+
+def _post_delay_after(attempts: int) -> float:
+    """Seconds to wait after attempt `attempts` before trying again.
+
+    An inter-attempt DELAY, deliberately not a deadline measured from a fixed
+    origin: a capped absolute deadline stops bounding anything the moment the
+    row is older than the cap, and every later poll attempts the post again --
+    the hot loop back an hour late. Measured from `last_attempt_at`, the wait
+    keeps holding at any age.
+
+    Exponential in the attempt count and capped, so the first retries still
+    come at roughly poll cadence (the right answer to a blip) and a hopeless
+    post settles at a single attempt an hour. The round never closes either
+    way; only the cadence is bounded.
+    """
+    return min(2 ** max(attempts, 0) * 60, MAX_VERDICT_POST_BACKOFF_SECONDS)
+
+
+# The native verdict review body. The verdict word is the payload; the round
+# and the review task make it auditable, and the marker (invisible in the
+# rendered comment) is what keeps this from being counted as a second round
+# alongside the reviewer session's own write-up.
+NATIVE_VERDICT_BODY = (
+    "**Review round {round} — `{verdict}`**\n\n"
+    "Submitted by the review daemon under the configured reviewer identity, so "
+    "this round has a verdict of record on GitHub. The round's findings and "
+    "reasoning are in the reviewer session's own comments on this PR{task_note}."
+    "{head_note}\n\n"
+    "{marker}"
+)
+
+# Appended to the body when the round's review task is known.
+_VERDICT_TASK_NOTE = ", and the CR6 verdict envelope is on `{task_ref}`"
+
+# Appended when the head moved between the round being queued and this post.
+# The review record already says so (it is pinned to `{judged}`), but only a
+# reader who checks the commit would notice, and "an approve that does not
+# cover the current head" is the one thing about this record that changes what
+# happens next: the loop treats the PR as owing another round.
+HEAD_MOVED_NOTE = (
+    "\n\n> This verdict judged `{judged}`; the head is now `{head}`. It is "
+    "recorded against the commit it actually reviewed, so it does **not** "
+    "count as a verdict on the newer code — the next round is owed."
+)
+
+# The operator page for a native verdict post that keeps failing. Loud on
+# purpose: until it lands the round is NOT closed, so the loop is stalled on
+# this PR and no amount of waiting fixes it.
+VERDICT_POST_FAILED_COMMENT = (
+    "**Review round {round} cannot be closed** — its verdict (`{verdict}`) is "
+    "recorded on the review task, but the daemon has failed {attempts} times to "
+    "submit it as a native GitHub review under the reviewer identity "
+    "(`{reviewer}`).\n\n"
+    "Last error:\n```\n{error}\n```\n\n"
+    "A round is not complete until that review exists: the verdict has no "
+    "record on GitHub, the pending review request is never consumed, and the "
+    "daemon will not queue the next round. It keeps retrying, but this usually "
+    "needs a credential fix — check that the reviewer token is present, valid, "
+    "and belongs to `{reviewer}`. Submitting the review by hand as `{reviewer}` "
+    "also closes the round."
+)
+
+# Told to the reviewer session when the daemon knows which environment variable
+# carries the reviewer credential. Sessions run in a shared container whose
+# default `gh` credential belongs to the IMPLEMENTER identity, which is how
+# round-1 verdicts landed under the wrong login on studio #298/#302; naming the
+# variable (never its value) is what lets a session route around the default.
+# It deliberately does NOT assume the variable is there: the daemon populates
+# its own environment, not the worker's, so an unexported variable would expand
+# to an empty string -- and `gh` reads an empty GH_TOKEN as "no token" and falls
+# back to the container default, which is the very identity this clause exists
+# to avoid. Verify, then write or skip; the daemon's own post closes the round
+# either way, so skipping costs nothing and a blind write costs the verdict.
+_POST_AS_REVIEWER = (
+    "CREDENTIAL — this container's default `gh` credential is NOT the reviewer "
+    "identity. Before any `gh` call that WRITES to the PR, check that "
+    "`${env_var}` is non-empty AND that "
+    "`GH_TOKEN=\"${env_var}\" gh api user --jq .login` prints `{reviewer}`. If "
+    "both hold, prefix every write with `GH_TOKEN=\"${env_var}\" ` (the "
+    "variable, never its value). If either fails, do NOT post the review at "
+    "all — say so in your verdict evidence and stop: an empty GH_TOKEN falls "
+    "back to the default credential, and a review under it is not the round's "
+    "verdict of record. The daemon submits the native verdict either way, so "
+    "skipping the write loses nothing. "
+)
 
 # The closing contract is spelled out in both directives (not just the skill)
 # because it is the reviewer's most-skipped step: on re-review, sessions produce
@@ -105,6 +224,7 @@ ROUND_1_DIRECTIVE = (
     "severity-tagged comments via gh pr review, record the verdict evidence, "
     "move the task to pending_validation. "
     + _RECORD_THE_CAP
+    + "{credential}"
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions. "
@@ -119,6 +239,7 @@ ROUND_K_DIRECTIVE = (
     "verify the fixes, sweep the new diff with the full rubric, record a "
     "round-{round} verdict envelope, move the task to pending_validation. "
     + _RECORD_THE_CAP
+    + "{credential}"
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions. "
@@ -361,6 +482,18 @@ def parse_reentry_ack(body: str) -> Ack:
     return Ack(rounds=rounds)
 
 
+def verdict_post_kind(round_: int) -> str:
+    """The ping-ledger kind that dedupes ONE round's failed-post page.
+
+    Per round, not per PR: round 2 failing to close is a new problem even if
+    round 1's page is still unanswered. The row is written only AFTER the
+    comment posts, like the stalled ping -- this is the operator's only signal
+    that the loop has stopped on this PR, so a transient comment failure must
+    retry rather than be swallowed.
+    """
+    return f"verdict-post-failed:{round_}"
+
+
 class Action(str, Enum):
     SPAWNED = "spawned"
     IN_FLIGHT = "in-flight"
@@ -368,6 +501,13 @@ class Action(str, Enum):
     CAPPED = "capped"
     ESCALATED = "escalated"
     SKIPPED = "skipped"
+    # The round's verdict just landed as a native reviewer-identity review --
+    # the moment the round actually closes.
+    POSTED = "posted"
+    # The round has a verdict but no native review yet: inside the grace
+    # window, or the post failed and is being retried. Either way the round is
+    # NOT closed and nothing downstream of it runs.
+    AWAITING_POST = "awaiting-post"
 
 
 @dataclass(frozen=True)
@@ -419,7 +559,9 @@ class ReviewWatcher:
         state: State | None = None,
     ):
         self.config = config
-        self.github = github or GitHub(config.reviewer_login)
+        self.github = github or GitHub(
+            config.reviewer_login, token_env=config.reviewer_token_env
+        )
         self.alissa = alissa or Alissa()
         self.state = state or State(config.state_db)
         # (repo, number, comment id) of every re-entry directive already
@@ -464,10 +606,33 @@ class ReviewWatcher:
         # exists (round 1). Looked up here (not in _spawn) because both the count
         # and convergence need it.
         task = self.alissa.find_review_task(owner, repo, number)
+        native = countable_rounds(my_reviews)
         completed = (
-            self.alissa.count_verdicts(task.ref) if task is not None
-            else len(my_reviews)
+            self.alissa.count_verdicts(task.ref) if task is not None else native
         )
+
+        # A round is not over until its verdict exists as a native review by
+        # the reviewer identity (issue #51). An envelope ahead of the native
+        # count is exactly that gap, and it is checked BEFORE convergence on
+        # purpose: an approve envelope with no native APPROVE behind it would
+        # otherwise close the loop with no verdict of record on GitHub and the
+        # review request still dangling -- the studio #298 failure.
+        # ...unless the post was ABANDONED, which happens only when the head the
+        # round judged is gone from the PR. There is then no commit left to
+        # record that verdict against, and holding the round open would strand
+        # the PR outside the loop forever; the round is released instead and a
+        # fresh one is owed against the new head. See _abandon_verdict.
+        if (
+            task is not None
+            and completed > native
+            and not self.state.verdict_post_abandoned(pr.full_name, number, completed)
+        ):
+            # Terminal for this pass either way. On a landed post the review
+            # request it consumed drops the PR out of the search, so
+            # convergence and the next round belong to the next pass, decided
+            # from GitHub rather than from this pass's now-stale counts; on
+            # anything else the round is still open and nothing may follow it.
+            return self._close_round_natively(pr, task, round_=completed)
 
         converged = self._convergence_reason(my_reviews, task, pr.head_sha)
         if converged is not None:
@@ -514,6 +679,297 @@ class ReviewWatcher:
             )
 
         return self._spawn(pr, round_, task, cap, reenqueued=age is not None)
+
+    # -- native verdict post -----------------------------------------------
+
+    def _close_round_natively(
+        self, pr: PullRequest, task: Task, round_: int
+    ) -> Decision:
+        """Land round `round_`'s verdict as a native reviewer-identity review.
+
+        Called when the review task carries more verdict envelopes than the PR
+        has countable reviewer reviews -- i.e. a round produced a verdict that
+        never became a review of record. Three outcomes, and none of them
+        closes the round unless a review actually lands:
+
+        * inside the grace window -> AWAITING_POST, so a reviewer session that
+          is seconds from submitting its own review is not raced;
+        * post succeeds -> POSTED, and the pending review request GitHub was
+          holding is consumed by that very submission;
+        * post fails -> AWAITING_POST, retried next poll, and paged to an
+          operator once the attempts pass MAX_VERDICT_POST_ATTEMPTS.
+
+        Never raises past RateLimited: a broken post must stall this PR, not
+        the whole poll pass.
+        """
+        verdict = self.alissa.latest_verdict(task.ref)
+        if verdict not in (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES):
+            # count_verdicts and latest_verdict read the same envelopes with
+            # the same pattern, so this is nearly unreachable -- but "I know a
+            # round finished and cannot tell you its verdict" must never be
+            # resolved by guessing one onto the PR.
+            log.error(
+                "%s round %d has a verdict envelope on %s that does not parse "
+                "to a verdict (%r) — cannot post it; the round stays open",
+                pr.slug, round_, task.ref, verdict,
+            )
+            return Decision(
+                Action.AWAITING_POST,
+                f"round {round_}'s envelope on {task.ref} has no readable verdict",
+                round_,
+                task_ref=task.ref,
+            )
+
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] would submit a native %s review for round %d of %s",
+                verdict, round_, pr.slug,
+            )
+            return Decision(
+                Action.AWAITING_POST,
+                f"[dry-run] round {round_} would be closed with a native "
+                f"{verdict} review",
+                round_,
+                task_ref=task.ref,
+            )
+
+        row = self.state.note_verdict_post_owed(
+            pr.full_name, pr.number, round_, self._judged_head(pr, round_)
+        )
+        attempts = int(row["attempts"])
+        if attempts == 0:
+            # The grace window: measured from the first observation, because it
+            # is about the round's own session getting its chance, not about
+            # retrying.
+            left = VERDICT_POST_GRACE_SECONDS - (time.time() - int(row["first_seen_at"]))
+            reason = f"{int(left)}s of grace left for its own session to submit one"
+        else:
+            # Every later attempt is spaced from the PREVIOUS one; see
+            # _post_delay_after for why not from a fixed origin.
+            since = time.time() - int(row["last_attempt_at"] or row["first_seen_at"])
+            left = _post_delay_after(attempts) - since
+            reason = (
+                f"backing off after {attempts} failed attempt(s), "
+                f"retrying in {int(left)}s"
+            )
+        if left > 0:
+            return Decision(
+                Action.AWAITING_POST,
+                f"round {round_} has a {verdict} envelope but no native review "
+                f"yet — {reason}",
+                round_,
+                task_ref=task.ref,
+            )
+
+        judged = str(row["head_sha"] or pr.head_sha)
+        moved = bool(judged) and judged != pr.head_sha
+        event = EVENT_APPROVE if verdict == VERDICT_APPROVE else EVENT_REQUEST_CHANGES
+        body = NATIVE_VERDICT_BODY.format(
+            round=round_,
+            verdict=verdict,
+            task_note=_VERDICT_TASK_NOTE.format(task_ref=task.ref),
+            head_note=(
+                HEAD_MOVED_NOTE.format(judged=judged[:8], head=pr.head_sha[:8])
+                if moved
+                else ""
+            ),
+            marker=verdict_marker(round_),
+        )
+        try:
+            url = self.github.submit_review(
+                pr.owner, pr.repo, pr.number,
+                event=event, body=body, commit_id=judged,
+            )
+        except RateLimited:
+            # run_forever's backoff is the whole response to a rate limit.
+            raise
+        except Exception as exc:
+            # Broad on purpose. The named failures -- CommandError (gh said
+            # no), IdentityMismatch (the credential is the wrong identity),
+            # ReviewerTokenUnset (it is missing entirely) -- are the expected
+            # ones, and every one of them means the same thing: the round did
+            # not close. An unexpected failure means that too, and must not
+            # take down a poll pass that has other PRs to decide.
+            return self._verdict_post_failed(pr, task, round_, verdict, judged, exc)
+
+        self.state.record_verdict_post(pr.full_name, pr.number, round_, url)
+        log.info(
+            "%s round %d closed: native %s review submitted as %s (%s)",
+            pr.slug, round_, event, self.github.login, url or "no url",
+        )
+        self._append_activity(
+            pr,
+            f"- {_now()} — round {round_} — native `{event}` review submitted "
+            f"as `{self.github.login}` (verdict of record)",
+        )
+        return Decision(
+            Action.POSTED,
+            f"round {round_} closed with a native {event} review as "
+            f"{self.github.login}",
+            round_,
+            task_ref=task.ref,
+        )
+
+    def _judged_head(self, pr: PullRequest, round_: int) -> str:
+        """The head round `round_`'s verdict is ABOUT — not the current one.
+
+        A review carries the commit it judged, and `_convergence_reason` reads
+        that commit to decide whether an approval still covers the code. Post
+        with the head at POST time and an old approve is restamped onto commits
+        no reviewer has seen, and the next pass converges on it: the #227 latch,
+        rebuilt inside the daemon's own post. The gap is not small -- it spans
+        an implementer triaging visible findings and pushing, a daemon restart,
+        or a rate-limit backoff.
+
+        The spawn ledger is the answer: its row for this round records the head
+        the round was QUEUED against. That is deliberately the conservative
+        choice over the current head. If a session actually reviewed a newer
+        head pushed mid-round, attributing to the queued head under-claims --
+        convergence is missed and one extra round runs. Over-claiming produces
+        a false approve. Only one of those is recoverable.
+
+        Falls back to the current head when there is no ledger row at all (a
+        hand-spawned round, or one whose ledger was lost); that is no worse
+        than the behaviour without a ledger, and the caller records whatever
+        this returns so the answer cannot drift between polls.
+        """
+        row = self.state.get_spawn(pr.full_name, pr.number, round_)
+        if row is not None and row["head_sha"]:
+            return str(row["head_sha"])
+        return pr.head_sha
+
+    def _abandon_verdict(
+        self,
+        pr: PullRequest,
+        task: Task,
+        round_: int,
+        judged: str,
+        exc: BaseException,
+    ) -> Decision | None:
+        """Give up on a post that can never succeed, or None to keep retrying.
+
+        Pinning the verdict to the head its round judged (the fix for the
+        stale-approve latch) makes one new failure possible: a rebase or an
+        amended force-push removes that commit from the PR, GitHub rejects the
+        review, and no amount of retrying will change that. Without an exit the
+        round stays open forever -- which means round k+1 is never spawned and
+        the PR leaves the loop until a human edits sqlite. That is a worse
+        outcome than any verdict-of-record concern this path exists to serve.
+
+        The exit is to ABANDON the owed post, never to fall back to the current
+        head: the verdict judged code that no longer exists in the PR, so
+        restamping it forward is exactly the latch that was just removed.
+        Abandoning releases the round, and the next pass spawns a fresh one
+        against the new head -- the same place the head-moved path lands, minus
+        the unpostable POST.
+
+        Detection does not trust the error string. A rejection that mentions
+        the commit only *starts* the question; the answer comes from reading
+        the PR's commits and finding the judged SHA genuinely absent. Any other
+        422, an unreadable commit list, or a listing too long to prove absence
+        from all stay on the ordinary retry path -- the conservative direction,
+        since abandoning wrongly discards a real verdict.
+        """
+        blob = str(exc).lower()
+        if not ("422" in blob or "commit_id" in blob or "unprocessable" in blob):
+            return None
+        if not judged:
+            return None
+        try:
+            commits = self.github.pull_request_commits(pr.owner, pr.repo, pr.number)
+        except RateLimited:
+            raise
+        except Exception as probe_exc:
+            log.warning(
+                "%s round %d: the review POST was rejected and the PR's commit "
+                "list is unreadable (%s) — retrying rather than assuming the "
+                "judged head is gone",
+                pr.slug, round_, probe_exc,
+            )
+            return None
+        if judged in commits:
+            return None  # the pin is fine; the 422 is about something else
+
+        why = (
+            f"the head this round judged ({judged[:8]}) is no longer a commit of "
+            f"the PR — a force-push landed under it"
+        )
+        self.state.record_verdict_post_abandoned(pr.full_name, pr.number, round_, why)
+        log.error(
+            "%s round %d: ABANDONING its native verdict — %s. The round is "
+            "released so a fresh round can run against %s; the verdict stays on "
+            "%s as the record of what was judged.",
+            pr.slug, round_, why, pr.head_sha[:8], task.ref,
+        )
+        self._append_activity(
+            pr,
+            f"- {_now()} — round {round_} — native verdict abandoned: {why}. "
+            f"A fresh round is owed against `{pr.head_sha[:8]}`.",
+        )
+        return Decision(
+            Action.AWAITING_POST,
+            f"round {round_}'s native verdict was abandoned — {why}",
+            round_,
+            task_ref=task.ref,
+        )
+
+    def _verdict_post_failed(
+        self,
+        pr: PullRequest,
+        task: Task,
+        round_: int,
+        verdict: str,
+        judged: str,
+        exc: BaseException,
+    ) -> Decision:
+        """Count a failed post, page once it stops looking transient, and keep
+        the round OPEN. The page is the point: a silently missing native
+        verdict is the exact defect this whole path exists to remove, so it
+        must not degrade into a quiet retry loop.
+
+        One failure is NOT retryable and gets its own exit: the commit the
+        verdict was pinned to is no longer in the PR. See _abandon_verdict.
+        """
+        attempts = self.state.record_verdict_post_failure(
+            pr.full_name, pr.number, round_, str(exc)
+        )
+        abandoned = self._abandon_verdict(pr, task, round_, judged, exc)
+        if abandoned is not None:
+            return abandoned
+        log.error(
+            "%s round %d: native %s review FAILED (attempt %d) — %s; the round "
+            "stays open and the post retries next poll",
+            pr.slug, round_, verdict, attempts, exc,
+        )
+        if attempts >= MAX_VERDICT_POST_ATTEMPTS and not self.state.pinged(
+            pr.full_name, pr.number, verdict_post_kind(round_)
+        ):
+            body = VERDICT_POST_FAILED_COMMENT.format(
+                round=round_,
+                verdict=verdict,
+                attempts=attempts,
+                reviewer=self.github.login,
+                error=str(exc)[:500],
+            )
+            try:
+                self.github.comment(pr.owner, pr.repo, pr.number, body)
+            except Exception as comment_exc:  # pragma: no cover - defence in depth
+                log.error(
+                    "could not post the failed-verdict page on %s: %s — the ping "
+                    "retries next poll",
+                    pr.slug, comment_exc,
+                )
+            else:
+                self.state.record_ping(
+                    pr.full_name, pr.number, verdict_post_kind(round_)
+                )
+        return Decision(
+            Action.AWAITING_POST,
+            f"round {round_}'s native {verdict} review failed to submit "
+            f"(attempt {attempts}) — the round is NOT closed",
+            round_,
+            task_ref=task.ref,
+        )
 
     # -- operator re-entry -------------------------------------------------
 
@@ -1236,7 +1692,7 @@ class ReviewWatcher:
             # which spares the session (round >= 1 > 0).
             return self.alissa.count_verdicts(task_ref)
         try:
-            return len(self.github.my_reviews(pr.owner, pr.repo, pr.number))
+            return countable_rounds(self.github.my_reviews(pr.owner, pr.repo, pr.number))
         except RateLimited:
             raise
         except CommandError as exc:
@@ -1275,7 +1731,11 @@ class ReviewWatcher:
         name = session_name(pr, round_)
         template = ROUND_1_DIRECTIVE if round_ == 1 else ROUND_K_DIRECTIVE
         directive = template.format(
-            assignment=assignment, round=round_, cap=cap, session=name
+            assignment=assignment,
+            round=round_,
+            cap=cap,
+            session=name,
+            credential=self._credential_clause(),
         )
 
         hub, problem = self._ensure_hub(pr)
@@ -1315,6 +1775,26 @@ class ReviewWatcher:
             session=name,
             task_ref=task.ref if task else None,
             reenqueued=reenqueued,
+        )
+
+    def _credential_clause(self) -> str:
+        """The directive's credential-routing clause, or "" when there is
+        nothing useful to say.
+
+        `alissa tmux queue add` has no env-injection flag, so a reviewer
+        session inherits the worker's environment -- in this container, the
+        IMPLEMENTER identity's `gh` credential. The daemon cannot fix that from
+        outside the session; what it can do is tell the session which variable
+        holds the right token, by NAME, so its own `gh` calls can route around
+        the default. With no `reviewer_token_env` configured there is no name
+        to give and the clause is omitted rather than replaced with advice the
+        session cannot act on -- the daemon's own native post is the guarantee
+        either way.
+        """
+        if not self.config.reviewer_token_env:
+            return ""
+        return _POST_AS_REVIEWER.format(
+            env_var=self.config.reviewer_token_env, reviewer=self.github.login
         )
 
     def _ensure_hub(self, pr: PullRequest) -> tuple[Path, str | None]:
@@ -1369,9 +1849,27 @@ class ReviewWatcher:
         """Startup checks. Returns warnings; raises on anything fatal."""
         warnings: list[str] = []
 
-        # Fatal: a mismatched identity silently breaks round counting.
+        # Fatal: a mismatched identity silently breaks round counting -- and
+        # this is also the once-per-process identity assertion every later
+        # review post is held to (see GitHub.assert_review_identity), so the
+        # resolved login is logged rather than merely checked.
         login = self.github.verify_identity()
-        log.info("reviewing as GitHub user %s (from the gh token)", login)
+        source = (
+            f"from ${self.config.reviewer_token_env}"
+            if self.config.reviewer_token_env
+            else "from the inherited gh credential"
+        )
+        log.info("reviewing as GitHub user %s (%s)", login, source)
+
+        if not self.config.reviewer_token_env:
+            warnings.append(
+                "no reviewer_token_env configured — every `gh` call uses "
+                "whatever GH_TOKEN/GITHUB_TOKEN this process inherited. In a "
+                "container that holds more than one GitHub identity that is "
+                "how a round's verdict lands under the wrong login; set "
+                "reviewer_token_env to the NAME of the variable carrying the "
+                f"reviewer ({login}) token"
+            )
 
         if not self.config.workspace_root.is_dir():
             warnings.append(f"workspace_root {self.config.workspace_root} does not exist")
@@ -1654,6 +2152,8 @@ class ReviewWatcher:
             escalated=counts[Action.ESCALATED],
             skipped=counts[Action.SKIPPED],
             reaped=reaped,
+            posted=counts[Action.POSTED],
+            awaiting_post=counts[Action.AWAITING_POST],
             stages=stages,
         )
 

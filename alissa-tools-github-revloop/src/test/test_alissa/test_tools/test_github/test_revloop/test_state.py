@@ -28,7 +28,8 @@ def ledger(tmp_path):
 
 def _snap(ledger, *, duration_ms=42, candidates=1, spawned=0,
           stale_reenqueued=0, in_flight=0, deferred=0, converged=0, capped=0,
-          escalated=0, skipped=0, reaped=0, stages=None):
+          escalated=0, skipped=0, reaped=0, posted=0, awaiting_post=0,
+          stages=None):
     """Record one poll snapshot with sensible defaults; overrides per call."""
     ledger.record_snapshot(
         duration_ms=duration_ms,
@@ -42,6 +43,8 @@ def _snap(ledger, *, duration_ms=42, candidates=1, spawned=0,
         escalated=escalated,
         skipped=skipped,
         reaped=reaped,
+        posted=posted,
+        awaiting_post=awaiting_post,
         stages=stages if stages is not None else [],
     )
 
@@ -308,3 +311,118 @@ def test_grants_table_is_added_to_a_database_that_predates_it(tmp_path):
         assert st.granted_rounds(REPO, 7) == 0
         assert st.record_grant(REPO, 7, 1001, "rhdzmota", 1) is True
         assert st.granted_rounds(REPO, 7) == 1
+
+
+# -- native verdict posts (issue #51) ---------------------------------------
+
+
+def test_a_verdict_post_row_keeps_its_first_observation(ledger):
+    """The grace window before the daemon posts is measured from when the gap
+    was FIRST seen — a timestamp that moved every poll would push the deadline
+    out forever and the round would never close."""
+    first = ledger.note_verdict_post_owed(REPO, 7, 1)
+    again = ledger.note_verdict_post_owed(REPO, 7, 1)
+
+    assert again == first
+    row = ledger.get_verdict_post(REPO, 7, 1)
+    assert row["attempts"] == 0 and row["posted_at"] is None
+
+
+def test_failed_post_attempts_accumulate_with_the_last_error(ledger):
+    ledger.note_verdict_post_owed(REPO, 7, 1)
+
+    assert ledger.record_verdict_post_failure(REPO, 7, 1, "401 Bad credentials") == 1
+    assert ledger.record_verdict_post_failure(REPO, 7, 1, "401 Bad credentials") == 2
+    assert "401" in ledger.get_verdict_post(REPO, 7, 1)["last_error"]
+
+
+def test_a_landed_post_clears_the_error_and_records_the_url(ledger):
+    ledger.note_verdict_post_owed(REPO, 7, 1)
+    ledger.record_verdict_post_failure(REPO, 7, 1, "boom")
+    ledger.record_verdict_post(REPO, 7, 1, "https://github.com/acme/widgets/pull/7#r1")
+
+    row = ledger.get_verdict_post(REPO, 7, 1)
+    assert row["posted_at"] is not None
+    assert row["last_error"] is None
+    assert row["review_url"].endswith("#r1")
+    assert ledger.read_verdict_posts(1)[0]["round"] == 1
+
+
+def test_rounds_track_their_posts_independently(ledger):
+    ledger.note_verdict_post_owed(REPO, 7, 1)
+    ledger.record_verdict_post(REPO, 7, 1, "url-1")
+    ledger.note_verdict_post_owed(REPO, 7, 2)
+
+    assert ledger.get_verdict_post(REPO, 7, 1)["posted_at"] is not None
+    assert ledger.get_verdict_post(REPO, 7, 2)["posted_at"] is None
+
+
+def test_the_new_snapshot_columns_are_altered_into_an_older_database(tmp_path):
+    """CREATE TABLE IF NOT EXISTS is NOT a migration for a table that already
+    exists: `posted` / `awaiting_post` have to be ALTERed in, and every
+    historical row backfills to 0 (an old pass really did post no verdicts)."""
+    path = tmp_path / "state.db"
+    con = sqlite3.connect(str(path))
+    con.executescript(
+        """
+        CREATE TABLE poll_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+            candidates INTEGER NOT NULL, spawned INTEGER NOT NULL,
+            stale_reenqueued INTEGER NOT NULL, in_flight INTEGER NOT NULL,
+            deferred INTEGER NOT NULL, converged INTEGER NOT NULL,
+            capped INTEGER NOT NULL, escalated INTEGER NOT NULL,
+            skipped INTEGER NOT NULL, reaped INTEGER NOT NULL,
+            stages_json TEXT NOT NULL
+        );
+        INSERT INTO poll_snapshots VALUES
+            (1, 100, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, '[]');
+        """
+    )
+    con.commit()
+    con.close()
+
+    with State(path) as st:
+        rows = st.read_snapshots()
+        assert rows[0]["posted"] == 0 and rows[0]["awaiting_post"] == 0
+        _snap(st, posted=1, awaiting_post=2, stages=[])
+        newest = st.read_snapshots(1)[0]
+        assert newest["posted"] == 1 and newest["awaiting_post"] == 2
+
+    # Idempotent: a second open must not try to re-ALTER the same columns.
+    with State(path) as st:
+        assert len(st.read_snapshots()) == 2
+
+
+def test_an_abandoned_verdict_post_is_terminal(ledger):
+    """The exit for a post that can never succeed — the head it was pinned to
+    is gone from the PR. Without it the round is held open forever and the PR
+    leaves the review loop until a human edits this table."""
+    ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
+    assert ledger.verdict_post_abandoned(REPO, 7, 1) is False
+
+    ledger.record_verdict_post_abandoned(REPO, 7, 1, "abc123 is gone from the PR")
+
+    assert ledger.verdict_post_abandoned(REPO, 7, 1) is True
+    row = ledger.get_verdict_post(REPO, 7, 1)
+    assert row["posted_at"] is None, "abandoned is not posted"
+    assert "gone from the PR" in row["last_error"]
+    assert ledger.verdict_post_abandoned(REPO, 7, 2) is False, "per round"
+
+
+def test_a_failed_attempt_stamps_when_it_ran(ledger):
+    """The retry delay is measured from the last attempt, not from a fixed
+    origin — so the attempt has to record when it happened."""
+    ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
+    assert ledger.get_verdict_post(REPO, 7, 1)["last_attempt_at"] is None
+
+    ledger.record_verdict_post_failure(REPO, 7, 1, "boom")
+
+    assert ledger.get_verdict_post(REPO, 7, 1)["last_attempt_at"] is not None
+
+
+def test_the_judged_head_is_recorded_and_frozen(ledger):
+    ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
+    ledger.note_verdict_post_owed(REPO, 7, 1, "pushed-since")
+    assert ledger.get_verdict_post(REPO, 7, 1)["head_sha"] == "abc123"
+    assert ledger.read_verdict_posts(1)[0]["head_sha"] == "abc123"

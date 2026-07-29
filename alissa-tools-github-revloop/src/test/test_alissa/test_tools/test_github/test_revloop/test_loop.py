@@ -22,6 +22,8 @@ from alissa.tools.github.revloop.config import (
     resolve_config_path,
 )
 from alissa.tools.github.revloop.alissa import (
+    VERDICT_APPROVE,
+    VERDICT_REQUEST_CHANGES,
     ManagedSession,
     SessionRef,
     parse_session_name,
@@ -36,19 +38,26 @@ from alissa.tools.github.revloop.ghclient import (
     PullRequest,
     RateLimited,
     Review,
+    ReviewerTokenUnset,
+    countable_rounds,
+    verdict_marker,
 )
+from alissa.tools.github.revloop import loop as loop_module
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     MAX_REENTRY_ROUNDS,
+    MAX_VERDICT_POST_ATTEMPTS,
     REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
+    VERDICT_POST_GRACE_SECONDS,
     Action,
     ReviewWatcher,
     deferral_activity_kind,
     parse_reentry_ack,
     session_name,
     stalled_kind,
+    verdict_post_kind,
 )
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
@@ -70,6 +79,16 @@ class FakeGitHub:
         self._next_comment_id = 1000
         self.requests = [(OWNER, REPO, NUMBER)]
         self.pr_fetches = 0
+        # Native verdict posts: what was submitted, and an optional failure to
+        # raise instead of submitting (the credential-broken case).
+        self.submitted: list[dict] = []
+        self.submit_error: BaseException | None = None
+        self.identity_error: BaseException | None = None
+        # The PR's commit list, as the abandon probe reads it. Defaults to the
+        # head the fixtures use, so a pinned verdict is postable unless a test
+        # says otherwise (a force-push).
+        self.commits: list[str] = [pr.head_sha, "abc123"]
+        self.commits_error: BaseException | None = None
 
     def pull_request(self, owner, repo, number):
         self.pr_fetches += 1
@@ -81,6 +100,38 @@ class FakeGitHub:
             r for r in self._reviews if r.author == self.login and r.is_substantive
         ]
         return sorted(mine, key=lambda r: r.submitted_at)
+
+    def pull_request_commits(self, owner, repo, number):
+        if self.commits_error:
+            raise self.commits_error
+        return list(self.commits)
+
+    def assert_review_identity(self):
+        if self.identity_error:
+            raise self.identity_error
+        return self.login
+
+    def submit_review(self, owner, repo, number, *, event, body, commit_id=None):
+        """Mirrors GitHub.submit_review: assert the identity, then land a real
+        review record — so a posted verdict shows up in my_reviews exactly as
+        GitHub would show it on the next poll."""
+        self.assert_review_identity()
+        if self.submit_error:
+            raise self.submit_error
+        self.submitted.append(
+            {"event": event, "body": body, "commit_id": commit_id}
+        )
+        self._reviews.append(
+            Review(
+                author=self.login,
+                state="APPROVED" if event == "APPROVE" else "CHANGES_REQUESTED",
+                commit_id=commit_id or "",
+                submitted_at=f"2026-07-20T0{len(self.submitted)}:00:00Z",
+                url=f"https://github.com/{SLUG}/pull/{NUMBER}#pullrequestreview-{len(self.submitted)}",
+                body=body,
+            )
+        )
+        return self._reviews[-1].url
 
     def comment(self, owner, repo, number, body):
         self.comments.append(body)
@@ -199,6 +250,20 @@ def operator_comments(gh):
 
 def activity_comments(gh):
     return [c for c in gh.issue_store if ACTIVITY_MARKER in c.body]
+
+
+@pytest.fixture
+def no_post_grace(monkeypatch):
+    """Collapse the pre-post wait: both the grace window and the retry backoff.
+
+    The grace window exists to let a reviewer session submit its OWN review
+    before the daemon posts one, and the backoff exists to stop a hopeless post
+    retrying every poll forever. Every test using this fixture is about what
+    happens once the wait has passed, so waiting it out would only be waiting.
+    Both schedules are pinned by their own tests.
+    """
+    monkeypatch.setattr(loop_module, "VERDICT_POST_GRACE_SECONDS", 0)
+    monkeypatch.setattr(loop_module, "_post_delay_after", lambda attempts: 0)
 
 
 @pytest.fixture
@@ -2159,6 +2224,7 @@ def test_spawns_append_lines_to_one_activity_comment(config):
 
     assert w.evaluate(OWNER, REPO, NUMBER).round == 1
     al.verdict_count = 1  # round 1's verdict envelope landed
+    gh._reviews.append(review())  # ...and so did its native review
     assert w.evaluate(OWNER, REPO, NUMBER).round == 2
 
     acts = activity_comments(gh)
@@ -2363,13 +2429,22 @@ def test_round_number_comes_from_envelopes_when_github_overcounts(config):
     assert al.enqueued[-1]["session"].startswith("review-widgets-pr7-r2-")
 
 
-def test_empty_body_round_still_counts_via_envelope(config):
+def test_empty_body_round_still_counts_via_envelope(config, no_post_grace):
     # The prior round's GitHub review had an empty body (is_substantive False),
-    # so github shows 0 reviews -- but its verdict envelope was recorded. Without
-    # the envelope count the daemon would repeat round 1 (name collision -> stuck);
-    # with it, the next round is correctly round 2.
+    # so github shows 0 countable reviews -- but its verdict envelope was
+    # recorded. Two things follow, in order: that round has no verdict of
+    # record, so the daemon posts one natively (issue #51); and the NEXT round
+    # is numbered from the envelope, so it is round 2 and not a repeat of
+    # round 1 (a repeat collides on the session name -> the worker wedges).
     pr = make_pr()
-    w, _, al = watcher(config, pr, [], verdict_count=1)
+    w, gh, al = watcher(
+        config, pr, [], verdict_count=1, verdict=VERDICT_REQUEST_CHANGES
+    )
+
+    posted = w.evaluate(OWNER, REPO, NUMBER)
+    assert posted.action is Action.POSTED
+    assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
+
     d = w.evaluate(OWNER, REPO, NUMBER)
     assert d.action is Action.SPAWNED
     assert d.round == 2
@@ -3072,3 +3147,740 @@ def test_the_dry_run_pass_never_records_a_grant(ack_config):
     assert al.enqueued[0]["dry_run"] is True, "...without really enqueuing it"
     assert st.get_spawn(SLUG, NUMBER, 4) is None
     assert st.granted_rounds(SLUG, NUMBER) == 0, "and records nothing"
+
+
+# -- reviewer identity: the round's verdict of record (issue #51) -----------
+#
+# The defect these pin: a round's verdict reached GitHub only as a COMMENT
+# review by the IMPLEMENTER identity (studio #298/#302 round 1). Nothing then
+# expressed approve/request_changes on the PR, the pending review request was
+# never consumed, and the daemon re-verified a closed round every poll. The
+# rule is now flat: a round is not complete until the verdict exists as a
+# native review submitted by the configured reviewer identity.
+
+
+def envelope_ahead(config, verdict, *, reviews=None, state=None):
+    """A PR whose review task carries a round-1 verdict envelope that no
+    countable reviewer review backs — the #298 shape."""
+    return watcher(
+        config,
+        make_pr(),
+        list(reviews or []),
+        state=state,
+        verdict=verdict,
+        verdict_count=1,
+    )
+
+
+def test_an_envelope_with_no_native_review_is_posted_as_one(config, no_post_grace):
+    w, gh, _ = envelope_ahead(config, VERDICT_REQUEST_CHANGES)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED
+    assert d.round == 1
+    assert len(gh.submitted) == 1
+    assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
+    assert gh.submitted[0]["commit_id"] == "abc123", "pinned to the head it judged"
+    assert verdict_marker(1) in gh.submitted[0]["body"]
+    assert "TASK-500" in gh.submitted[0]["body"]
+
+
+def test_an_approve_envelope_posts_a_native_approve(config, no_post_grace):
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "APPROVE"
+
+
+def test_an_approve_envelope_does_not_converge_before_its_native_review(config):
+    """The ordering that matters most. An approve envelope with no native
+    APPROVE behind it must NOT close the loop: doing so leaves the PR with no
+    verdict of record and its review request dangling forever — #298 exactly."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST, "not CONVERGED"
+    assert gh.submitted == [], "still inside the grace window"
+
+
+def test_the_round_is_not_closed_while_the_post_is_owed(config, no_post_grace):
+    """No next round, either: round 2 cannot be owed while round 1 has no
+    verdict of record."""
+    st = State(config.state_db)
+    w, gh, al = envelope_ahead(config, VERDICT_REQUEST_CHANGES, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "422 Unprocessable Entity")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert al.enqueued == [], "round 2 must not be queued over an unclosed round 1"
+    assert st.get_spawn(SLUG, NUMBER, 2) is None
+
+
+def test_the_grace_window_lets_the_session_post_its_own_review_first(config):
+    """A reviewer session writes its envelope and submits its own review
+    moments apart. A poll landing between the two must not race it."""
+    w, gh, _ = envelope_ahead(config, VERDICT_REQUEST_CHANGES)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert "grace" in d.reason
+    assert gh.submitted == []
+
+
+def test_the_post_refuses_under_a_foreign_login(config, no_post_grace):
+    """The assertion is the whole point: a review posted under the wrong
+    identity is not the round's verdict and does not consume the request, so
+    refusing to post is strictly better than posting."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    gh.identity_error = IdentityMismatch("resolves to 'RHDZMOTA', not 'alissa-app'")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.submitted == [], "refused, not posted under the wrong login"
+
+
+def test_a_missing_reviewer_token_is_a_failed_post_not_a_silent_fallback(
+    config, no_post_grace
+):
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    gh.submit_error = ReviewerTokenUnset("REVLOOP_REVIEWER_GH_TOKEN is unset")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert "NOT closed" in d.reason
+
+
+def test_a_failed_post_is_retried_and_then_escalated(config, no_post_grace):
+    st = State(config.state_db)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "401 Bad credentials")
+
+    for _ in range(MAX_VERDICT_POST_ATTEMPTS):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
+
+    pages = [c for c in operator_comments(gh) if "cannot be closed" in c]
+    assert len(pages) == 1, "paged once, loudly"
+    assert "alissa-app" in pages[0]
+    assert st.pinged(SLUG, NUMBER, verdict_post_kind(1))
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["posted_at"] is None
+
+    # ...and it keeps retrying without re-paging: the round stays OPEN.
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
+    assert len([c for c in operator_comments(gh) if "cannot be closed" in c]) == 1
+
+
+def test_a_landed_post_is_recorded_and_announced(config, no_post_grace):
+    st = State(config.state_db)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    row = st.get_verdict_post(SLUG, NUMBER, 1)
+    assert row["posted_at"] is not None and row["review_url"]
+    assert "verdict of record" in activity_comments(gh)[0].body
+
+
+def test_the_dry_run_pass_never_submits_a_review(config, no_post_grace):
+    dry = dataclasses.replace(config, dry_run=True)
+    w, gh, _ = envelope_ahead(dry, VERDICT_APPROVE)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.submitted == []
+
+
+def test_a_session_review_and_the_native_post_are_one_round(config, no_post_grace):
+    """Requirement 5. Once a session's own review carries the reviewer
+    identity, its record and the daemon's native post both describe round 1 —
+    and counting two would spend a cap slot on a round that never ran."""
+    st = State(config.state_db)
+    w, gh, al = watcher(
+        config, make_pr(), [review()], state=st,
+        verdict=VERDICT_REQUEST_CHANGES, verdict_count=2,
+    )
+    # Round 2's envelope landed with no native review; the daemon posts it.
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.round == 3, "two rounds are done, not three"
+    assert countable_rounds(gh.my_reviews(OWNER, REPO, NUMBER)) == 2
+
+
+def test_a_marked_post_and_an_unmarked_one_for_the_same_round_count_once():
+    marked = review(body="verdict\n" + verdict_marker(1))
+    unmarked = review(body="the session's own write-up")
+    assert countable_rounds([unmarked, marked]) == 1
+    assert countable_rounds([unmarked]) == 1, "legacy PRs count exactly as before"
+    assert countable_rounds([]) == 0
+
+
+def test_an_unreadable_verdict_is_never_guessed_onto_the_pr(config, no_post_grace):
+    """`request_changes` and `approve` are not interchangeable. With an
+    envelope counted but no verdict word parseable, the round stays open."""
+    w, gh, al = envelope_ahead(config, None)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.submitted == []
+    assert al.enqueued == []
+
+
+def test_the_post_only_happens_for_the_reviewer_identity_gap(config, no_post_grace):
+    """No gap, no post: the healthy path is untouched, and every round the
+    session closed itself stays closed by its own review."""
+    w, gh, al = watcher(config, make_pr(), [review()], verdict=VERDICT_REQUEST_CHANGES)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.submitted == []
+    assert d.action is Action.SPAWNED and d.round == 2
+
+
+def test_the_grace_window_is_pinned():
+    """Long enough to lose a race, short enough that a genuinely missing post
+    heals within one operator's attention span."""
+    assert 60 <= VERDICT_POST_GRACE_SECONDS <= 15 * 60
+
+
+def test_the_snapshot_counts_the_new_stages(config, no_post_grace):
+    st = State(config.state_db)
+    w, _, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+
+    w.poll_once()
+
+    snap = st.read_snapshots(1)[0]
+    assert snap["posted"] == 1
+    assert snap["awaiting_post"] == 0
+    assert snap["stages"][0]["stage"] == "posted"
+
+
+# -- credential routing: no inherited container default --------------------
+
+
+def test_the_gh_env_carries_the_reviewer_token_and_nothing_inherited(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "the-implementer-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "the-implementer-token")
+    monkeypatch.setenv("REV_TOKEN", "the-reviewer-token")
+
+    env = GitHub("alissa-app", token_env="REV_TOKEN")._env()
+
+    assert env["GH_TOKEN"] == "the-reviewer-token"
+    assert env["GITHUB_TOKEN"] == "the-reviewer-token", "both, or gh picks the other"
+
+
+def test_an_unset_reviewer_token_refuses_rather_than_falling_back(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "the-implementer-token")
+    monkeypatch.delenv("REV_TOKEN", raising=False)
+
+    with pytest.raises(ReviewerTokenUnset, match="REV_TOKEN"):
+        GitHub("alissa-app", token_env="REV_TOKEN")._env()
+
+
+def test_no_token_env_inherits_exactly_as_before():
+    assert GitHub("alissa-app")._env() is None
+
+
+def test_the_posting_gate_reads_the_login_fresh(monkeypatch):
+    """Asserted once at boot, re-read at post time: the failure being defended
+    against is a credential that was right at boot and is wrong now."""
+    gh = GitHub("alissa-app")
+    logins = iter(["alissa-app", "RHDZMOTA"])
+    monkeypatch.setattr(GitHub, "token_login", lambda self: next(logins))
+
+    assert gh.verify_identity() == "alissa-app"
+    with pytest.raises(IdentityMismatch, match="RHDZMOTA"):
+        gh.assert_review_identity()
+
+
+def test_submit_review_refuses_a_comment_event():
+    with pytest.raises(ValueError, match="cannot close a round"):
+        GitHub("alissa-app").submit_review(
+            OWNER, REPO, NUMBER, event="COMMENT", body="x"
+        )
+
+
+def test_the_directive_names_the_credential_variable_by_name(config):
+    cfg = dataclasses.replace(config, reviewer_token_env="REVLOOP_REVIEWER_GH_TOKEN")
+    w, _, al = watcher(cfg, make_pr(), [])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    directive = al.enqueued[0]["directive"]
+    assert 'GH_TOKEN="$REVLOOP_REVIEWER_GH_TOKEN"' in directive
+    assert "verdict of record" in directive
+
+
+def test_the_directive_omits_the_clause_with_nothing_to_name(config):
+    w, _, al = watcher(config, make_pr(), [])
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert "CREDENTIAL" not in al.enqueued[0]["directive"]
+
+
+def test_reviewer_token_env_must_be_a_name_not_a_token(tmp_path):
+    with pytest.raises(ValueError, match="variable NAME"):
+        Config.build(tmp_path, {"reviewer_token_env": "ghp_liveTokenPastedHere!"})
+    assert Config.build(
+        tmp_path, {"reviewer_token_env": "REVLOOP_REVIEWER_GH_TOKEN"}
+    ).reviewer_token_env == "REVLOOP_REVIEWER_GH_TOKEN"
+
+
+def test_preflight_logs_the_resolved_login_and_warns_on_an_inherited_credential(
+    config, caplog
+):
+    w, gh, _ = watcher(config, make_pr(), [])
+    gh.verify_identity = lambda: "alissa-app"
+    gh.login = "alissa-app"
+
+    with caplog.at_level(logging.INFO):
+        warnings = w.preflight()
+
+    assert "reviewing as GitHub user alissa-app" in caplog.text
+    assert any("reviewer_token_env" in warning for warning in warnings)
+
+
+def test_preflight_is_quiet_once_the_credential_is_routed(config):
+    cfg = dataclasses.replace(config, reviewer_token_env="REV_TOKEN")
+    w, gh, _ = watcher(cfg, make_pr(), [])
+    gh.verify_identity = lambda: "alissa-app"
+
+    assert not any("reviewer_token_env" in w_ for w_ in w.preflight())
+
+
+# -- round-1 findings: the head a native verdict is ABOUT --------------------
+
+
+def seed_round(st, head, round_=1):
+    """The spawn ledger row the daemon writes for every round it queues — the
+    record of which head the round was handed."""
+    st.record_spawn(
+        repo=SLUG, number=NUMBER, round_=round_, head_sha=head,
+        session=f"review-widgets-pr{NUMBER}-r{round_}-seed", task_ref="TASK-500",
+    )
+
+
+def test_a_verdict_is_posted_against_the_head_its_round_judged(config, no_post_grace):
+    """[blocker, round 1] The implementer pushes between the envelope and the
+    daemon's post. Stamping the verdict onto the NEW head would restamp an
+    approval onto code no reviewer has seen — the #227 latch, rebuilt inside
+    the daemon's own post."""
+    st = State(config.state_db)
+    seed_round(st, "abc123")                       # round 1 judged abc123
+    w, gh, _ = watcher(
+        config, make_pr(sha="newhead"), [], state=st,   # ...the head is now newhead
+        verdict=VERDICT_APPROVE, verdict_count=1,
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["commit_id"] == "abc123", "pinned to the head it judged"
+    assert "judged `abc123`" in gh.submitted[0]["body"], "and it says so in the open"
+
+
+def test_a_verdict_on_an_older_head_does_not_converge_the_loop(config, no_post_grace):
+    """The consequence that makes it a blocker: the very next pass must owe
+    round 2, not read the daemon's own post as a current approval."""
+    st = State(config.state_db)
+    seed_round(st, "abc123")
+    w, gh, al = watcher(
+        config, make_pr(sha="newhead"), [], state=st,
+        verdict=VERDICT_APPROVE, verdict_count=1,
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED, "an approve for old code owes another round"
+    assert d.round == 2
+
+
+def test_an_unmoved_head_still_converges(config, no_post_grace):
+    """...and the ordinary case is untouched: nothing was pushed, so the
+    daemon's APPROVE covers the current head and the loop is done."""
+    st = State(config.state_db)
+    seed_round(st, "abc123")
+    w, gh, _ = watcher(
+        config, make_pr(sha="abc123"), [], state=st,
+        verdict=VERDICT_APPROVE, verdict_count=1,
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert "head has moved" not in gh.submitted[0]["body"]
+
+
+def test_the_judged_head_is_frozen_at_first_observation(config):
+    """With no ledger row the daemon cannot know the judged head, so it freezes
+    the head it first saw the gap at. A push during the grace window then
+    cannot drag the verdict forward onto it."""
+    st = State(config.state_db)
+    pr = make_pr(sha="firstseen")
+    w, gh, _ = watcher(
+        config, pr, [], state=st, verdict=VERDICT_APPROVE, verdict_count=1
+    )
+    w.evaluate(OWNER, REPO, NUMBER)                      # inside grace; freezes it
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["head_sha"] == "firstseen"
+
+    gh._pr = make_pr(sha="pushed-since")                 # implementer pushes
+    w.state.note_verdict_post_owed(SLUG, NUMBER, 1, "pushed-since")  # no-op by design
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["head_sha"] == "firstseen"
+
+
+# -- round-1 findings: a 403 must not masquerade as a rate limit -------------
+
+
+def _gh_raising(monkeypatch, stderr):
+    """A real GitHub client whose `gh api` fails with `stderr` — so the mapping
+    under test is `GitHub._api`'s, not the fake's."""
+    gh = GitHub("alissa-app")
+    monkeypatch.setattr(GitHub, "assert_review_identity", lambda self: "alissa-app")
+
+    def boom(argv, *, timeout=60, env=None):
+        raise CommandError(argv, 1, stderr)
+
+    monkeypatch.setattr("alissa.tools.github.revloop.ghclient.run_json", boom)
+    return gh
+
+
+def test_an_authorization_403_on_the_review_post_is_not_a_rate_limit(monkeypatch):
+    """[major, round 1] Collapsed into RateLimited it aborts the whole poll
+    pass into a 900s backoff, and the round's retry-and-page path never runs —
+    for exactly the failure the PR names as its main unverified risk."""
+    gh = _gh_raising(
+        monkeypatch, "Resource not accessible by personal access token (HTTP 403)"
+    )
+    with pytest.raises(CommandError):
+        gh.submit_review(OWNER, REPO, NUMBER, event="APPROVE", body="x")
+
+
+@pytest.mark.parametrize("stderr", [
+    "API rate limit exceeded (HTTP 403)",
+    "You have exceeded a secondary rate limit (HTTP 403)",
+    "was submitted too quickly (HTTP 429)",
+])
+def test_a_genuine_throttle_on_the_review_post_still_backs_off(monkeypatch, stderr):
+    gh = _gh_raising(monkeypatch, stderr)
+    with pytest.raises(RateLimited):
+        gh.submit_review(OWNER, REPO, NUMBER, event="APPROVE", body="x")
+
+
+def test_the_read_path_still_treats_a_bare_403_as_throttling(monkeypatch):
+    """Unchanged for reads: backing off is the right response there, and a
+    skipped poll costs nothing."""
+    gh = _gh_raising(monkeypatch, "HTTP 403: Forbidden")
+    with pytest.raises(RateLimited):
+        gh.reviews(OWNER, REPO, NUMBER)
+
+
+def test_an_unpostable_repo_holds_its_round_open_instead_of_stalling_the_pass(
+    config, no_post_grace, monkeypatch
+):
+    """End to end: the 403 lands on the retry path, so `poll_once` completes
+    and every other watched PR in the pass still gets decided."""
+    st = State(config.state_db)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "Resource not accessible (HTTP 403)")
+
+    results = w.poll_once()
+
+    assert [d.action for _, d in results] == [Action.AWAITING_POST]
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 1
+
+
+# -- round-1 findings: the retry backoff ------------------------------------
+
+
+def test_the_retry_delay_grows_per_attempt_and_is_capped():
+    assert loop_module._post_delay_after(1) == 120
+    assert loop_module._post_delay_after(4) == 960
+    assert loop_module._post_delay_after(99) == loop_module.MAX_VERDICT_POST_BACKOFF_SECONDS
+
+
+def age_verdict_post(st, seconds, *, attempts=None):
+    """Age a verdict_posts row: both clocks, so an aged row is aged for the
+    grace window AND for the retry delay."""
+    stamp = int(time.time()) - int(seconds)
+    st._db.execute(
+        "UPDATE verdict_posts SET first_seen_at=?, last_attempt_at=?", (stamp, stamp)
+    )
+    if attempts is not None:
+        st._db.execute("UPDATE verdict_posts SET attempts=?", (attempts,))
+    st._db.commit()
+
+
+def test_a_failing_post_stops_retrying_every_poll(config, monkeypatch):
+    """Deployed poll interval is 30s: unbounded retry is ~2,880 review POSTs a
+    day per stuck PR. The round still never closes — only the cadence bounds."""
+    st = State(config.state_db)
+    monkeypatch.setattr(loop_module, "VERDICT_POST_GRACE_SECONDS", 0)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "401 Bad credentials")
+
+    first = w.evaluate(OWNER, REPO, NUMBER)      # attempt 0 runs (grace is 0)
+    second = w.evaluate(OWNER, REPO, NUMBER)     # attempt 1 is deferred
+
+    assert first.action is second.action is Action.AWAITING_POST
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 1, "no second POST"
+    assert "backing off" in second.reason
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["posted_at"] is None
+
+
+@pytest.mark.parametrize("elapsed", [2 * 3600, 24 * 3600, 10 * 24 * 3600])
+def test_the_backoff_still_holds_long_past_its_cap(config, monkeypatch, elapsed):
+    """[minor, reopened in round 2] A capped deadline measured from a FIXED
+    origin stops bounding anything once the row outlives the cap — the hot loop
+    returns, an hour late. The delay has to be per-attempt."""
+    st = State(config.state_db)
+    monkeypatch.setattr(loop_module, "VERDICT_POST_GRACE_SECONDS", 0)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+    gh.submit_error = CommandError(["gh"], 1, "401 Bad credentials")
+    w.evaluate(OWNER, REPO, NUMBER)                       # one real attempt
+    age_verdict_post(st, elapsed, attempts=20)            # ...now long stale
+
+    due = w.evaluate(OWNER, REPO, NUMBER)                 # one attempt is due
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 21
+
+    # ...and the NEXT poll, 30s later, is deferred again — that is the whole
+    # property. With a capped deadline off a fixed origin, every poll from here
+    # attempted the post forever.
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert due.action is d.action is Action.AWAITING_POST
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 21, "no hot loop"
+    assert "backing off" in d.reason
+
+
+# -- round-1 findings: a later session review closes its own round -----------
+
+
+def test_a_correctly_posted_later_round_is_not_posted_over(config, no_post_grace):
+    """[minor, round 1] Once round 1 is daemon-closed, a round-2 session that
+    submits its own review correctly must not get a duplicate verdict stacked
+    on top of it — every round, forever."""
+    marked = review(body="round 1\n" + verdict_marker(1), at="2026-07-18T10:00:00Z")
+    session_review = review(body="round 2 findings", at="2026-07-19T10:00:00Z")
+    w, gh, al = watcher(
+        config, make_pr(), [marked, session_review],
+        verdict=VERDICT_REQUEST_CHANGES, verdict_count=2,
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.submitted == [], "round 2 already has a reviewer review"
+    assert d.action is Action.SPAWNED and d.round == 3
+
+
+def test_an_unmarked_review_older_than_the_marked_one_still_counts_once():
+    """...while the same-round pair it was protecting against is unchanged: an
+    unmarked review at or before the marked post is that round's, not a new one."""
+    marked = review(body="v\n" + verdict_marker(1), at="2026-07-18T10:00:00Z")
+    same_round = review(body="the session's own write-up", at="2026-07-18T09:00:00Z")
+    assert countable_rounds([same_round, marked]) == 1
+
+
+# -- round-1 findings: the config validator and its message ------------------
+
+
+@pytest.mark.parametrize("token", [
+    "ghp_" + "a" * 36,
+    "gho_" + "b" * 36,
+    "ghs_" + "c" * 36,
+    "github_pat_" + "d" * 60,
+    "R" * 80,
+])
+def test_credential_shaped_values_are_rejected_as_a_token_env_name(tmp_path, token):
+    """Every real GitHub token is a valid POSIX identifier, so a name regex
+    alone lets the one mistake this exists to catch straight through."""
+    with pytest.raises(ValueError, match="not a value or a token"):
+        Config.build(tmp_path, {"reviewer_token_env": token})
+
+
+def test_the_rejection_never_reprints_the_rejected_value(tmp_path):
+    """`__main__` prints this as `config error: …` — into the container log."""
+    secret = "ghp-uTCXx2m1YGfWNid84iK2xxxxxxxxxxxxxxxx"
+    with pytest.raises(ValueError) as exc:
+        Config.build(tmp_path, {"reviewer_token_env": secret})
+
+    assert secret not in str(exc.value)
+    assert f"{len(secret)}-character value" in str(exc.value)
+    assert "rotate it" in str(exc.value)
+
+
+def test_an_ordinary_variable_name_is_still_accepted(tmp_path):
+    for name in ("REVLOOP_REVIEWER_GH_TOKEN", "_rev", "GH_TOKEN_REV2"):
+        assert Config.build(
+            tmp_path, {"reviewer_token_env": name}
+        ).reviewer_token_env == name
+
+
+# -- round-1 findings: the session must verify before it writes --------------
+
+
+def test_the_credential_clause_tells_the_session_to_verify_first(config):
+    """The daemon populates its own environment, not the worker's. An
+    unexported variable expands to "", and `gh` reads an empty GH_TOKEN as no
+    token — falling back to the container default, the identity the clause
+    exists to avoid."""
+    cfg = dataclasses.replace(config, reviewer_token_env="REV_TOKEN")
+    w, _, al = watcher(cfg, make_pr(), [])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    directive = al.enqueued[0]["directive"]
+    assert "non-empty" in directive
+    assert 'GH_TOKEN="$REV_TOKEN" gh api user --jq .login' in directive
+    assert "alissa-app" in directive, "the login to compare against"
+    assert "do NOT post the review at all" in directive
+
+
+# -- round-2 findings: a verdict pinned to a commit that is gone -------------
+#
+# Pinning the verdict to the head its round judged (round 1's blocker fix) made
+# a new failure reachable: a force-push removes that commit, GitHub rejects the
+# review, and no retry can ever succeed. Without an exit the round stays open,
+# round k+1 is never spawned, and the PR leaves the loop until a human edits
+# sqlite — a worse outcome than any verdict-of-record concern here.
+
+REJECTED_COMMIT = CommandError(
+    ["gh"], 1, "HTTP 422: commit_id is not part of the pull request"
+)
+
+
+def force_pushed(config, state):
+    """Round 1 judged `abc123`; the implementer rebased and the PR now carries
+    `rebased` alone."""
+    seed_round(state, "abc123")
+    w, gh, al = watcher(
+        config, make_pr(sha="rebased"), [], state=state,
+        verdict=VERDICT_APPROVE, verdict_count=1,
+    )
+    gh.commits = ["rebased"]                 # abc123 is gone
+    gh.submit_error = REJECTED_COMMIT
+    return w, gh, al
+
+
+def test_an_unpostable_pinned_verdict_is_abandoned_not_retried_forever(
+    config, no_post_grace
+):
+    st = State(config.state_db)
+    w, gh, _ = force_pushed(config, st)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert "abandoned" in d.reason
+    assert st.verdict_post_abandoned(SLUG, NUMBER, 1)
+    assert "abandoned" in activity_comments(gh)[0].body, "never silent"
+
+
+def test_an_abandoned_round_releases_the_loop(config, no_post_grace):
+    """The point of abandoning: the PR rejoins the loop instead of stalling out
+    of it, and the fresh round runs against the NEW head."""
+    st = State(config.state_db)
+    w, gh, al = force_pushed(config, st)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 2
+    assert gh.submitted == [], "and never by posting against the new head"
+    assert st.get_spawn(SLUG, NUMBER, 2)["head_sha"] == "rebased"
+
+
+def test_a_rejection_is_not_abandoned_while_the_commit_is_still_there(
+    config, no_post_grace
+):
+    """The 422 only starts the question; the PR's commit list answers it. A
+    rejection for any other reason stays on the ordinary retry path —
+    abandoning wrongly discards a real verdict."""
+    st = State(config.state_db)
+    seed_round(st, "abc123")
+    w, gh, _ = watcher(
+        config, make_pr(sha="abc123"), [], state=st,
+        verdict=VERDICT_APPROVE, verdict_count=1,
+    )
+    gh.commits = ["abc123"]                  # the pin is fine
+    gh.submit_error = CommandError(["gh"], 1, "HTTP 422: Unprocessable Entity")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not st.verdict_post_abandoned(SLUG, NUMBER, 1)
+    assert st.get_verdict_post(SLUG, NUMBER, 1)["attempts"] == 1
+    assert "NOT closed" in d.reason
+
+
+def test_an_unreadable_commit_list_never_abandons(config, no_post_grace):
+    """Conservative on missing evidence: retry, do not discard."""
+    st = State(config.state_db)
+    w, gh, _ = force_pushed(config, st)
+    gh.commits_error = CommandError(["gh"], 1, "network is unreachable")
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not st.verdict_post_abandoned(SLUG, NUMBER, 1)
+
+
+def test_a_non_commit_failure_never_probes_the_commit_list(config, no_post_grace):
+    """A 401 is not about the pin, so it must not pay for a commit fetch."""
+    st = State(config.state_db)
+    w, gh, _ = force_pushed(config, st)
+    gh.submit_error = CommandError(["gh"], 1, "401 Bad credentials")
+    gh.commits_error = AssertionError("the commit list must not be read here")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert not st.verdict_post_abandoned(SLUG, NUMBER, 1)
+
+
+def test_a_truncated_commit_listing_cannot_prove_absence():
+    """`pull_request_commits` raises rather than returning a short list: a SHA
+    missing from a truncated read is not a SHA that is gone."""
+    from alissa.tools.github.revloop.ghclient import TruncatedListing
+    gh = GitHub("alissa-app")
+    gh._api = lambda *a, **k: [{"sha": f"c{i}"} for i in range(PER_PAGE)]  # always full
+    with pytest.raises(TruncatedListing):
+        gh.pull_request_commits(OWNER, REPO, NUMBER)
+
+
+# -- round-2 findings: the credential guard and its message ------------------
+
+
+@pytest.mark.parametrize("secret", [
+    "f1e2d3c4b5a67890abcdef0123456789abcdef01",   # legacy 40-char hex token
+    "a" * 40,
+    "s3cretValueNoPunctuation",                    # generic alnum API key
+])
+def test_a_punctuation_free_secret_is_rejected_too(tmp_path, secret):
+    """Length alone is not the discriminator — an undifferentiated alphanumeric
+    run is. Every plausible NAME carries an underscore or is short."""
+    with pytest.raises(ValueError, match="not a value or a token"):
+        Config.build(tmp_path, {"reviewer_token_env": secret})
+
+
+def test_an_innocent_typo_is_echoed_rather_than_redacted(tmp_path):
+    """[nit, round 2] Here the value IS the diagnostic — redacting it turns a
+    one-glance fix into a puzzle."""
+    with pytest.raises(ValueError) as exc:
+        Config.build(tmp_path, {"reviewer_token_env": "REVLOOP-REVIEWER-GH-TOKEN"})
+
+    assert "REVLOOP-REVIEWER-GH-TOKEN" in str(exc.value)
+    assert "rotate it" not in str(exc.value), "not a credential, so no rotate advice"
+
+
+def test_a_credential_is_still_redacted(tmp_path):
+    secret = "ghp_" + "a" * 36
+    with pytest.raises(ValueError) as exc:
+        Config.build(tmp_path, {"reviewer_token_env": secret})
+
+    assert secret not in str(exc.value)
+    assert "rotate it" in str(exc.value)
