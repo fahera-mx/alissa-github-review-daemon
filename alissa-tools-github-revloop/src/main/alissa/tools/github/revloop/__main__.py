@@ -100,6 +100,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[ON_MISSING_SPAWN, ON_MISSING_CREATE, ON_MISSING_SKIP],
     )
     over.add_argument("--on-missing-hub", choices=[HUB_SKIP, HUB_ADD])
+    over.add_argument(
+        "--reap-grace-seconds",
+        type=int,
+        metavar="SECONDS",
+        help="how long a reviewer session must be idle AND quiet before the "
+        "sweep reaps it (and before a stale round reads it as dead)",
+    )
+    over.add_argument(
+        "--reap-session-cap",
+        type=int,
+        metavar="N",
+        help="page-worthy threshold: more live reviewer sessions than this "
+        "after a sweep and the daemon logs loudly",
+    )
 
     dry = over.add_mutually_exclusive_group()
     dry.add_argument(
@@ -132,6 +146,8 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "state_path": args.state_path,
         "on_missing_review_task": args.on_missing_review_task,
         "on_missing_hub": args.on_missing_hub,
+        "reap_grace_seconds": args.reap_grace_seconds,
+        "reap_session_cap": args.reap_session_cap,
         "dry_run": args.dry_run,
     }
 

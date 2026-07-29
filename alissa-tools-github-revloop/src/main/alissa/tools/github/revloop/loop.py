@@ -20,22 +20,25 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from .alissa import VERDICT_APPROVE, Alissa, Task
-from .config import HUB_ADD, ON_MISSING_SKIP, Config
+from .alissa import (
+    VERDICT_APPROVE,
+    Alissa,
+    ManagedSession,
+    SessionRef,
+    Task,
+    session_repo_slug,
+)
+from .config import (
+    HUB_ADD,
+    ON_MISSING_SKIP,
+    STALE_ROUND_SECONDS,
+    Config,
+)
 from .ghclient import GitHub, IssueComment, PullRequest, RateLimited, Review
 from .proc import CommandError
 from .state import State
 
 log = logging.getLogger(__name__)
-
-# A reviewer session that has not submitted after this long is presumed dead
-# (skill failure mode: "reviewer session stalls"). The round is re-enqueued --
-# but only with a second signal agreeing: the timer alone cannot tell a dead
-# session from a slow one, and a timer-only re-enqueue double-spends the round
-# (two sessions review it, both submit -- observed live twice: double round-2
-# approves on devloop's PR #11, double approves on this repo's PR #19). See
-# _defer_stale_round for the liveness signal.
-STALE_ROUND_SECONDS = 90 * 60
 
 # The floor under the liveness deferral: a live session defers the stale
 # respawn indefinitely -- correct for a genuinely slow round, silent forever
@@ -48,13 +51,14 @@ STALE_ROUND_SECONDS = 90 * 60
 # wedged one surfaces the same day.
 STALLED_DEFER_MULTIPLE = 2
 
-# The sweep only reaps a session that has been idle AND quiet this long. The
-# GitHub review count increments the moment a review is submitted, but the
-# reviewer still has close-out work after that (CR6 envelope, task status) --
-# and a claude session parked at its prompt between turns reports "idle", so
-# idleness alone cannot distinguish "between turns" from "done". Recent tmux
-# activity can.
-REAP_QUIET_SECONDS = 5 * 60
+# The sweep only reaps a session that has been idle AND quiet for
+# `config.reap_grace_seconds`. The GitHub review count increments the moment a
+# review is submitted, but the reviewer still has close-out work after that
+# (CR6 envelope, task status) -- and a claude session parked at its prompt
+# between turns reports "idle", so idleness alone cannot distinguish "between
+# turns" from "done". Recent tmux activity can. The same number answers the
+# stale-round liveness probe, which asks the same question; see
+# config.DEFAULT_REAP_GRACE_SECONDS.
 
 # The closing contract is spelled out in both directives (not just the skill)
 # because it is the reviewer's most-skipped step: on re-review, sessions produce
@@ -395,9 +399,15 @@ def session_name(pr: PullRequest, round_: int) -> str:
     original 'stuck' failure). Safe to be non-deterministic: the generated name
     is recorded in the spawn ledger and is what gets reaped / self-killed, so the
     daemon never re-derives it.
+
+    The shape is a contract, not just a convention: alissa.parse_session_name
+    matches it, and only names it matches are ever reap candidates. Both sides
+    build the repo component through `session_repo_slug` so they cannot drift.
     """
-    repo = re.sub(r"[^A-Za-z0-9-]", "-", pr.repo).strip("-").lower()
-    return f"review-{repo}-pr{pr.number}-r{round_}-{secrets.token_hex(3)}"
+    return (
+        f"review-{session_repo_slug(pr.repo)}-pr{pr.number}"
+        f"-r{round_}-{secrets.token_hex(3)}"
+    )
 
 
 class ReviewWatcher:
@@ -415,6 +425,14 @@ class ReviewWatcher:
         # (repo, number, comment id) of every re-entry directive already
         # refused in this process -- see _log_ignored_ack.
         self._ignored_acks: set[tuple[str, int, int]] = set()
+        # Reviewer session name -> the (repo slug, number) its NAME resolved
+        # to, or None for "could not be resolved". Process-lifetime, pruned
+        # against the live list each sweep; see _resolve_pr for why the probe
+        # behind it must not be paid per poll.
+        self._probe_cache: dict[str, tuple[str, int] | None] = {}
+        # The surviving-session set the cap alarm last paged on, so a standing
+        # over-cap condition pages once per episode -- see _check_session_cap.
+        self._paged_cap: frozenset[str] | None = None
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -688,7 +706,8 @@ class ReviewWatcher:
         round and both submit. So before respawning, consult external
         evidence of life: the round's recorded session in the live list
         (the reap sweep's own probe). Busy, or idle without a real quiet
-        period (mid-close-out between turns; see REAP_QUIET_SECONDS) -> the
+        period (mid-close-out between turns; the same `reap_grace_seconds`
+        the sweep waits out, because it is the same question) -> the
         round is alive, defer with a reason. Gone, or idle-finished -> dead,
         respawn (the sweep separately handles any corpse). An unprobeable
         live list defers too: respawning on missing evidence is exactly the
@@ -726,7 +745,8 @@ class ReviewWatcher:
         ses = live.get(session)
         if ses is None:
             return None  # session gone -> presumed dead -> respawn
-        if ses.is_idle and time.time() - ses.last_activity >= REAP_QUIET_SECONDS:
+        quiet_for = time.time() - ses.last_activity
+        if ses.is_idle and quiet_for >= self.config.reap_grace_seconds:
             return None  # idle-finished: it died without submitting -> respawn
 
         if (
@@ -823,18 +843,51 @@ class ReviewWatcher:
         spawn ledger. It must stay search-independent: never move it (back)
         into the evaluate() path.
 
-        Every-poll cost, honestly: one `alissa tmux ls` when no review-*
+        Two reap edges, and the difference is what the sweep KNOWS about a
+        session:
+
+        * With a spawn-ledger row the session's PR and round are exact, so a
+          round whose verdict already landed is reapable on its own -- an
+          approved-but-unmerged PR is the common case, and waiting for a human
+          to merge before freeing the slot is the leak this sweep predates.
+        * Without one -- the hand-driven `review-pr-<n>` rounds the
+          alissa-code-review skill's procedures spawn, and any spawn whose
+          ledger was lost -- the name is the only evidence, and it cannot tell
+          a superseded round from an in-flight one. Those are reaped on a
+          TERMINAL PR only (issue #46): merged or closed ends every round on
+          the PR, so no round accounting is needed to be sure. Superseded
+          rounds of an OPEN PR are deliberately out of scope -- an operator
+          re-entry (`alissa-review: re-enter +N`) may still want that context.
+
+        Both edges additionally require the session to be idle and to have been
+        quiet for `reap_grace_seconds`: a busy session is NEVER killed, even on
+        a merged PR (scoped post-merge re-reviews of fold commits are an
+        established pattern), and the grace period leaves a just-merged PR's
+        reviewer time to finish its in-session close-out.
+
+        Every-poll cost, honestly: one `alissa tmux ls` when no reviewer
         session is live; otherwise one PR fetch per distinct PR with a live
         idle quiet session, plus -- per distinct (PR, task ref) among its
-        rows -- exactly one of `alissa task get <ref>` (the row carries a
-        task ref) or the reviews fetch (it does not). The ledger ref is used
-        deliberately instead of
-        find_review_task: that would fetch the actor's ENTIRE task list per
-        PR, and its open-status filter would drop a human-validated review
-        task back onto the racier GitHub-count fallback. Only individual
+        ledger rows -- exactly one of `alissa task get <ref>` (the row carries
+        a task ref) or the reviews fetch (it does not). The ledger ref is used
+        deliberately instead of find_review_task: that would fetch the actor's
+        ENTIRE task list per PR, and its open-status filter would drop a
+        human-validated review task back onto the racier GitHub-count
+        fallback. A ledger-less session costs its allowlist probe ONCE per
+        session lifetime, not once per poll -- `_probe_cache` remembers the
+        answer, including the negative one -- after which it is the same one
+        fetch per distinct PR as everything else. Busy and in-grace sessions
+        are filtered out BEFORE anything is fetched at all. Only individual
         sessions are ever killed (`alissa tmux kill <name>`) -- never the
-        server. Best-effort throughout: an undecidable session is spared and
-        looked at again next poll.
+        server, which in this shared container would take every other lane's
+        workers with it. Best-effort throughout: an undecidable session is
+        spared, logged at debug, and looked at again next poll; only genuine
+        failures (a fetch that blew up, a kill that raised) are logged louder.
+
+        Every spare records WHY against the session name. Those reasons are
+        debug-level (they repeat every poll), but the cap alarm interpolates
+        them, so the one line an operator does see in a container running at
+        INFO carries the explanation with it.
         """
         try:
             sessions = self.alissa.list_review_sessions()
@@ -842,93 +895,342 @@ class ReviewWatcher:
             log.warning("reap sweep skipped: could not list sessions: %s", exc)
             return 0
 
-        # Per-sweep memos. The PR fetch is keyed per distinct PR; the round
-        # count additionally keys on the task ref, because two spawns of one
-        # PR can disagree on it (a round-1 row recorded before the review
+        # Drop cached resolutions for sessions that are gone. Names are unique
+        # per spawn (that is what the nonce is for) and a session's PR never
+        # changes, so this is the only invalidation the cache needs.
+        live_names = {ses.name for ses in sessions}
+        self._probe_cache = {
+            name: target
+            for name, target in self._probe_cache.items()
+            if name in live_names
+        }
+
+        # Per-sweep memos. The PR fetch is keyed per distinct (repo, number);
+        # the round count additionally keys on the task ref, because two spawns
+        # of one PR can disagree on it (a round-1 row recorded before the review
         # task existed carries None). None = undecidable this pass.
         prs: dict[tuple[str, int], PullRequest | None] = {}
         completed_cache: dict[tuple[str, int, str | None], float | None] = {}
-        reaped = 0
+        holdouts: dict[str, str] = {}
+        reaped: list[str] = []
 
         for ses in sessions:
+            idle_for = time.time() - ses.last_activity
             if not ses.is_idle:
                 # A busy session is still doing something (reviewing, or
-                # closing out its round) -- never yank the slot from under it.
+                # closing out its round) -- never yank the slot from under it,
+                # whatever its PR's state. Logged, not killed. Deliberately
+                # without resolving the PR: the state cannot change the
+                # outcome, and paying a fetch per poll for every working
+                # reviewer just to log it is not worth the API budget.
+                self._hold(holdouts, ses, "busy — never reaped")
                 continue
-            if time.time() - ses.last_activity < REAP_QUIET_SECONDS:
+            if idle_for < self.config.reap_grace_seconds:
                 # Idle but recently active: likely mid-close-out (the review
                 # is submitted before the envelope and task move land). Wait
-                # for a real quiet period; see REAP_QUIET_SECONDS.
-                continue
-            row = self.state.find_spawn_by_session(ses.name)
-            if row is None:
-                # Not in our ledger: another workspace's daemon (or a human)
-                # owns it. Not ours to judge.
-                continue
-            pr_key = (row["repo"], row["number"])
-            if pr_key not in prs:
-                prs[pr_key] = self._sweep_pr(row["repo"], row["number"])
-            pr = prs[pr_key]
-            if pr is None:
-                continue  # fetch failed -- spare everything on this PR
-            key = (row["repo"], row["number"], row["task_ref"])
-            if key not in completed_cache:
-                completed_cache[key] = self._completed_rounds(pr, row["task_ref"])
-            completed = completed_cache[key]
-            if completed is None or row["round"] > completed:
-                continue  # undecidable, or the round is still in flight
-            if self.config.dry_run:
-                log.info(
-                    "[dry-run] would reap finished reviewer session %s (round %d done)",
-                    ses.name, row["round"],
+                # out the grace period.
+                self._hold(
+                    holdouts, ses,
+                    f"idle {idle_for // 60:.0f} min, inside the "
+                    f"{self.config.reap_grace_seconds // 60} min grace",
                 )
+                continue
+
+            row = self.state.find_spawn_by_session(ses.name)
+            pr = self._resolve_pr(ses, row, prs, holdouts)
+            if pr is None:
+                continue  # undecidable -- already recorded, retried next poll
+
+            reason = self._reap_reason(pr, ses, row, completed_cache, holdouts)
+            if reason is None:
+                continue
+
+            # `last_activity` is 0 when the CLI reported none: that reads as
+            # "quiet for ages" to the guard above, but printing the epoch as a
+            # duration would be a lie, so the evidence says so instead.
+            idle_note = (
+                f"idle {idle_for // 60:.0f} min"
+                if ses.last_activity
+                else "idle, no activity timestamp"
+            )
+            evidence = (
+                f"{pr.slug} is {'merged' if pr.merged else pr.state}, "
+                f"{idle_note} — {reason}"
+            )
+            if self.config.dry_run:
+                log.info("[dry-run] would reap reviewer session %s (%s)", ses.name, evidence)
+                holdouts[ses.name] = f"dry-run: would have reaped ({evidence})"
                 continue
             try:
                 self.alissa.kill_session(ses.name)
             except Exception:  # pragma: no cover - defence in depth
                 log.exception("failed to reap session %s", ses.name)
+                holdouts[ses.name] = "the kill raised — see the traceback above"
                 continue
             # Bookkeeping only -- deliberately never consulted before a kill.
             # The live list is the authority; gating on the reaps table would
             # spare any session killed behind the ledger's back.
             self.state.record_reap(ses.name)
-            reaped += 1
-            log.info(
-                "reaped finished reviewer session %s (round %d done)",
-                ses.name, row["round"],
+            reaped.append(ses.name)
+            log.info("reaped reviewer session %s (%s)", ses.name, evidence)
+
+        self._check_session_cap(sessions, reaped, holdouts)
+        return len(reaped)
+
+    def _hold(self, holdouts: dict[str, str], ses: ManagedSession, why: str) -> None:
+        """Record (and log at debug) why a live session was not reaped.
+
+        Debug because it repeats every poll for the whole life of a spared
+        session -- and the deployed container runs at INFO, so these lines are
+        invisible there by design. They are not the operator's channel: the
+        cap alarm is, and it interpolates what is recorded here.
+        """
+        holdouts[ses.name] = why
+        log.debug("reap sweep: %s spared — %s", ses.name, why)
+
+    def _resolve_pr(
+        self,
+        ses: ManagedSession,
+        row: sqlite3.Row | None,
+        prs: dict[tuple[str, int], PullRequest | None],
+        holdouts: dict[str, str],
+    ) -> PullRequest | None:
+        """The PR a reapable session is about, or None when undecidable.
+
+        A ledger row names the PR outright. Without one the session name is
+        the only evidence, so the number it carries is resolved against the
+        `repos` allowlist. A name carrying a repo component picks its
+        allowlist entry directly; a bare `review-pr-<n>` (the skill's shape)
+        names no repo, so every watched repo is probed and EXACTLY one must
+        have that PR. An empty allowlist -- "watch every repo that asks" --
+        can never resolve a bare name at all; nothing bounds the search.
+
+        What that does and does NOT establish, precisely, because the
+        difference decides whose session can be killed: the allowlist BOUNDS
+        THE SEARCH, it does not prove ownership. A bare number carries no
+        repo, so a session reviewing a PR in an UNWATCHED repo is reaped if
+        exactly one watched repo happens to have a terminal PR of the same
+        number. Requiring a unique hit bounds the blast radius rather than
+        removing it. The converse costs reaps instead: once two watched repos
+        both have a PR #n -- inevitable as newer repos' numbering catches up
+        with older ones -- every bare `review-pr-<n>` in the overlap resolves
+        to two hits and is spared forever. Both are known v1 limits, recorded
+        in the README; the durable fix is a repo in the name (skill-side) or a
+        ledger row for hand-spawned sessions.
+
+        The probe is paid ONCE per session name. Its answer -- the resolved
+        (repo, number), or a sticky None for "could not be resolved" -- is
+        cached on the watcher, because a name is unique per spawn and its PR
+        never changes. Without that, a session spared on an open PR (the
+        common case: a finished round waits idle for the implementer) re-ran
+        the whole allowlist sweep on every poll for the life of the PR, which
+        at 7 repos and a 30s interval is ~840 REST calls an hour for one
+        session. The sticky None never re-probes within a process, so an
+        ambiguity that later clears is not noticed until a restart -- the safe
+        direction (spare, never guess), and the alternative is exactly the
+        cost above.
+        """
+        if row is not None:
+            return self._fetch_pr(prs, row["repo"], row["number"])
+
+        ref = ses.ref
+        if ref is None:  # pragma: no cover - list_review_sessions filters these
+            return None
+
+        if ses.name not in self._probe_cache:
+            self._probe_cache[ses.name] = self._probe_allowlist(ses, ref, prs)
+        target = self._probe_cache[ses.name]
+        if target is None:
+            self._hold(
+                holdouts, ses,
+                f"no ledger row and PR #{ref.number} does not resolve to exactly "
+                f"one watched repo — sparing it rather than guessing",
             )
-        return reaped
+            return None
+        # A memo hit in the common case: the probe that resolved this session
+        # already fetched it. On a later poll this is the one fetch that can
+        # turn the session reapable, so it is not cacheable.
+        return self._fetch_pr(prs, target[0], target[1])
 
-    def _sweep_pr(self, repo_slug: str, number: int) -> PullRequest | None:
-        """One PR fetch for the sweep; the caller memoizes per distinct PR.
+    def _probe_allowlist(
+        self,
+        ses: ManagedSession,
+        ref: SessionRef,
+        prs: dict[tuple[str, int], PullRequest | None],
+    ) -> tuple[str, int] | None:
+        """Which watched repo owns this session's PR number, or None.
 
-        None = the fetch failed -- every session on that PR is spared this
-        pass and looked at again next poll. RateLimited propagates so
+        The expensive half of _resolve_pr, called once per session name.
+        """
+        candidates = self._name_candidates(ref)
+        if not candidates:
+            return None
+        hits = []
+        for repo_slug in candidates:
+            # Quiet: probing a repo that simply has no PR #n is the expected
+            # outcome for all but one candidate, not a failure worth a warning.
+            if self._fetch_pr(prs, repo_slug, ref.number, quiet=True) is not None:
+                hits.append(repo_slug)
+        if len(hits) != 1:
+            log.debug(
+                "reap sweep: PR #%d of %s resolves to %d watched repo(s)",
+                ref.number, ses.name, len(hits),
+            )
+            return None
+        return (hits[0], ref.number)
+
+    def _name_candidates(self, ref: SessionRef) -> list[str]:
+        """The watched repos a session name could be about.
+
+        A name-borne repo component narrows the allowlist to (at most) its own
+        entry; a bare name leaves the whole allowlist as candidates. Matching
+        goes through `session_repo_slug` on both sides so `studio.alissa.app`
+        and the `studio-alissa-app` a session name can carry compare equal.
+        """
+        if ref.repo is None:
+            return list(self.config.repos)
+        return [
+            full_name
+            for full_name in self.config.repos
+            if session_repo_slug(full_name.partition("/")[2]) == ref.repo
+        ]
+
+    def _reap_reason(
+        self,
+        pr: PullRequest,
+        ses: ManagedSession,
+        row: sqlite3.Row | None,
+        completed_cache: dict[tuple[str, int, str | None], float | None],
+        holdouts: dict[str, str],
+    ) -> str | None:
+        """Why this session may be reaped, or None to spare it (recorded)."""
+        if pr.is_terminal:
+            return "the PR is terminal, so every round on it is over"
+
+        if row is None:
+            # v1 reaps a ledger-less session on a terminal PR only. The name's
+            # `-r<k>` cannot tell a superseded round from an in-flight one, and
+            # an operator re-entry may still want the earlier round's context;
+            # superseded-round reaping is a v2 with its own analysis (#46).
+            self._hold(
+                holdouts, ses,
+                f"{pr.slug} is open and there is no ledger row — v1 reaps "
+                f"ledger-less sessions on terminal PRs only",
+            )
+            return None
+
+        key = (row["repo"], row["number"], row["task_ref"])
+        if key not in completed_cache:
+            completed_cache[key] = self._completed_rounds(pr, row["task_ref"])
+        completed = completed_cache[key]
+        if completed is None or row["round"] > completed:
+            self._hold(
+                holdouts, ses,
+                f"round {row['round']} of {pr.slug} is not finished "
+                f"({completed} completed)",
+            )
+            return None
+        return f"round {row['round']} of an open PR is done"
+
+    def _check_session_cap(
+        self,
+        sessions: list[ManagedSession],
+        reaped: list[str],
+        holdouts: dict[str, str],
+    ) -> None:
+        """Page-worthy log when the sweep is not keeping up.
+
+        Counted AFTER the sweep, from the same live list the sweep walked
+        minus what it killed, so the number is "sessions this pass could not
+        free". Every idle agent session holds hundreds of MB forever and the
+        worker container is shared, so a count that stays above the cap is the
+        2026-07-28 incident happening again.
+
+        The page carries each survivor's spare reason inline, because the
+        per-session holdout lines are debug and the deployed container runs at
+        INFO: an alarm whose explanation is invisible is an alarm an operator
+        cannot act on.
+
+        Deduped in-process on the set of surviving names: the sweep runs every
+        poll (every 30s in the deployed config), and 120 identical pages an
+        hour is not a page. It re-fires when the set changes, and clears once
+        the count falls back inside the cap so the next episode pages again.
+        Deliberately NOT the `pings` ledger the stalled-round escalation uses:
+        that table is keyed (repo, number, kind) and this alarm belongs to no
+        PR, so persisting it would mean a sentinel row every console reader
+        then has to filter around -- and a standing over-cap condition SHOULD
+        announce itself once to a freshly restarted daemon, which a persisted
+        ping would suppress forever.
+        """
+        killed = set(reaped)
+        remaining = sorted(s.name for s in sessions if s.name not in killed)
+        if len(remaining) <= self.config.reap_session_cap:
+            self._paged_cap = None
+            return
+        episode = frozenset(remaining)
+        if episode == self._paged_cap:
+            return
+        self._paged_cap = episode
+        log.error(
+            "REVIEWER SESSION CAP EXCEEDED: %d live reviewer sessions after the "
+            "sweep (cap %d) — each holds hundreds of MB in a shared container. "
+            "Survivors and why the sweep spared each: %s",
+            len(remaining),
+            self.config.reap_session_cap,
+            "; ".join(
+                f"{name} ({holdouts.get(name, 'no reason recorded')})"
+                for name in remaining
+            ),
+        )
+
+    def _fetch_pr(
+        self,
+        prs: dict[tuple[str, int], PullRequest | None],
+        repo_slug: str,
+        number: int,
+        *,
+        quiet: bool = False,
+    ) -> PullRequest | None:
+        """One memoized PR fetch for the sweep, per distinct (repo, number).
+
+        None = the PR could not be fetched -- it does not exist in that repo,
+        or the call failed. Either way every session resolving through it is
+        spared this pass and looked at again next poll. `quiet` demotes the
+        log to debug for the allowlist probe, where a miss is the expected
+        answer for all but one candidate. RateLimited propagates so
         run_forever backs off instead of hammering the API once per session.
         """
+        key = (repo_slug, number)
+        if key in prs:
+            return prs[key]
         owner, _, repo = repo_slug.partition("/")
         try:
-            return self.github.pull_request(owner, repo, number)
+            prs[key] = self.github.pull_request(owner, repo, number)
         except RateLimited:
             raise
         except CommandError as exc:
-            log.warning("reap sweep: could not fetch %s#%d: %s", repo_slug, number, exc)
-            return None
+            log.log(
+                logging.DEBUG if quiet else logging.WARNING,
+                "reap sweep: could not fetch %s#%d: %s", repo_slug, number, exc,
+            )
+            prs[key] = None
+        return prs[key]
 
     def _completed_rounds(self, pr: PullRequest, task_ref: str | None) -> float | None:
-        """How many rounds of this PR are over, judged from GitHub/task state.
+        """How many rounds of this OPEN PR are over, judged from task/GitHub.
 
-        A closed or merged PR terminates every round, so it reports infinity.
-        Otherwise rounds completed = verdict envelopes on the review task (the
+        Rounds completed = verdict envelopes on the review task (the
         authoritative round record), addressed by the task ref the ledger
         captured at spawn time -- NOT find_review_task, which would fetch the
         whole task list and whose open-status filter loses validated tasks.
         The substantive-review count is the fallback only for spawns recorded
         before any review task existed. None means "could not tell" -- the
         sweep spares the session and retries next poll.
+
+        Terminal PRs never reach here: the caller answers those before asking
+        about rounds, because a merged or closed PR ends every round on it
+        whatever the envelopes say.
         """
-        if pr.is_terminal:
-            return float("inf")
         if task_ref:
             # count_verdicts never raises; unreadable evidence degrades to 0,
             # which spares the session (round >= 1 > 0).

@@ -212,6 +212,11 @@ ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 # they are documented in the README, not duplicated here.
 ARG ALISSA_POLL_INTERVAL=""
 ARG ALISSA_ROUND_CAP=""
+# Reviewer-session reaper knobs, pass-through on the same contract: how long a
+# session must be idle AND quiet before the sweep reaps it, and the page-worthy
+# threshold for live reviewer sessions left after a sweep.
+ARG ALISSA_REAP_GRACE_SECONDS=""
+ARG ALISSA_REAP_SESSION_CAP=""
 # STRUCTURAL container constants (not pass-through): agent_profile must name a
 # profile the baked agents.yaml ships (`claude`); on_missing_hub must be `add`
 # for the self-contained hub-ify-on-demand model (the library default `skip`
@@ -236,6 +241,8 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_REVIEW_SKILLS=${ALISSA_REVIEW_SKILLS} \
     ALISSA_POLL_INTERVAL=${ALISSA_POLL_INTERVAL} \
     ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
+    ALISSA_REAP_GRACE_SECONDS=${ALISSA_REAP_GRACE_SECONDS} \
+    ALISSA_REAP_SESSION_CAP=${ALISSA_REAP_SESSION_CAP} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \
     ALISSA_AGENT_MODEL=${ALISSA_AGENT_MODEL} \
     ALISSA_ON_MISSING_HUB=${ALISSA_ON_MISSING_HUB} \

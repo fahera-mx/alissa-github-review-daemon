@@ -57,9 +57,13 @@ render_revloop_config() {
     --arg     agent  "${ALISSA_AGENT_PROFILE:-claude}" \
     --arg     poll   "${ALISSA_POLL_INTERVAL:-}" \
     --arg     cap    "${ALISSA_ROUND_CAP:-}" \
+    --arg     grace  "${ALISSA_REAP_GRACE_SECONDS:-}" \
+    --arg     scap   "${ALISSA_REAP_SESSION_CAP:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
-     + (if $poll == "" then {} else { poll_interval: ($poll | tonumber) } end)
-     + (if $cap  == "" then {} else { round_cap:     ($cap  | tonumber) } end)
+     + (if $poll  == "" then {} else { poll_interval:      ($poll  | tonumber) } end)
+     + (if $cap   == "" then {} else { round_cap:          ($cap   | tonumber) } end)
+     + (if $grace == "" then {} else { reap_grace_seconds: ($grace | tonumber) } end)
+     + (if $scap  == "" then {} else { reap_session_cap:   ($scap  | tonumber) } end)
      + (if ($operators | length) == 0 then {} else { operators: $operators } end)'
 }
 

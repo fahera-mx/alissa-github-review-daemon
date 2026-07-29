@@ -14,12 +14,19 @@ import pytest
 
 from alissa.tools.github.revloop.config import (
     CONFIG_FILENAME,
+    DEFAULT_REAP_GRACE_SECONDS,
+    DEFAULT_REAP_SESSION_CAP,
     HUB_ADD,
     ON_MISSING_SKIP,
     Config,
     resolve_config_path,
 )
-from alissa.tools.github.revloop.alissa import ManagedSession
+from alissa.tools.github.revloop.alissa import (
+    ManagedSession,
+    SessionRef,
+    parse_session_name,
+    session_repo_slug,
+)
 from alissa.tools.github.revloop.ghclient import (
     COMMENT_PAGE_LIMIT,
     PER_PAGE,
@@ -33,7 +40,6 @@ from alissa.tools.github.revloop.ghclient import (
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     MAX_REENTRY_ROUNDS,
-    REAP_QUIET_SECONDS,
     REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
@@ -127,7 +133,9 @@ class FakeAlissa:
         self.enqueued.append(kwargs)
 
     def list_review_sessions(self):
-        return [s for s in self.sessions if s.name.startswith("review-")]
+        # The real client filters on the grammar, not a prefix — the fake
+        # must too, or a test could 'reap' a name production never sees.
+        return [s for s in self.sessions if parse_session_name(s.name)]
 
     def kill_session(self, session):
         self.killed.append(session)
@@ -761,6 +769,25 @@ def test_config_rejects_bad_values(tmp_path):
     with pytest.raises(ValueError, match="unknown config key"):
         Config.build(tmp_path, {"pol_interval": 60})
 
+    with pytest.raises(ValueError, match="reap_grace_seconds"):
+        Config.build(tmp_path, {"reap_grace_seconds": -1})
+
+    # A cap of 0 would page on every live reviewer, i.e. on a healthy loop.
+    with pytest.raises(ValueError, match="reap_session_cap"):
+        Config.build(tmp_path, {"reap_session_cap": 0})
+
+
+def test_reap_knobs_default_and_layer_like_every_other_key(tmp_path):
+    assert Config.build(tmp_path).reap_grace_seconds == DEFAULT_REAP_GRACE_SECONDS
+    assert Config.build(tmp_path).reap_session_cap == DEFAULT_REAP_SESSION_CAP
+
+    cfg = Config.build(
+        tmp_path,
+        {"reap_grace_seconds": 900, "reap_session_cap": 3},
+        {"reap_grace_seconds": 120},  # CLI wins, the unset override does not
+    )
+    assert (cfg.reap_grace_seconds, cfg.reap_session_cap) == (120, 3)
+
 
 # -- config layering -------------------------------------------------------
 
@@ -1106,7 +1133,7 @@ def _record(w, pr, round_, task_ref="TASK-500"):
 
 
 def _live(al, name, status="idle", last_activity=0.0):
-    # last_activity=0 means "quiet for ages" — past REAP_QUIET_SECONDS.
+    # last_activity=0 means "quiet for ages" — past any grace period.
     al.sessions.append(
         ManagedSession(name=name, status=status, last_activity=last_activity)
     )
@@ -1327,7 +1354,7 @@ def test_sweep_waits_out_recent_activity(config):
     """The GitHub review count increments before the reviewer finishes its
     close-out (CR6 envelope, task move), and a claude session between turns
     reports 'idle' — so an idle-but-recently-active session is spared until
-    it has been quiet for REAP_QUIET_SECONDS."""
+    it has been quiet for the configured grace period."""
     pr = make_pr()
     w, _, al = watcher(config, pr, [review()])
     s1 = _record(w, pr, 1)
@@ -1337,7 +1364,7 @@ def test_sweep_waits_out_recent_activity(config):
     assert al.killed == []
 
     al.sessions = []
-    _live(al, s1, last_activity=time.time() - REAP_QUIET_SECONDS * 2)  # long quiet
+    _live(al, s1, last_activity=time.time() - config.reap_grace_seconds * 2)
     w.sweep_sessions()
     assert al.killed == [s1]
 
@@ -1432,6 +1459,485 @@ def test_sweep_falls_back_to_review_count_without_a_task_ref(config):
     assert al.killed == [s1]
 
 
+# -- the session-name grammar: what the sweep is allowed to touch -----------
+#
+# The sweep KILLS, and the worker container is shared with every other lane,
+# so ownership is a parse and not a prefix. These pin both halves: the shapes
+# the review loop produces, and the shapes it must keep its hands off.
+
+
+def test_grammar_round_trips_the_names_this_daemon_spawns():
+    """Producer and parser are one contract — a session_name() change that the
+    matcher did not follow would make the daemon stop recognizing its own."""
+    ref = parse_session_name(session_name(make_pr(), 3))
+    assert ref == SessionRef(number=NUMBER, repo="widgets", round=3)
+
+
+def test_grammar_accepts_the_skill_spawned_shapes():
+    """The alissa-code-review procedures spawn `review-pr-<n>` (and
+    `-r<k>` for later rounds) by hand. Those are rounds of the SAME loop, no
+    ledger knows them, and nothing reaped them: every session in the
+    2026-07-28 memory incident had one of these two names."""
+    assert parse_session_name("review-pr-296") == SessionRef(number=296)
+    assert parse_session_name("review-pr-302-r2") == SessionRef(
+        number=302, round=2
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Other lanes live in the same container. Real names, from the
+        # incident container's `alissa tmux ls`.
+        "develop-fahera-mx-alissa-github-review-daemon-i46-a1",
+        "fix-fahera-mx-studio-alissa-app-pr304-r1-a1",
+        "maintain-fahera-mx-studio-alissa-app-pr293-a1",
+        # Near misses in our own namespace.
+        "review-",
+        "review-pr-",
+        "review-pr-x",
+        "review-pr-296-r2-extra",
+        "reviewer-pr-296",
+        "review-widgets-pr7",  # no round, no nonce
+        "review-widgets-pr7-r1",  # no nonce
+        "review-widgets-pr7-r1-NOTHEX",
+        # The raw tmux name, not the managed name the CLI reports.
+        "ali-review-pr-296",
+        "",
+        None,
+    ],
+)
+def test_grammar_rejects_everything_that_is_not_ours(name):
+    assert parse_session_name(name) is None
+
+
+def test_list_review_sessions_enumerates_only_the_grammar(monkeypatch):
+    """The filter lives in the enumerator on purpose: a name that is not ours
+    never reaches the sweep at all, so no later bug in it can kill one."""
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    rows = [
+        {"name": "review-pr-296", "status": "idle", "lastActivity": 12},
+        {"name": "review-widgets-pr7-r1-abc123", "status": "busy"},
+        {"name": "develop-fahera-mx-widgets-i46-a1", "status": "idle"},
+        {"name": "fix-fahera-mx-widgets-pr304-r1-a1", "status": "idle"},
+        {"name": None, "status": "idle"},
+        "not-even-a-dict",
+    ]
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: rows)
+
+    got = alissa_mod.Alissa().list_review_sessions()
+
+    assert [s.name for s in got] == ["review-pr-296", "review-widgets-pr7-r1-abc123"]
+    assert got[0].last_activity == 12
+    assert got[1].last_activity == 0.0  # missing field = "quiet for ages"
+
+
+def test_the_only_tmux_kill_the_package_can_run_is_per_session():
+    """`kill-server` in a shared container takes every other lane's workers
+    down with the finished reviewer. Pinned by walking every literal argv in
+    the package rather than by grepping the call site, so a future 'tidy up
+    all these sessions' anywhere in the tree still trips it."""
+    import ast
+    import pathlib
+
+    import alissa.tools.github.revloop as pkg
+
+    argvs = []
+    for path in sorted(pathlib.Path(pkg.__file__).parent.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            if not isinstance(node.args[0], (ast.List, ast.Tuple)):
+                continue
+            # Literal head of the argv; variables (the session name) drop out.
+            literals = [
+                el.value
+                for el in node.args[0].elts
+                if isinstance(el, ast.Constant) and isinstance(el.value, str)
+            ]
+            if literals[:1] == ["alissa"]:
+                argvs.append(literals)
+
+    assert argvs, "found no alissa argv at all — the walk is broken, not clean"
+    assert not any("kill-server" in argv for argv in argvs)
+    # Every kill the package can issue -- the sweep's and the console's
+    # operator action -- is the same per-session verb, with the session name
+    # as its (non literal) tail argument.
+    kills = [argv for argv in argvs if "kill" in argv]
+    assert kills and all(argv == ["alissa", "tmux", "kill"] for argv in kills)
+
+
+# -- the terminal-PR reap edge (issue #46) ----------------------------------
+#
+# Sessions with no ledger row: the hand-spawned `review-pr-<n>` rounds, and
+# any spawn whose ledger was lost. The name is the only evidence, so these
+# reap on a TERMINAL PR only.
+
+
+def _watched(config, *repos):
+    return dataclasses.replace(config, repos=tuple(repos))
+
+
+def _resolve_prs(gh, mapping):
+    """Make the fake GitHub answer per (repo slug, number), 404ing otherwise —
+    the multi-repo world the allowlist probe has to work in."""
+
+    def pull_request(owner, repo, number):
+        gh.pr_fetches += 1
+        found = mapping.get((f"{owner}/{repo}", number))
+        if found is None:
+            raise CommandError(["gh", "api"], 1, "Not Found (HTTP 404)")
+        return found
+
+    gh.pull_request = pull_request
+
+
+def test_sweep_reaps_a_ledgerless_session_of_a_merged_pr(config, caplog):
+    """THE incident case: a skill-spawned reviewer, idle for hours, its PR
+    merged, no spawn row anywhere — nothing in the daemon used to be able to
+    reach it."""
+    merged = make_pr(state="closed", merged=True)
+    w, _, al = watcher(_watched(config, SLUG), merged, [])
+    _live(al, "review-pr-7", last_activity=time.time() - 3600)
+
+    with caplog.at_level(logging.INFO):
+        assert w.sweep_sessions() == 1
+
+    assert al.killed == ["review-pr-7"]
+    # Evidence, per #46: the name, the PR state, and how long it sat idle.
+    line = next(r.getMessage() for r in caplog.records if "reaped" in r.message)
+    assert "review-pr-7" in line and "merged" in line and "60 min" in line
+
+
+def test_sweep_never_reaps_a_ledgerless_session_of_an_open_pr(config):
+    """v1 reaps on terminal PRs only. A superseded round (r1 while r2 runs) is
+    exactly what the name cannot distinguish from an in-flight one, and an
+    operator re-entry may still want that context — so an open PR spares every
+    round of it."""
+    w, _, al = watcher(_watched(config, SLUG), make_pr(), [review()])
+    _live(al, "review-pr-7-r1")
+    _live(al, "review-pr-7-r2")
+
+    assert w.sweep_sessions() == 0
+    assert al.killed == []
+
+
+def test_sweep_never_reaps_a_busy_session_even_on_a_merged_pr(config):
+    """Scoped post-merge re-reviews of fold commits are an established
+    pattern — busy plus terminal is logged, never killed."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    _live(al, "review-pr-7", status="busy")
+
+    assert w.sweep_sessions() == 0
+    assert al.killed == []
+    assert gh.pr_fetches == 0, "a session we will never kill must cost no fetch"
+
+
+def test_sweep_holds_a_terminal_pr_session_through_the_grace_period(config):
+    """The grace period is what lets a just-merged PR's reviewer finish its
+    in-session close-out (CR6 envelope, task move) before the slot is freed."""
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_grace_seconds=600)
+    merged = make_pr(state="closed", merged=True)
+    w, _, al = watcher(cfg, merged, [])
+    _live(al, "review-pr-7", last_activity=time.time() - 300)  # inside the grace
+
+    assert w.sweep_sessions() == 0
+
+    al.sessions = []
+    _live(al, "review-pr-7", last_activity=time.time() - 900)  # past it
+    assert w.sweep_sessions() == 1
+    assert al.killed == ["review-pr-7"]
+
+
+def test_sweep_spares_a_bare_name_when_nothing_bounds_the_search(config):
+    """An empty allowlist means 'review whatever asks' — there is then no
+    repo a bare `review-pr-<n>` could be resolved against, so it is spared
+    without spending a single fetch."""
+    w, gh, al = watcher(config, make_pr(state="closed", merged=True), [])
+    _live(al, "review-pr-7")
+
+    assert w.sweep_sessions() == 0
+    assert al.killed == []
+    assert gh.pr_fetches == 0
+
+
+def test_sweep_spares_a_bare_name_two_watched_repos_could_own(config):
+    """PR #7 exists in both watched repos: which session this is cannot be
+    known, and a guess here kills somebody's reviewer."""
+    merged = make_pr(state="closed", merged=True)
+    other = dataclasses.replace(merged, repo="gadgets")
+    w, gh, al = watcher(_watched(config, SLUG, "acme/gadgets"), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged, ("acme/gadgets", 7): other})
+    _live(al, "review-pr-7")
+
+    assert w.sweep_sessions() == 0
+    assert al.killed == []
+
+
+def test_sweep_resolves_a_bare_name_to_the_one_watched_repo_that_has_it(config):
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, "acme/gadgets", SLUG), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged})  # gadgets 404s on #7
+    _live(al, "review-pr-7")
+
+    assert w.sweep_sessions() == 1
+    assert al.killed == ["review-pr-7"]
+
+
+def test_sweep_matches_a_repo_bearing_name_against_the_allowlist(config):
+    """A daemon-shaped name whose ledger row is gone still carries its repo —
+    and the slug in the name ('studio-alissa-app') has to compare equal to the
+    allowlist's real name ('studio.alissa.app')."""
+    merged = dataclasses.replace(
+        make_pr(state="closed", merged=True), owner="fahera-mx", repo="studio.alissa.app"
+    )
+    w, gh, al = watcher(
+        _watched(config, "fahera-mx/studio.alissa.app", "acme/gadgets"), merged, []
+    )
+    _resolve_prs(gh, {("fahera-mx/studio.alissa.app", 7): merged})
+    _live(al, "review-studio-alissa-app-pr7-r1-abc123")
+
+    assert w.sweep_sessions() == 1
+    assert al.killed == ["review-studio-alissa-app-pr7-r1-abc123"]
+    assert gh.pr_fetches == 1, "the name names its repo — no allowlist probing"
+
+
+def test_sweep_never_touches_another_lanes_sessions(config):
+    """The other lanes' sessions are idle, long quiet, and share the container
+    with a merged PR's — and are still invisible to the sweep."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    for name in (
+        "develop-fahera-mx-alissa-github-review-daemon-i46-a1",
+        "fix-fahera-mx-studio-alissa-app-pr304-r1-a1",
+        "maintain-fahera-mx-studio-alissa-app-pr293-a1",
+    ):
+        _live(al, name)
+
+    assert w.sweep_sessions() == 0
+    assert al.killed == []
+    assert gh.pr_fetches == 0
+    assert len(al.sessions) == 3, "they must still be running afterwards"
+
+
+def test_sweep_skips_a_ledgerless_session_whose_pr_cannot_be_fetched(config):
+    """A GitHub failure is logged and skipped, never fatal to the walk: the
+    session after it is still considered in the same pass."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    _resolve_prs(gh, {(SLUG, 9): merged})  # #7 blows up, #9 resolves
+    _live(al, "review-pr-7")
+    _live(al, "review-pr-9")
+
+    assert w.sweep_sessions() == 1
+    assert al.killed == ["review-pr-9"]
+
+
+# -- the post-sweep cap check ----------------------------------------------
+
+
+def test_cap_check_pages_when_the_sweep_cannot_keep_up(config, caplog):
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_session_cap=2)
+    w, _, al = watcher(cfg, make_pr(), [review()])  # open PR: nothing reapable
+    for number in (1, 2, 3):
+        _live(al, f"review-pr-{number}")
+
+    with caplog.at_level(logging.ERROR):
+        assert w.sweep_sessions() == 0
+
+    pages = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(pages) == 1
+    assert "CAP EXCEEDED" in pages[0].message
+    page = pages[0].getMessage()
+    assert all(f"review-pr-{n} (" in page for n in (1, 2, 3))
+
+
+def test_cap_check_counts_what_the_sweep_left_behind(config, caplog):
+    """Reaped sessions are not 'live after the sweep' — a pass that cleared
+    itself back under the cap must not page."""
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_session_cap=2)
+    merged = make_pr(state="closed", merged=True)
+    w, _, al = watcher(cfg, merged, [])
+    for number in (1, 2, 3):
+        _live(al, f"review-pr-{number}")
+    _resolve_prs(w.github, {(SLUG, n): merged for n in (1, 2, 3)})
+
+    with caplog.at_level(logging.ERROR):
+        assert w.sweep_sessions() == 3
+
+    assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+
+
+# -- round 2: the probe must not be paid per poll ---------------------------
+
+
+def _sweep_n(w, times):
+    for _ in range(times):
+        w.sweep_sessions()
+    return w.github.pr_fetches
+
+
+def test_the_allowlist_probe_is_paid_once_per_session_not_once_per_poll(config):
+    """A bare-name session on an OPEN PR is spared by design and stays live for
+    the life of the PR, so re-probing the whole allowlist each poll turned a
+    documented cost into a budget problem (7 repos x 120 polls/h). The probe's
+    answer is cached per session name; only the PR-state fetch, which is what
+    can turn the session reapable, repeats."""
+    open_pr = make_pr()
+    repos = [f"acme/r{n}" for n in range(5)] + [SLUG]
+    w, gh, al = watcher(_watched(config, *repos), open_pr, [review()])
+    _resolve_prs(gh, {(SLUG, 7): open_pr})  # the other five 404 on #7
+    _live(al, "review-pr-7")
+
+    assert _sweep_n(w, 3) == 6 + 1 + 1, "6 probes once, then one state fetch/poll"
+    assert al.killed == []
+
+
+def test_an_unresolvable_name_is_probed_once_and_then_costs_nothing(config):
+    """The sticky negative: two watched repos both have PR #7, so the session
+    is spared forever. Re-probing it forever is exactly the cost that made the
+    per-poll probe untenable."""
+    merged = make_pr(state="closed", merged=True)
+    other = dataclasses.replace(merged, repo="gadgets")
+    w, gh, al = watcher(_watched(config, SLUG, "acme/gadgets"), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged, ("acme/gadgets", 7): other})
+    _live(al, "review-pr-7")
+
+    assert _sweep_n(w, 3) == 2, "both repos probed once; nothing after that"
+    assert al.killed == []
+
+
+def test_the_probe_cache_drops_sessions_that_left_the_live_list(config):
+    """Names are unique per spawn and a session's PR never changes, so the only
+    invalidation needed is forgetting names that are gone — otherwise the cache
+    grows without bound in a daemon that polls forever."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged, (SLUG, 9): merged})
+    _live(al, "review-pr-7")
+    w.sweep_sessions()
+    assert "review-pr-7" in w._probe_cache
+
+    al.sessions = []
+    _live(al, "review-pr-9")
+    w.sweep_sessions()
+
+    assert list(w._probe_cache) == ["review-pr-9"]
+
+
+# -- round 2: the cap alarm explains itself, once per episode ---------------
+
+
+def test_the_cap_page_carries_why_each_survivor_was_spared(config, caplog):
+    """The per-session holdout lines are debug and the container runs at INFO,
+    so an alarm without the reasons inline is an alarm nobody can act on."""
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_session_cap=1)
+    open_pr = make_pr()
+    w, gh, al = watcher(cfg, open_pr, [review()])
+    _resolve_prs(gh, {(SLUG, 7): open_pr})
+    _live(al, "review-pr-7")  # idle, past grace, open PR, no ledger row
+    _live(al, "review-pr-8", status="busy")
+
+    with caplog.at_level(logging.ERROR):
+        w.sweep_sessions()
+
+    page = next(r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+    assert "review-pr-7 (acme/widgets#7 is open and there is no ledger row" in page
+    assert "review-pr-8 (busy — never reaped)" in page
+
+
+def test_the_cap_page_fires_once_per_episode_not_once_per_poll(config, caplog):
+    """Every 30s in the deployed config; 120 identical pages an hour is not a
+    page. It must re-fire when the survivor set changes, and again after the
+    count has fallen back inside the cap."""
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_session_cap=1)
+    w, _, al = watcher(cfg, make_pr(), [review()])
+    _live(al, "review-pr-7")
+    _live(al, "review-pr-8")
+
+    with caplog.at_level(logging.ERROR):
+        w.sweep_sessions()
+        w.sweep_sessions()  # same survivors — silent
+        assert len(caplog.records) == 1
+
+        _live(al, "review-pr-9")  # the set changed — page again
+        w.sweep_sessions()
+        assert len(caplog.records) == 2
+
+        al.sessions = [al.sessions[0]]  # back inside the cap — clears
+        w.sweep_sessions()
+        assert len(caplog.records) == 2
+
+        al.sessions = [ManagedSession(name=f"review-pr-{n}", status="idle") for n in (7, 8)]
+        w.sweep_sessions()  # a NEW episode of the same set pages again
+        assert len(caplog.records) == 3
+
+
+# -- round 2: reap_grace_seconds is coupled to the stale window -------------
+
+
+def test_a_grace_at_or_above_the_stale_window_is_rejected(tmp_path):
+    """The same knob gates the stale-round liveness probe. At or above
+    STALE_ROUND_SECONDS its 'idle-finished -> dead -> respawn' branch is
+    unreachable: every stale round defers forever and only the operator ping
+    fires. Loud at config time instead of silently wedged at runtime."""
+    with pytest.raises(ValueError, match="stale-round window"):
+        Config.build(tmp_path, {"reap_grace_seconds": STALE_ROUND_SECONDS})
+    with pytest.raises(ValueError, match="stale-round window"):
+        Config.build(tmp_path, {"reap_grace_seconds": 4 * 60 * 60})
+
+    ok = Config.build(tmp_path, {"reap_grace_seconds": STALE_ROUND_SECONDS - 1})
+    assert ok.reap_grace_seconds == STALE_ROUND_SECONDS - 1
+
+
+def test_stale_round_constant_is_still_importable_from_loop():
+    """It moved to `config` so the validation above can see it; `loop` re-exports
+    it because webui and the tests import it from there."""
+    from alissa.tools.github.revloop import config as config_mod
+    from alissa.tools.github.revloop import loop as loop_mod
+
+    assert loop_mod.STALE_ROUND_SECONDS is config_mod.STALE_ROUND_SECONDS
+
+
+# -- AC2: reaping must not disturb round accounting or cap re-entry ---------
+
+
+def _accounting_run(config, tmp_path, db_name, *, reap):
+    """One identical scenario -- open PR, round 1 done, one operator re-entry
+    grant on the ledger -- decided with and without a reap of round 1's
+    session. Everything but the reap is byte-identical between the two."""
+    pr = make_pr()
+    st = State(tmp_path / db_name)
+    w, _, al = watcher(config, pr, [review()], state=st, verdict_count=1)
+    s1 = _record(w, pr, 1)
+    w.state.record_grant(SLUG, NUMBER, 4242, "RHDZMOTA", 2)
+    if reap:
+        _live(al, s1)
+        assert w.sweep_sessions() == 1, "the reap under test must actually happen"
+    return w.evaluate(OWNER, REPO, NUMBER), w.state.granted_rounds(SLUG, NUMBER)
+
+
+def test_round_accounting_and_re_entry_ignore_whether_sessions_were_reaped(
+    config, tmp_path
+):
+    """AC2. Rounds are counted from CR6 verdict envelopes and the effective
+    cap from the grants table; the reaps table is bookkeeping that nothing
+    consults. So a PR whose earlier-round sessions were reaped decides
+    exactly like one whose were not."""
+    reaped_decision, reaped_grants = _accounting_run(
+        config, tmp_path, "reaped.db", reap=True
+    )
+    kept_decision, kept_grants = _accounting_run(
+        config, tmp_path, "kept.db", reap=False
+    )
+
+    assert reaped_decision.action is kept_decision.action is Action.SPAWNED
+    assert reaped_decision.round == kept_decision.round == 2
+    assert reaped_grants == kept_grants == 2
+
+
 # -- stale rounds: two-signal staleness (timer + liveness) + floor -----------
 
 def _backdate(st, seconds):
@@ -1487,7 +1993,7 @@ def test_stale_round_with_idle_finished_session_respawns(config):
     w, _, al = watcher(config, make_pr(), [], state=st)
     w.evaluate(OWNER, REPO, NUMBER)
     _live(al, al.enqueued[0]["session"],
-          last_activity=time.time() - REAP_QUIET_SECONDS * 2)
+          last_activity=time.time() - config.reap_grace_seconds * 2)
     _backdate(st, PAST_STALE)
 
     d = w.evaluate(OWNER, REPO, NUMBER)

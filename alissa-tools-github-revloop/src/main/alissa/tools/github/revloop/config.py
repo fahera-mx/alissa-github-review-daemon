@@ -47,10 +47,47 @@ CONFIG_KEYS = (
     "state_path",
     "on_missing_review_task",
     "on_missing_hub",
+    "reap_grace_seconds",
+    "reap_session_cap",
     "dry_run",
 )
 
 MIN_POLL_INTERVAL = 10  # the search API allows 30 req/min
+
+# A reviewer session that has not submitted after this long is presumed dead
+# (skill failure mode: "reviewer session stalls"). The round is re-enqueued --
+# but only with a second signal agreeing: the timer alone cannot tell a dead
+# session from a slow one, and a timer-only re-enqueue double-spends the round
+# (two sessions review it, both submit -- observed live twice: double round-2
+# approves on devloop's PR #11, double approves on this repo's PR #19). See
+# loop._defer_stale_round for the liveness signal.
+#
+# It lives here rather than in `loop` (which re-exports it, so every import
+# site is unchanged) because `reap_grace_seconds` is validated against it, and
+# config cannot import loop without a cycle.
+STALE_ROUND_SECONDS = 90 * 60
+
+# How long a reviewer session must have been idle AND quiet (no tmux activity)
+# before the sweep may reap it, and before the stale-round liveness probe
+# reads it as finished rather than working.
+#
+# Both readings need the same number because they ask the same question -- "is
+# this session done?" -- and a claude session parked at its prompt between
+# turns reports "idle", so only the absence of activity can answer it. The
+# default is generous on purpose: a just-merged PR's reviewer still has
+# in-session close-out to do (CR6 envelope, task move, its own self-kill), and
+# reaping under it loses that work for nothing. Configurable because the right
+# value tracks how long a round's close-out takes on a given deployment.
+DEFAULT_REAP_GRACE_SECONDS = 30 * 60
+
+# Post-sweep alarm threshold: more live reviewer sessions than this and the
+# sweep logs page-worthy, because the reaper is not keeping up with the spawn
+# rate. Each idle agent session holds hundreds of MB forever, and the worker
+# container is shared -- the 2026-07-28 incident was this exact drift, climbing
+# past 10 GB with every review session idle and its PR long merged. A healthy
+# loop runs a couple of concurrent rounds, so the default is a threshold no
+# healthy deployment reaches, not a capacity limit.
+DEFAULT_REAP_SESSION_CAP = 6
 
 
 def default_state_path(workspace_root: Path) -> Path:
@@ -86,6 +123,12 @@ class Config:
 
     on_missing_review_task: str = ON_MISSING_SPAWN
     on_missing_hub: str = HUB_SKIP
+
+    # The reap sweep's two knobs -- see the constants above for what each one
+    # buys and why it is tunable rather than pinned.
+    reap_grace_seconds: int = DEFAULT_REAP_GRACE_SECONDS
+    reap_session_cap: int = DEFAULT_REAP_SESSION_CAP
+
     dry_run: bool = False
 
     def __post_init__(self) -> None:
@@ -180,6 +223,30 @@ class Config:
                 f"poll_interval must be >= {MIN_POLL_INTERVAL} seconds, got {interval}"
             )
 
+        grace = int(raw.get("reap_grace_seconds", cls.reap_grace_seconds))
+        if grace < 0:
+            raise ValueError(f"reap_grace_seconds must be >= 0, got {grace}")
+        if grace >= STALE_ROUND_SECONDS:
+            # The same number answers the stale-round liveness probe, whose
+            # own window is STALE_ROUND_SECONDS. At or above it the
+            # "idle-finished -> dead -> respawn" branch is unreachable: a
+            # session can never have been quiet longer than the grace by the
+            # time its round goes stale, so every stale round defers forever
+            # and only the operator ping ever fires. Loud here rather than
+            # silently wedged there.
+            raise ValueError(
+                f"reap_grace_seconds must be well under the {STALE_ROUND_SECONDS}s "
+                f"stale-round window (it also gates the stale-round liveness "
+                f"probe, whose respawn branch it would make unreachable), "
+                f"got {grace}"
+            )
+
+        session_cap = int(raw.get("reap_session_cap", cls.reap_session_cap))
+        if session_cap < 1:
+            # 0 would page on every single live reviewer, which is the normal
+            # state of a working loop -- an alarm that always fires is noise.
+            raise ValueError(f"reap_session_cap must be >= 1, got {session_cap}")
+
         state_path = raw.get("state_path")
         return cls(
             workspace_root=Path(workspace_root),
@@ -193,6 +260,8 @@ class Config:
             state_path=Path(state_path).expanduser() if state_path else None,
             on_missing_review_task=mode,
             on_missing_hub=hub_mode,
+            reap_grace_seconds=grace,
+            reap_session_cap=session_cap,
             dry_run=bool(raw.get("dry_run", False)),
         )
 
