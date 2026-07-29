@@ -40,6 +40,26 @@ from .state import State
 
 log = logging.getLogger(__name__)
 
+
+class _FetchFailed:
+    """Sentinel: the PR fetch did not answer, as distinct from "no such PR".
+
+    A distinct type rather than a second None, because the reap sweep now
+    caches what a probe concluded: "GitHub says this repo has no PR #n" is a
+    fact worth pinning, "the call blew up" is not. See loop._fetch_pr.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "FETCH_FAILED"
+
+
+FETCH_FAILED = _FetchFailed()
+
+# The reap sweep's per-pass PR memo, keyed (repo slug, number).
+FetchMemo = dict[tuple[str, int], "PullRequest | None | _FetchFailed"]
+
 # The floor under the liveness deferral: a live session defers the stale
 # respawn indefinitely -- correct for a genuinely slow round, silent forever
 # for a session that is wedged but still registers tmux activity. Once the
@@ -388,6 +408,18 @@ class Decision:
     task_ref: str | None = None
     deferred: bool = False
     reenqueued: bool = False
+
+
+def _is_not_found(exc: CommandError) -> bool:
+    """Whether a failed `gh api` says the resource does not exist.
+
+    `gh` puts the status line in stderr ("gh: Not Found (HTTP 404)"), which is
+    the only signal available without changing proc.run's contract. Matched
+    loosely and biased toward False: reading a real 404 as a transient failure
+    only costs a re-probe next poll, while the reverse pins a wrong answer.
+    """
+    text = (exc.stderr or "").lower()
+    return "404" in text or "not found" in text
 
 
 def session_name(pr: PullRequest, round_: int) -> str:
@@ -895,9 +927,15 @@ class ReviewWatcher:
             log.warning("reap sweep skipped: could not list sessions: %s", exc)
             return 0
 
-        # Drop cached resolutions for sessions that are gone. Names are unique
-        # per spawn (that is what the nonce is for) and a session's PR never
-        # changes, so this is the only invalidation the cache needs.
+        # Drop cached resolutions for sessions that are gone, so the cache
+        # stays bounded by the live session count in a process that polls
+        # forever. That is the ONLY invalidation needed because a bare
+        # `review-pr-<n>` resolves as a function of its number and the repos
+        # allowlist, and the allowlist cannot change under a running process.
+        # (Not because names are unique per spawn -- the nonce belongs to this
+        # daemon's OWN `review-<repo>-pr<n>-r<k>-<nonce>` names, which always
+        # have a ledger row and so never reach this cache at all. The shape
+        # that does reach it carries no nonce and is reusable across months.)
         live_names = {ses.name for ses in sessions}
         self._probe_cache = {
             name: target
@@ -909,7 +947,7 @@ class ReviewWatcher:
         # the round count additionally keys on the task ref, because two spawns
         # of one PR can disagree on it (a round-1 row recorded before the review
         # task existed carries None). None = undecidable this pass.
-        prs: dict[tuple[str, int], PullRequest | None] = {}
+        prs: FetchMemo = {}
         completed_cache: dict[tuple[str, int, str | None], float | None] = {}
         holdouts: dict[str, str] = {}
         reaped: list[str] = []
@@ -992,7 +1030,7 @@ class ReviewWatcher:
         self,
         ses: ManagedSession,
         row: sqlite3.Row | None,
-        prs: dict[tuple[str, int], PullRequest | None],
+        prs: FetchMemo,
         holdouts: dict[str, str],
     ) -> PullRequest | None:
         """The PR a reapable session is about, or None when undecidable.
@@ -1020,8 +1058,12 @@ class ReviewWatcher:
 
         The probe is paid ONCE per session name. Its answer -- the resolved
         (repo, number), or a sticky None for "could not be resolved" -- is
-        cached on the watcher, because a name is unique per spawn and its PR
-        never changes. Without that, a session spared on an open PR (the
+        cached on the watcher, because the resolution is a function of the
+        number and the repos allowlist, and the allowlist cannot change under
+        a running process. (It is NOT because the name is unique per spawn:
+        the nonce that makes it so belongs to ledger-backed daemon names,
+        which return above without touching this cache.) Without that, a
+        session spared on an open PR (the
         common case: a finished round waits idle for the implementer) re-ran
         the whole allowlist sweep on every poll for the life of the PR, which
         at 7 repos and a 30s interval is ~840 REST calls an hour for one
@@ -1031,15 +1073,25 @@ class ReviewWatcher:
         cost above.
         """
         if row is not None:
-            return self._fetch_pr(prs, row["repo"], row["number"])
+            return self._fetched_pr(ses, holdouts, prs, row["repo"], row["number"])
 
         ref = ses.ref
         if ref is None:  # pragma: no cover - list_review_sessions filters these
             return None
 
-        if ses.name not in self._probe_cache:
-            self._probe_cache[ses.name] = self._probe_allowlist(ses, ref, prs)
-        target = self._probe_cache[ses.name]
+        if ses.name in self._probe_cache:
+            target = self._probe_cache[ses.name]
+        else:
+            target, cacheable = self._probe_allowlist(ses, ref, prs)
+            if cacheable:
+                self._probe_cache[ses.name] = target
+            elif target is None:
+                self._hold(
+                    holdouts, ses,
+                    f"a probe fetch for PR #{ref.number} failed — re-probing "
+                    f"next poll rather than pinning what it seemed to say",
+                )
+                return None
         if target is None:
             self._hold(
                 holdouts, ses,
@@ -1050,34 +1102,64 @@ class ReviewWatcher:
         # A memo hit in the common case: the probe that resolved this session
         # already fetched it. On a later poll this is the one fetch that can
         # turn the session reapable, so it is not cacheable.
-        return self._fetch_pr(prs, target[0], target[1])
+        return self._fetched_pr(ses, holdouts, prs, target[0], target[1])
 
     def _probe_allowlist(
         self,
         ses: ManagedSession,
         ref: SessionRef,
-        prs: dict[tuple[str, int], PullRequest | None],
-    ) -> tuple[str, int] | None:
-        """Which watched repo owns this session's PR number, or None.
+        prs: FetchMemo,
+    ) -> tuple[tuple[str, int] | None, bool]:
+        """Which watched repo owns this session's PR number, and may we cache it?
 
         The expensive half of _resolve_pr, called once per session name.
+        Returns (target, cacheable); `target` is None when the number does not
+        resolve to exactly one watched repo.
+
+        `cacheable` is False when ANY candidate fetch failed to answer, and
+        that flag is the whole point of the error/404 distinction: the caller
+        pins this conclusion for the session's lifetime, so a conclusion drawn
+        while `gh` was blipping would be pinned too. A blip on the true owner
+        leaves exactly one apparent hit -- a confident, wrong resolution that
+        can get somebody else's live session killed. Before the cache existed
+        the next poll simply re-probed and self-healed; declining to cache an
+        error-tainted pass is how that self-healing survives.
+
+        It gates the NEGATIVE as well, not just the positive: a pass in which
+        the true owner blipped and nothing answered would otherwise pin a
+        sticky "unresolvable" for the session's lifetime on equally bad
+        evidence -- the failure is quieter (a session spared forever rather
+        than killed wrongly) but it is the same mistake.
         """
         candidates = self._name_candidates(ref)
         if not candidates:
-            return None
+            # Nothing to probe: stable until the allowlist itself changes,
+            # which no poll can do to a running process.
+            return None, True
         hits = []
+        errored = False
         for repo_slug in candidates:
             # Quiet: probing a repo that simply has no PR #n is the expected
             # outcome for all but one candidate, not a failure worth a warning.
-            if self._fetch_pr(prs, repo_slug, ref.number, quiet=True) is not None:
+            found = self._fetch_pr(prs, repo_slug, ref.number, quiet=True)
+            if isinstance(found, PullRequest):
                 hits.append(repo_slug)
+            elif isinstance(found, _FetchFailed):
+                errored = True
+        if errored:
+            log.debug(
+                "reap sweep: a probe fetch for PR #%d (%s) failed — not caching "
+                "what this pass seemed to resolve",
+                ref.number, ses.name,
+            )
+            return None, False
         if len(hits) != 1:
             log.debug(
                 "reap sweep: PR #%d of %s resolves to %d watched repo(s)",
                 ref.number, ses.name, len(hits),
             )
-            return None
-        return (hits[0], ref.number)
+            return None, True
+        return (hits[0], ref.number), True
 
     def _name_candidates(self, ref: SessionRef) -> list[str]:
         """The watched repos a session name could be about.
@@ -1185,20 +1267,27 @@ class ReviewWatcher:
 
     def _fetch_pr(
         self,
-        prs: dict[tuple[str, int], PullRequest | None],
+        prs: FetchMemo,
         repo_slug: str,
         number: int,
         *,
         quiet: bool = False,
-    ) -> PullRequest | None:
+    ) -> PullRequest | None | _FetchFailed:
         """One memoized PR fetch for the sweep, per distinct (repo, number).
 
-        None = the PR could not be fetched -- it does not exist in that repo,
-        or the call failed. Either way every session resolving through it is
-        spared this pass and looked at again next poll. `quiet` demotes the
-        log to debug for the allowlist probe, where a miss is the expected
-        answer for all but one candidate. RateLimited propagates so
-        run_forever backs off instead of hammering the API once per session.
+        Three answers, and the third is why this is not simply
+        `PullRequest | None`: the PR (a definite yes), None (a definite NO --
+        GitHub said 404, that repo has no such PR), or FETCH_FAILED (the call
+        did not answer). Collapsing the last two, as this did, makes a
+        transient `gh` blip indistinguishable from "no such PR" -- harmless
+        while every decision was retried next poll, but `_probe_allowlist`
+        now CACHES its conclusion, so a blip would be pinned for the session's
+        lifetime. See _probe_allowlist for what it does with the difference.
+
+        `quiet` demotes the log to debug for the allowlist probe, where a miss
+        is the expected answer for all but one candidate. RateLimited
+        propagates so run_forever backs off instead of hammering the API once
+        per session.
         """
         key = (repo_slug, number)
         if key in prs:
@@ -1209,12 +1298,43 @@ class ReviewWatcher:
         except RateLimited:
             raise
         except CommandError as exc:
+            missing = _is_not_found(exc)
             log.log(
-                logging.DEBUG if quiet else logging.WARNING,
-                "reap sweep: could not fetch %s#%d: %s", repo_slug, number, exc,
+                logging.DEBUG if quiet or missing else logging.WARNING,
+                "reap sweep: %s %s#%d: %s",
+                "no such PR" if missing else "could not fetch",
+                repo_slug, number, exc,
             )
-            prs[key] = None
+            prs[key] = None if missing else FETCH_FAILED
         return prs[key]
+
+    def _fetched_pr(
+        self,
+        ses: ManagedSession,
+        holdouts: dict[str, str],
+        prs: FetchMemo,
+        repo_slug: str,
+        number: int,
+    ) -> PullRequest | None:
+        """`_fetch_pr` narrowed to "the PR, or spare the session and say why".
+
+        Both fetch-returning paths out of _resolve_pr go through here, because
+        both used to `return self._fetch_pr(...)` straight through: a None fell
+        to `continue` in the sweep without recording anything, so the cap alarm
+        printed `(no reason recorded)` for it -- on exactly the path (a `gh`
+        outage sparing several sessions at once) where the alarm most needs to
+        explain itself.
+        """
+        found = self._fetch_pr(prs, repo_slug, number)
+        if isinstance(found, PullRequest):
+            return found
+        self._hold(
+            holdouts, ses,
+            f"{repo_slug}#{number} could not be fetched — retrying next poll"
+            if isinstance(found, _FetchFailed)
+            else f"{repo_slug}#{number} no longer exists",
+        )
+        return None
 
     def _completed_rounds(self, pr: PullRequest, task_ref: str | None) -> float | None:
         """How many rounds of this OPEN PR are over, judged from task/GitHub.
