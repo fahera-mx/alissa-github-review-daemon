@@ -1750,7 +1750,8 @@ def test_cap_check_pages_when_the_sweep_cannot_keep_up(config, caplog):
     pages = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(pages) == 1
     assert "CAP EXCEEDED" in pages[0].message
-    assert "review-pr-1, review-pr-2, review-pr-3" in pages[0].getMessage()
+    page = pages[0].getMessage()
+    assert all(f"review-pr-{n} (" in page for n in (1, 2, 3))
 
 
 def test_cap_check_counts_what_the_sweep_left_behind(config, caplog):
@@ -1761,12 +1762,143 @@ def test_cap_check_counts_what_the_sweep_left_behind(config, caplog):
     w, _, al = watcher(cfg, merged, [])
     for number in (1, 2, 3):
         _live(al, f"review-pr-{number}")
-    _resolve_prs(al and w.github, {(SLUG, n): merged for n in (1, 2, 3)})
+    _resolve_prs(w.github, {(SLUG, n): merged for n in (1, 2, 3)})
 
     with caplog.at_level(logging.ERROR):
         assert w.sweep_sessions() == 3
 
     assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+
+
+# -- round 2: the probe must not be paid per poll ---------------------------
+
+
+def _sweep_n(w, times):
+    for _ in range(times):
+        w.sweep_sessions()
+    return w.github.pr_fetches
+
+
+def test_the_allowlist_probe_is_paid_once_per_session_not_once_per_poll(config):
+    """A bare-name session on an OPEN PR is spared by design and stays live for
+    the life of the PR, so re-probing the whole allowlist each poll turned a
+    documented cost into a budget problem (7 repos x 120 polls/h). The probe's
+    answer is cached per session name; only the PR-state fetch, which is what
+    can turn the session reapable, repeats."""
+    open_pr = make_pr()
+    repos = [f"acme/r{n}" for n in range(5)] + [SLUG]
+    w, gh, al = watcher(_watched(config, *repos), open_pr, [review()])
+    _resolve_prs(gh, {(SLUG, 7): open_pr})  # the other five 404 on #7
+    _live(al, "review-pr-7")
+
+    assert _sweep_n(w, 3) == 6 + 1 + 1, "6 probes once, then one state fetch/poll"
+    assert al.killed == []
+
+
+def test_an_unresolvable_name_is_probed_once_and_then_costs_nothing(config):
+    """The sticky negative: two watched repos both have PR #7, so the session
+    is spared forever. Re-probing it forever is exactly the cost that made the
+    per-poll probe untenable."""
+    merged = make_pr(state="closed", merged=True)
+    other = dataclasses.replace(merged, repo="gadgets")
+    w, gh, al = watcher(_watched(config, SLUG, "acme/gadgets"), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged, ("acme/gadgets", 7): other})
+    _live(al, "review-pr-7")
+
+    assert _sweep_n(w, 3) == 2, "both repos probed once; nothing after that"
+    assert al.killed == []
+
+
+def test_the_probe_cache_drops_sessions_that_left_the_live_list(config):
+    """Names are unique per spawn and a session's PR never changes, so the only
+    invalidation needed is forgetting names that are gone — otherwise the cache
+    grows without bound in a daemon that polls forever."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged, (SLUG, 9): merged})
+    _live(al, "review-pr-7")
+    w.sweep_sessions()
+    assert "review-pr-7" in w._probe_cache
+
+    al.sessions = []
+    _live(al, "review-pr-9")
+    w.sweep_sessions()
+
+    assert list(w._probe_cache) == ["review-pr-9"]
+
+
+# -- round 2: the cap alarm explains itself, once per episode ---------------
+
+
+def test_the_cap_page_carries_why_each_survivor_was_spared(config, caplog):
+    """The per-session holdout lines are debug and the container runs at INFO,
+    so an alarm without the reasons inline is an alarm nobody can act on."""
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_session_cap=1)
+    open_pr = make_pr()
+    w, gh, al = watcher(cfg, open_pr, [review()])
+    _resolve_prs(gh, {(SLUG, 7): open_pr})
+    _live(al, "review-pr-7")  # idle, past grace, open PR, no ledger row
+    _live(al, "review-pr-8", status="busy")
+
+    with caplog.at_level(logging.ERROR):
+        w.sweep_sessions()
+
+    page = next(r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+    assert "review-pr-7 (acme/widgets#7 is open and there is no ledger row" in page
+    assert "review-pr-8 (busy — never reaped)" in page
+
+
+def test_the_cap_page_fires_once_per_episode_not_once_per_poll(config, caplog):
+    """Every 30s in the deployed config; 120 identical pages an hour is not a
+    page. It must re-fire when the survivor set changes, and again after the
+    count has fallen back inside the cap."""
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_session_cap=1)
+    w, _, al = watcher(cfg, make_pr(), [review()])
+    _live(al, "review-pr-7")
+    _live(al, "review-pr-8")
+
+    with caplog.at_level(logging.ERROR):
+        w.sweep_sessions()
+        w.sweep_sessions()  # same survivors — silent
+        assert len(caplog.records) == 1
+
+        _live(al, "review-pr-9")  # the set changed — page again
+        w.sweep_sessions()
+        assert len(caplog.records) == 2
+
+        al.sessions = [al.sessions[0]]  # back inside the cap — clears
+        w.sweep_sessions()
+        assert len(caplog.records) == 2
+
+        al.sessions = [ManagedSession(name=f"review-pr-{n}", status="idle") for n in (7, 8)]
+        w.sweep_sessions()  # a NEW episode of the same set pages again
+        assert len(caplog.records) == 3
+
+
+# -- round 2: reap_grace_seconds is coupled to the stale window -------------
+
+
+def test_a_grace_at_or_above_the_stale_window_is_rejected(tmp_path):
+    """The same knob gates the stale-round liveness probe. At or above
+    STALE_ROUND_SECONDS its 'idle-finished -> dead -> respawn' branch is
+    unreachable: every stale round defers forever and only the operator ping
+    fires. Loud at config time instead of silently wedged at runtime."""
+    with pytest.raises(ValueError, match="stale-round window"):
+        Config.build(tmp_path, {"reap_grace_seconds": STALE_ROUND_SECONDS})
+    with pytest.raises(ValueError, match="stale-round window"):
+        Config.build(tmp_path, {"reap_grace_seconds": 4 * 60 * 60})
+
+    ok = Config.build(tmp_path, {"reap_grace_seconds": STALE_ROUND_SECONDS - 1})
+    assert ok.reap_grace_seconds == STALE_ROUND_SECONDS - 1
+
+
+def test_stale_round_constant_is_still_importable_from_loop():
+    """It moved to `config` so the validation above can see it; `loop` re-exports
+    it because webui and the tests import it from there."""
+    from alissa.tools.github.revloop import config as config_mod
+    from alissa.tools.github.revloop import loop as loop_mod
+
+    assert loop_mod.STALE_ROUND_SECONDS is config_mod.STALE_ROUND_SECONDS
 
 
 # -- AC2: reaping must not disturb round accounting or cap re-entry ---------

@@ -54,6 +54,19 @@ CONFIG_KEYS = (
 
 MIN_POLL_INTERVAL = 10  # the search API allows 30 req/min
 
+# A reviewer session that has not submitted after this long is presumed dead
+# (skill failure mode: "reviewer session stalls"). The round is re-enqueued --
+# but only with a second signal agreeing: the timer alone cannot tell a dead
+# session from a slow one, and a timer-only re-enqueue double-spends the round
+# (two sessions review it, both submit -- observed live twice: double round-2
+# approves on devloop's PR #11, double approves on this repo's PR #19). See
+# loop._defer_stale_round for the liveness signal.
+#
+# It lives here rather than in `loop` (which re-exports it, so every import
+# site is unchanged) because `reap_grace_seconds` is validated against it, and
+# config cannot import loop without a cycle.
+STALE_ROUND_SECONDS = 90 * 60
+
 # How long a reviewer session must have been idle AND quiet (no tmux activity)
 # before the sweep may reap it, and before the stale-round liveness probe
 # reads it as finished rather than working.
@@ -213,6 +226,20 @@ class Config:
         grace = int(raw.get("reap_grace_seconds", cls.reap_grace_seconds))
         if grace < 0:
             raise ValueError(f"reap_grace_seconds must be >= 0, got {grace}")
+        if grace >= STALE_ROUND_SECONDS:
+            # The same number answers the stale-round liveness probe, whose
+            # own window is STALE_ROUND_SECONDS. At or above it the
+            # "idle-finished -> dead -> respawn" branch is unreachable: a
+            # session can never have been quiet longer than the grace by the
+            # time its round goes stale, so every stale round defers forever
+            # and only the operator ping ever fires. Loud here rather than
+            # silently wedged there.
+            raise ValueError(
+                f"reap_grace_seconds must be well under the {STALE_ROUND_SECONDS}s "
+                f"stale-round window (it also gates the stale-round liveness "
+                f"probe, whose respawn branch it would make unreachable), "
+                f"got {grace}"
+            )
 
         session_cap = int(raw.get("reap_session_cap", cls.reap_session_cap))
         if session_cap < 1:

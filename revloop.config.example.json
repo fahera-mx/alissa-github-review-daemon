@@ -24,7 +24,7 @@
   "_on_missing_hub": "'skip' (default) or 'add' to run `alissa code workspace add`. 'add' requires a non-empty repos allowlist.",
   "on_missing_hub": "skip",
 
-  "_reap_grace_seconds": "How long a reviewer session must be idle AND quiet (no tmux activity) before the reap sweep kills it, and before a stale round reads it as dead rather than working. Long enough that a just-merged PR's reviewer can finish its in-session close-out.",
+  "_reap_grace_seconds": "How long a reviewer session must be idle AND quiet (no tmux activity) before the reap sweep kills it, and before a stale round reads it as dead rather than working. Long enough that a just-merged PR's reviewer can finish its in-session close-out, and REJECTED at or above the 90-minute stale-round window (it also gates the stale-round liveness probe, whose respawn branch it would otherwise make unreachable).",
   "reap_grace_seconds": 1800,
 
   "_reap_session_cap": "Alarm threshold, not a capacity limit: more live reviewer sessions than this after a sweep and the daemon logs page-worthy. A healthy loop runs a couple of concurrent rounds.",

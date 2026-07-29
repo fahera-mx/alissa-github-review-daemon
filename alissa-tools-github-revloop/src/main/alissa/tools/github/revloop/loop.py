@@ -28,21 +28,17 @@ from .alissa import (
     Task,
     session_repo_slug,
 )
-from .config import HUB_ADD, ON_MISSING_SKIP, Config
+from .config import (
+    HUB_ADD,
+    ON_MISSING_SKIP,
+    STALE_ROUND_SECONDS,
+    Config,
+)
 from .ghclient import GitHub, IssueComment, PullRequest, RateLimited, Review
 from .proc import CommandError
 from .state import State
 
 log = logging.getLogger(__name__)
-
-# A reviewer session that has not submitted after this long is presumed dead
-# (skill failure mode: "reviewer session stalls"). The round is re-enqueued --
-# but only with a second signal agreeing: the timer alone cannot tell a dead
-# session from a slow one, and a timer-only re-enqueue double-spends the round
-# (two sessions review it, both submit -- observed live twice: double round-2
-# approves on devloop's PR #11, double approves on this repo's PR #19). See
-# _defer_stale_round for the liveness signal.
-STALE_ROUND_SECONDS = 90 * 60
 
 # The floor under the liveness deferral: a live session defers the stale
 # respawn indefinitely -- correct for a genuinely slow round, silent forever
@@ -429,6 +425,14 @@ class ReviewWatcher:
         # (repo, number, comment id) of every re-entry directive already
         # refused in this process -- see _log_ignored_ack.
         self._ignored_acks: set[tuple[str, int, int]] = set()
+        # Reviewer session name -> the (repo slug, number) its NAME resolved
+        # to, or None for "could not be resolved". Process-lifetime, pruned
+        # against the live list each sweep; see _resolve_pr for why the probe
+        # behind it must not be paid per poll.
+        self._probe_cache: dict[str, tuple[str, int] | None] = {}
+        # The surviving-session set the cap alarm last paged on, so a standing
+        # over-cap condition pages once per episode -- see _check_session_cap.
+        self._paged_cap: frozenset[str] | None = None
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -869,14 +873,21 @@ class ReviewWatcher:
         deliberately instead of find_review_task: that would fetch the actor's
         ENTIRE task list per PR, and its open-status filter would drop a
         human-validated review task back onto the racier GitHub-count
-        fallback. A ledger-less session with a bare name costs one fetch per
-        watched repo (see _resolve_pr), which is why busy and in-grace
-        sessions are filtered out BEFORE anything is fetched. Only individual
+        fallback. A ledger-less session costs its allowlist probe ONCE per
+        session lifetime, not once per poll -- `_probe_cache` remembers the
+        answer, including the negative one -- after which it is the same one
+        fetch per distinct PR as everything else. Busy and in-grace sessions
+        are filtered out BEFORE anything is fetched at all. Only individual
         sessions are ever killed (`alissa tmux kill <name>`) -- never the
         server, which in this shared container would take every other lane's
         workers with it. Best-effort throughout: an undecidable session is
         spared, logged at debug, and looked at again next poll; only genuine
         failures (a fetch that blew up, a kill that raised) are logged louder.
+
+        Every spare records WHY against the session name. Those reasons are
+        debug-level (they repeat every poll), but the cap alarm interpolates
+        them, so the one line an operator does see in a container running at
+        INFO carries the explanation with it.
         """
         try:
             sessions = self.alissa.list_review_sessions()
@@ -884,12 +895,23 @@ class ReviewWatcher:
             log.warning("reap sweep skipped: could not list sessions: %s", exc)
             return 0
 
+        # Drop cached resolutions for sessions that are gone. Names are unique
+        # per spawn (that is what the nonce is for) and a session's PR never
+        # changes, so this is the only invalidation the cache needs.
+        live_names = {ses.name for ses in sessions}
+        self._probe_cache = {
+            name: target
+            for name, target in self._probe_cache.items()
+            if name in live_names
+        }
+
         # Per-sweep memos. The PR fetch is keyed per distinct (repo, number);
         # the round count additionally keys on the task ref, because two spawns
         # of one PR can disagree on it (a round-1 row recorded before the review
         # task existed carries None). None = undecidable this pass.
         prs: dict[tuple[str, int], PullRequest | None] = {}
         completed_cache: dict[tuple[str, int, str | None], float | None] = {}
+        holdouts: dict[str, str] = {}
         reaped: list[str] = []
 
         for ses in sessions:
@@ -901,24 +923,25 @@ class ReviewWatcher:
                 # without resolving the PR: the state cannot change the
                 # outcome, and paying a fetch per poll for every working
                 # reviewer just to log it is not worth the API budget.
-                log.debug("reap sweep: %s is busy — never reaped", ses.name)
+                self._hold(holdouts, ses, "busy — never reaped")
                 continue
             if idle_for < self.config.reap_grace_seconds:
                 # Idle but recently active: likely mid-close-out (the review
                 # is submitted before the envelope and task move land). Wait
                 # out the grace period.
-                log.debug(
-                    "reap sweep: %s idle for %d min, grace is %d min — holding",
-                    ses.name, idle_for // 60, self.config.reap_grace_seconds // 60,
+                self._hold(
+                    holdouts, ses,
+                    f"idle {idle_for // 60:.0f} min, inside the "
+                    f"{self.config.reap_grace_seconds // 60} min grace",
                 )
                 continue
 
             row = self.state.find_spawn_by_session(ses.name)
-            pr = self._resolve_pr(ses, row, prs)
+            pr = self._resolve_pr(ses, row, prs, holdouts)
             if pr is None:
-                continue  # undecidable -- already logged, retried next poll
+                continue  # undecidable -- already recorded, retried next poll
 
-            reason = self._reap_reason(pr, ses, row, completed_cache)
+            reason = self._reap_reason(pr, ses, row, completed_cache, holdouts)
             if reason is None:
                 continue
 
@@ -936,11 +959,13 @@ class ReviewWatcher:
             )
             if self.config.dry_run:
                 log.info("[dry-run] would reap reviewer session %s (%s)", ses.name, evidence)
+                holdouts[ses.name] = f"dry-run: would have reaped ({evidence})"
                 continue
             try:
                 self.alissa.kill_session(ses.name)
             except Exception:  # pragma: no cover - defence in depth
                 log.exception("failed to reap session %s", ses.name)
+                holdouts[ses.name] = "the kill raised — see the traceback above"
                 continue
             # Bookkeeping only -- deliberately never consulted before a kill.
             # The live list is the authority; gating on the reaps table would
@@ -949,29 +974,61 @@ class ReviewWatcher:
             reaped.append(ses.name)
             log.info("reaped reviewer session %s (%s)", ses.name, evidence)
 
-        self._check_session_cap(sessions, reaped)
+        self._check_session_cap(sessions, reaped, holdouts)
         return len(reaped)
+
+    def _hold(self, holdouts: dict[str, str], ses: ManagedSession, why: str) -> None:
+        """Record (and log at debug) why a live session was not reaped.
+
+        Debug because it repeats every poll for the whole life of a spared
+        session -- and the deployed container runs at INFO, so these lines are
+        invisible there by design. They are not the operator's channel: the
+        cap alarm is, and it interpolates what is recorded here.
+        """
+        holdouts[ses.name] = why
+        log.debug("reap sweep: %s spared — %s", ses.name, why)
 
     def _resolve_pr(
         self,
         ses: ManagedSession,
         row: sqlite3.Row | None,
         prs: dict[tuple[str, int], PullRequest | None],
+        holdouts: dict[str, str],
     ) -> PullRequest | None:
         """The PR a reapable session is about, or None when undecidable.
 
         A ledger row names the PR outright. Without one the session name is
         the only evidence, so the number it carries is resolved against the
-        `repos` allowlist -- which is also the ownership boundary: the sweep
-        only ever reaps a session it can tie to a repo this daemon is
-        responsible for.
+        `repos` allowlist. A name carrying a repo component picks its
+        allowlist entry directly; a bare `review-pr-<n>` (the skill's shape)
+        names no repo, so every watched repo is probed and EXACTLY one must
+        have that PR. An empty allowlist -- "watch every repo that asks" --
+        can never resolve a bare name at all; nothing bounds the search.
 
-        A name carrying a repo component picks its allowlist entry directly.
-        A bare `review-pr-<n>` (the skill's shape) names no repo, so every
-        watched repo is probed and EXACTLY one must have that PR: zero or
-        several hits is a guess, and a guess here kills somebody's session.
-        An empty allowlist -- "watch every repo that asks" -- can never
-        resolve a bare name at all; nothing bounds the search.
+        What that does and does NOT establish, precisely, because the
+        difference decides whose session can be killed: the allowlist BOUNDS
+        THE SEARCH, it does not prove ownership. A bare number carries no
+        repo, so a session reviewing a PR in an UNWATCHED repo is reaped if
+        exactly one watched repo happens to have a terminal PR of the same
+        number. Requiring a unique hit bounds the blast radius rather than
+        removing it. The converse costs reaps instead: once two watched repos
+        both have a PR #n -- inevitable as newer repos' numbering catches up
+        with older ones -- every bare `review-pr-<n>` in the overlap resolves
+        to two hits and is spared forever. Both are known v1 limits, recorded
+        in the README; the durable fix is a repo in the name (skill-side) or a
+        ledger row for hand-spawned sessions.
+
+        The probe is paid ONCE per session name. Its answer -- the resolved
+        (repo, number), or a sticky None for "could not be resolved" -- is
+        cached on the watcher, because a name is unique per spawn and its PR
+        never changes. Without that, a session spared on an open PR (the
+        common case: a finished round waits idle for the implementer) re-ran
+        the whole allowlist sweep on every poll for the life of the PR, which
+        at 7 repos and a 30s interval is ~840 REST calls an hour for one
+        session. The sticky None never re-probes within a process, so an
+        ambiguity that later clears is not noticed until a restart -- the safe
+        direction (spare, never guess), and the alternative is exactly the
+        cost above.
         """
         if row is not None:
             return self._fetch_pr(prs, row["repo"], row["number"])
@@ -980,30 +1037,47 @@ class ReviewWatcher:
         if ref is None:  # pragma: no cover - list_review_sessions filters these
             return None
 
-        candidates = self._name_candidates(ref)
-        if not candidates:
-            log.debug(
-                "reap sweep: %s has no ledger row and no watched repo matches "
-                "its name — sparing it",
-                ses.name,
+        if ses.name not in self._probe_cache:
+            self._probe_cache[ses.name] = self._probe_allowlist(ses, ref, prs)
+        target = self._probe_cache[ses.name]
+        if target is None:
+            self._hold(
+                holdouts, ses,
+                f"no ledger row and PR #{ref.number} does not resolve to exactly "
+                f"one watched repo — sparing it rather than guessing",
             )
             return None
+        # A memo hit in the common case: the probe that resolved this session
+        # already fetched it. On a later poll this is the one fetch that can
+        # turn the session reapable, so it is not cacheable.
+        return self._fetch_pr(prs, target[0], target[1])
 
+    def _probe_allowlist(
+        self,
+        ses: ManagedSession,
+        ref: SessionRef,
+        prs: dict[tuple[str, int], PullRequest | None],
+    ) -> tuple[str, int] | None:
+        """Which watched repo owns this session's PR number, or None.
+
+        The expensive half of _resolve_pr, called once per session name.
+        """
+        candidates = self._name_candidates(ref)
+        if not candidates:
+            return None
         hits = []
         for repo_slug in candidates:
             # Quiet: probing a repo that simply has no PR #n is the expected
             # outcome for all but one candidate, not a failure worth a warning.
-            found = self._fetch_pr(prs, repo_slug, ref.number, quiet=True)
-            if found is not None:
-                hits.append(found)
+            if self._fetch_pr(prs, repo_slug, ref.number, quiet=True) is not None:
+                hits.append(repo_slug)
         if len(hits) != 1:
             log.debug(
-                "reap sweep: %s has no ledger row and PR #%d resolves to %d "
-                "watched repo(s) — sparing it rather than guessing",
-                ses.name, ref.number, len(hits),
+                "reap sweep: PR #%d of %s resolves to %d watched repo(s)",
+                ref.number, ses.name, len(hits),
             )
             return None
-        return hits[0]
+        return (hits[0], ref.number)
 
     def _name_candidates(self, ref: SessionRef) -> list[str]:
         """The watched repos a session name could be about.
@@ -1027,8 +1101,9 @@ class ReviewWatcher:
         ses: ManagedSession,
         row: sqlite3.Row | None,
         completed_cache: dict[tuple[str, int, str | None], float | None],
+        holdouts: dict[str, str],
     ) -> str | None:
-        """Why this session may be reaped, or None to spare it (logged)."""
+        """Why this session may be reaped, or None to spare it (recorded)."""
         if pr.is_terminal:
             return "the PR is terminal, so every round on it is over"
 
@@ -1037,10 +1112,10 @@ class ReviewWatcher:
             # `-r<k>` cannot tell a superseded round from an in-flight one, and
             # an operator re-entry may still want the earlier round's context;
             # superseded-round reaping is a v2 with its own analysis (#46).
-            log.debug(
-                "reap sweep: %s is idle on open %s and has no ledger row — "
-                "v1 reaps ledger-less sessions on terminal PRs only",
-                ses.name, pr.slug,
+            self._hold(
+                holdouts, ses,
+                f"{pr.slug} is open and there is no ledger row — v1 reaps "
+                f"ledger-less sessions on terminal PRs only",
             )
             return None
 
@@ -1049,15 +1124,19 @@ class ReviewWatcher:
             completed_cache[key] = self._completed_rounds(pr, row["task_ref"])
         completed = completed_cache[key]
         if completed is None or row["round"] > completed:
-            log.debug(
-                "reap sweep: round %d of %s is not finished (%s completed) — holding %s",
-                row["round"], pr.slug, completed, ses.name,
+            self._hold(
+                holdouts, ses,
+                f"round {row['round']} of {pr.slug} is not finished "
+                f"({completed} completed)",
             )
             return None
         return f"round {row['round']} of an open PR is done"
 
     def _check_session_cap(
-        self, sessions: list[ManagedSession], reaped: list[str]
+        self,
+        sessions: list[ManagedSession],
+        reaped: list[str],
+        holdouts: dict[str, str],
     ) -> None:
         """Page-worthy log when the sweep is not keeping up.
 
@@ -1065,18 +1144,44 @@ class ReviewWatcher:
         minus what it killed, so the number is "sessions this pass could not
         free". Every idle agent session holds hundreds of MB forever and the
         worker container is shared, so a count that stays above the cap is the
-        2026-07-28 incident happening again -- and the sweep's own holdout
-        lines (debug) say which guard spared each one.
+        2026-07-28 incident happening again.
+
+        The page carries each survivor's spare reason inline, because the
+        per-session holdout lines are debug and the deployed container runs at
+        INFO: an alarm whose explanation is invisible is an alarm an operator
+        cannot act on.
+
+        Deduped in-process on the set of surviving names: the sweep runs every
+        poll (every 30s in the deployed config), and 120 identical pages an
+        hour is not a page. It re-fires when the set changes, and clears once
+        the count falls back inside the cap so the next episode pages again.
+        Deliberately NOT the `pings` ledger the stalled-round escalation uses:
+        that table is keyed (repo, number, kind) and this alarm belongs to no
+        PR, so persisting it would mean a sentinel row every console reader
+        then has to filter around -- and a standing over-cap condition SHOULD
+        announce itself once to a freshly restarted daemon, which a persisted
+        ping would suppress forever.
         """
         killed = set(reaped)
         remaining = sorted(s.name for s in sessions if s.name not in killed)
-        if len(remaining) > self.config.reap_session_cap:
-            log.error(
-                "REVIEWER SESSION CAP EXCEEDED: %d live reviewer sessions after "
-                "the sweep (cap %d) — each holds hundreds of MB in a shared "
-                "container; live: %s",
-                len(remaining), self.config.reap_session_cap, ", ".join(remaining),
-            )
+        if len(remaining) <= self.config.reap_session_cap:
+            self._paged_cap = None
+            return
+        episode = frozenset(remaining)
+        if episode == self._paged_cap:
+            return
+        self._paged_cap = episode
+        log.error(
+            "REVIEWER SESSION CAP EXCEEDED: %d live reviewer sessions after the "
+            "sweep (cap %d) — each holds hundreds of MB in a shared container. "
+            "Survivors and why the sweep spared each: %s",
+            len(remaining),
+            self.config.reap_session_cap,
+            "; ".join(
+                f"{name} ({holdouts.get(name, 'no reason recorded')})"
+                for name in remaining
+            ),
+        )
 
     def _fetch_pr(
         self,
