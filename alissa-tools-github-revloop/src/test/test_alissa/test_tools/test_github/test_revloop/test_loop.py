@@ -40,6 +40,7 @@ from alissa.tools.github.revloop.ghclient import (
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     MAX_REENTRY_ROUNDS,
+    PROBE_TAINT_ALARM,
     REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
@@ -1959,6 +1960,117 @@ def test_a_definite_404_and_a_failed_call_are_distinguishable():
     assert _is_not_found(CommandError(["gh"], 1, "HTTP 404"))
     assert not _is_not_found(CommandError(["gh"], 1, "HTTP 502: Bad Gateway"))
     assert not _is_not_found(CommandError(["gh"], 1, ""))
+
+
+# -- round 4: the error gate must be bounded and visible --------------------
+
+
+def test_the_probe_stops_at_the_first_candidate_that_will_not_answer(config):
+    """The pass is discarded the moment a candidate fails, so every further
+    fetch is spent on a conclusion already thrown away — which is how a
+    persistently failing candidate re-ran the WHOLE allowlist every poll."""
+    merged = make_pr(state="closed", merged=True)
+    repos = ["acme/a", "acme/b", "acme/c", SLUG]
+    w, gh, al = watcher(_watched(config, *repos), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged}, failing={"acme/b"})
+    _live(al, "review-pr-7")
+
+    w.sweep_sessions()
+
+    assert gh.pr_fetches == 2, "acme/a answered, acme/b failed, then stop"
+    assert al.killed == []
+
+
+def test_a_probe_that_never_answers_pages_once_and_re_arms_on_recovery(config, caplog):
+    """Refusing to cache a tainted pass is unbounded on its own: a repo that
+    HANGS (proc.run maps a 60s gh timeout to CommandError) keeps the session
+    re-probing every poll, silently, since the probe is quiet and the taint log
+    is debug. The floor makes it an operator problem."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    blip = {SLUG}
+    _resolve_prs(gh, {(SLUG, 7): merged}, failing=blip)
+    _live(al, "review-pr-7")
+
+    with caplog.at_level(logging.ERROR):
+        for _ in range(PROBE_TAINT_ALARM - 1):
+            w.sweep_sessions()
+        assert caplog.records == [], "a blip must not page"
+
+        w.sweep_sessions()
+        pages = [r for r in caplog.records if "PROBE STUCK" in r.message]
+        assert len(pages) == 1
+        assert "review-pr-7" in pages[0].getMessage()
+
+        w.sweep_sessions()  # still stuck — once per episode, not once per poll
+        assert len([r for r in caplog.records if "PROBE STUCK" in r.message]) == 1
+
+        blip.clear()
+        w.sweep_sessions()
+        assert al.killed == ["review-pr-7"]
+        assert w._probe_taint == {}, "a pass that answered clears the counter"
+
+
+def test_the_taint_counter_is_pruned_with_the_live_list(config):
+    """Bounded like _probe_cache — a daemon polls forever."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    _resolve_prs(gh, {}, failing={SLUG})
+    _live(al, "review-pr-7")
+    w.sweep_sessions()
+    assert "review-pr-7" in w._probe_taint
+
+    al.sessions = []
+    w.sweep_sessions()
+
+    assert w._probe_taint == {}
+
+
+def test_the_taint_alarm_floor_is_pinned():
+    """A constant, not a config key — changing it changes when an operator is
+    paged about a stuck candidate repo."""
+    assert PROBE_TAINT_ALARM == 3
+
+
+def test_probe_allowlist_cannot_represent_a_target_it_does_not_trust(config):
+    """`(target, cacheable)` could express `(something, False)`, which has no
+    meaning; the sentinel makes the impossible state unrepresentable and lets
+    the caller narrow instead of guarding an unreachable branch."""
+    from alissa.tools.github.revloop.loop import FETCH_FAILED
+
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG, "acme/gadgets"), merged, [])
+    ses = ManagedSession(name="review-pr-7", status="idle")
+    ref = parse_session_name("review-pr-7")
+
+    _resolve_prs(gh, {(SLUG, 7): merged})
+    assert w._probe_allowlist(ses, ref, {}) == (SLUG, 7)
+
+    other = dataclasses.replace(merged, repo="gadgets")
+    _resolve_prs(gh, {(SLUG, 7): merged, ("acme/gadgets", 7): other})
+    assert w._probe_allowlist(ses, ref, {}) is None  # definitely ambiguous
+
+    _resolve_prs(gh, {(SLUG, 7): merged}, failing={SLUG})
+    assert w._probe_allowlist(ses, ref, {}) is FETCH_FAILED
+
+
+def test_a_ledger_backed_404_stays_visible_at_the_containers_log_level(config, caplog):
+    """A 404 while PROBING is the expected answer for all but one candidate. A
+    404 on a PR this daemon recorded in its own ledger means the repo was
+    deleted, transferred or renamed under it — an operator fact, and the
+    container runs at INFO."""
+    pr = make_pr()
+    w, gh, al = watcher(config, pr, [review()])
+    s1 = _record(w, pr, 1)
+    _live(al, s1)
+    _resolve_prs(gh, {})  # every fetch 404s
+
+    with caplog.at_level(logging.DEBUG):
+        w.sweep_sessions()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("no such PR" in r.getMessage() for r in warnings)
+    assert al.killed == []
 
 
 # -- round 2: the cap alarm explains itself, once per episode ---------------

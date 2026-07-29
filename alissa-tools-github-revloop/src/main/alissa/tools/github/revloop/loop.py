@@ -57,6 +57,13 @@ class _FetchFailed:
 
 FETCH_FAILED = _FetchFailed()
 
+# How many consecutive un-answerable probes of ONE session make a stuck
+# candidate repo an operator problem rather than a blip. A constant, not a
+# config key: the point is to catch a failure that is not transient, and three
+# polls is already well past any blip at any sane poll interval. Pinned by a
+# test. See ReviewWatcher._note_probe_taint.
+PROBE_TAINT_ALARM = 3
+
 # The reap sweep's per-pass PR memo, keyed (repo slug, number).
 FetchMemo = dict[tuple[str, int], "PullRequest | None | _FetchFailed"]
 
@@ -465,6 +472,10 @@ class ReviewWatcher:
         # The surviving-session set the cap alarm last paged on, so a standing
         # over-cap condition pages once per episode -- see _check_session_cap.
         self._paged_cap: frozenset[str] | None = None
+        # Session name -> consecutive passes whose probe could not be answered.
+        # Bounded like _probe_cache (pruned against the live list); see
+        # _note_probe_taint for what it guards against.
+        self._probe_taint: dict[str, int] = {}
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -908,7 +919,10 @@ class ReviewWatcher:
         fallback. A ledger-less session costs its allowlist probe ONCE per
         session lifetime, not once per poll -- `_probe_cache` remembers the
         answer, including the negative one -- after which it is the same one
-        fetch per distinct PR as everything else. Busy and in-grace sessions
+        fetch per distinct PR as everything else. The exception is a probe no
+        candidate could answer: nothing is cached from a pass that may have
+        seen a partial truth, so it re-probes (stopping at the first failure)
+        until it clears, and pages if it does not. Busy and in-grace sessions
         are filtered out BEFORE anything is fetched at all. Only individual
         sessions are ever killed (`alissa tmux kill <name>`) -- never the
         server, which in this shared container would take every other lane's
@@ -940,6 +954,11 @@ class ReviewWatcher:
         self._probe_cache = {
             name: target
             for name, target in self._probe_cache.items()
+            if name in live_names
+        }
+        self._probe_taint = {
+            name: count
+            for name, count in self._probe_taint.items()
             if name in live_names
         }
 
@@ -1056,7 +1075,11 @@ class ReviewWatcher:
         in the README; the durable fix is a repo in the name (skill-side) or a
         ledger row for hand-spawned sessions.
 
-        The probe is paid ONCE per session name. Its answer -- the resolved
+        The probe is paid ONCE per session name -- unless a candidate fetch
+        fails to answer, in which case that pass is discarded uncached and
+        re-probed next poll (see _probe_allowlist, and _note_probe_taint for
+        the alarm bounding a failure that does not clear). Its answer -- the
+        resolved
         (repo, number), or a sticky None for "could not be resolved" -- is
         cached on the watcher, because the resolution is a function of the
         number and the repos allowlist, and the allowlist cannot change under
@@ -1082,16 +1105,18 @@ class ReviewWatcher:
         if ses.name in self._probe_cache:
             target = self._probe_cache[ses.name]
         else:
-            target, cacheable = self._probe_allowlist(ses, ref, prs)
-            if cacheable:
-                self._probe_cache[ses.name] = target
-            elif target is None:
+            probed = self._probe_allowlist(ses, ref, prs)
+            if isinstance(probed, _FetchFailed):
+                self._note_probe_taint(ses, ref)
                 self._hold(
                     holdouts, ses,
                     f"a probe fetch for PR #{ref.number} failed — re-probing "
                     f"next poll rather than pinning what it seemed to say",
                 )
                 return None
+            self._probe_taint.pop(ses.name, None)  # this pass answered
+            target = probed
+            self._probe_cache[ses.name] = target
         if target is None:
             self._hold(
                 holdouts, ses,
@@ -1109,57 +1134,88 @@ class ReviewWatcher:
         ses: ManagedSession,
         ref: SessionRef,
         prs: FetchMemo,
-    ) -> tuple[tuple[str, int] | None, bool]:
-        """Which watched repo owns this session's PR number, and may we cache it?
+    ) -> tuple[str, int] | None | _FetchFailed:
+        """Which watched repo owns this session's PR number.
 
-        The expensive half of _resolve_pr, called once per session name.
-        Returns (target, cacheable); `target` is None when the number does not
-        resolve to exactly one watched repo.
+        The expensive half of _resolve_pr. Three answers, for the same reason
+        _fetch_pr has three -- the caller CACHES what this concludes, so "I
+        could not tell" must not be representable as "I concluded nothing":
 
-        `cacheable` is False when ANY candidate fetch failed to answer, and
-        that flag is the whole point of the error/404 distinction: the caller
-        pins this conclusion for the session's lifetime, so a conclusion drawn
-        while `gh` was blipping would be pinned too. A blip on the true owner
-        leaves exactly one apparent hit -- a confident, wrong resolution that
-        can get somebody else's live session killed. Before the cache existed
-        the next poll simply re-probed and self-healed; declining to cache an
-        error-tainted pass is how that self-healing survives.
+        * a (repo, number) target -- resolved, and worth pinning;
+        * None -- the number definitely does not resolve to exactly one
+          watched repo, itself a fact worth pinning;
+        * FETCH_FAILED -- a candidate did not answer, so nothing this pass
+          seemed to see can be trusted or cached.
 
-        It gates the NEGATIVE as well, not just the positive: a pass in which
-        the true owner blipped and nothing answered would otherwise pin a
-        sticky "unresolvable" for the session's lifetime on equally bad
-        evidence -- the failure is quieter (a session spared forever rather
-        than killed wrongly) but it is the same mistake.
+        The third exists because a blip on the TRUE owner leaves exactly one
+        apparent hit: a confident, wrong resolution that can get somebody
+        else's live session killed. Before the cache existed the next poll
+        re-probed and self-healed; refusing to cache an error-tainted pass is
+        how that self-healing survives. It covers the negative too -- a pass
+        in which the true owner blipped and nothing answered is not evidence
+        that a number is unresolvable, and pinning it would spare the session
+        forever on equally bad evidence.
+
+        The candidate loop STOPS at the first failure. The pass's conclusion
+        is already discarded by then, so the remaining fetches buy nothing but
+        a memo entry for a hypothetical sibling -- and paying them anyway is
+        what let a persistently failing candidate re-run the WHOLE allowlist
+        sweep every poll, which is the per-poll cost the cache exists to
+        remove.
         """
         candidates = self._name_candidates(ref)
         if not candidates:
             # Nothing to probe: stable until the allowlist itself changes,
             # which no poll can do to a running process.
-            return None, True
+            return None
         hits = []
-        errored = False
         for repo_slug in candidates:
             # Quiet: probing a repo that simply has no PR #n is the expected
             # outcome for all but one candidate, not a failure worth a warning.
             found = self._fetch_pr(prs, repo_slug, ref.number, quiet=True)
+            if isinstance(found, _FetchFailed):
+                log.debug(
+                    "reap sweep: a probe fetch for PR #%d (%s) failed at %s — "
+                    "abandoning the pass rather than caching what it saw",
+                    ref.number, ses.name, repo_slug,
+                )
+                return FETCH_FAILED
             if isinstance(found, PullRequest):
                 hits.append(repo_slug)
-            elif isinstance(found, _FetchFailed):
-                errored = True
-        if errored:
-            log.debug(
-                "reap sweep: a probe fetch for PR #%d (%s) failed — not caching "
-                "what this pass seemed to resolve",
-                ref.number, ses.name,
-            )
-            return None, False
         if len(hits) != 1:
             log.debug(
                 "reap sweep: PR #%d of %s resolves to %d watched repo(s)",
                 ref.number, ses.name, len(hits),
             )
-            return None, True
-        return (hits[0], ref.number), True
+            return None
+        return (hits[0], ref.number)
+
+    def _note_probe_taint(self, ses: ManagedSession, ref: SessionRef) -> None:
+        """Count consecutive un-answerable probes, and page once past the floor.
+
+        Refusing to cache an error-tainted pass is correct but unbounded on its
+        own: while a candidate keeps failing, this session is re-probed every
+        poll -- the per-poll allowlist sweep the cache exists to remove -- and
+        silently, since probe fetches are quiet, the taint log is debug, and
+        the holdout reason only reaches an operator once the session cap is
+        exceeded. A candidate that HANGS rather than blips gets there easily:
+        proc.run turns a 60s `gh api` timeout into a CommandError, correctly
+        read as "did not answer", and that can persist indefinitely.
+
+        Once per episode, like the cap alarm and for the same reason (this runs
+        every poll); the counter resets on any pass that answers, so a recovery
+        re-arms the alarm for the next episode.
+        """
+        count = self._probe_taint.get(ses.name, 0) + 1
+        self._probe_taint[ses.name] = count
+        if count == PROBE_TAINT_ALARM:
+            log.error(
+                "REVIEWER SESSION PROBE STUCK: %s has been re-probed %d polls "
+                "running because a watched repo will not answer for PR #%d — "
+                "the whole allowlist is re-swept every poll and the session "
+                "cannot be resolved or reaped until it clears",
+                ses.name, count, ref.number,
+            )
 
     def _name_candidates(self, ref: SessionRef) -> list[str]:
         """The watched repos a session name could be about.
@@ -1299,8 +1355,13 @@ class ReviewWatcher:
             raise
         except CommandError as exc:
             missing = _is_not_found(exc)
+            # `quiet` alone decides the level, deliberately: a 404 while
+            # PROBING is the expected answer for all but one candidate, but a
+            # 404 on a PR this daemon recorded in its own spawn ledger means
+            # the repo was deleted, transferred or renamed under it -- an
+            # operator fact, and the container runs at INFO.
             log.log(
-                logging.DEBUG if quiet or missing else logging.WARNING,
+                logging.DEBUG if quiet else logging.WARNING,
                 "reap sweep: %s %s#%d: %s",
                 "no such PR" if missing else "could not fetch",
                 repo_slug, number, exc,
