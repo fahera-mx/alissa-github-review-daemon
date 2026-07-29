@@ -1579,13 +1579,20 @@ def _watched(config, *repos):
     return dataclasses.replace(config, repos=tuple(repos))
 
 
-def _resolve_prs(gh, mapping):
+def _resolve_prs(gh, mapping, failing=()):
     """Make the fake GitHub answer per (repo slug, number), 404ing otherwise —
-    the multi-repo world the allowlist probe has to work in."""
+    the multi-repo world the allowlist probe has to work in.
+
+    `failing` names repo slugs whose fetch blows up with a TRANSIENT error
+    (502, not 404). It is a mutable set in the tests that flip it mid-run, so
+    it is read at call time, not captured."""
 
     def pull_request(owner, repo, number):
         gh.pr_fetches += 1
-        found = mapping.get((f"{owner}/{repo}", number))
+        slug = f"{owner}/{repo}"
+        if slug in failing:
+            raise CommandError(["gh", "api"], 1, "HTTP 502: Bad Gateway")
+        found = mapping.get((slug, number))
         if found is None:
             raise CommandError(["gh", "api"], 1, "Not Found (HTTP 404)")
         return found
@@ -1825,6 +1832,133 @@ def test_the_probe_cache_drops_sessions_that_left_the_live_list(config):
     w.sweep_sessions()
 
     assert list(w._probe_cache) == ["review-pr-9"]
+
+
+# -- round 3: a blip must not be pinned, and a failed fetch must say so -----
+
+
+def test_a_transient_failure_during_the_probe_is_not_cached_and_self_heals(config):
+    """The regression the cache introduced. Two watched repos both have a PR
+    #7; the real subject is `acme/gadgets#7`, open throughout. `gh` blips on
+    gadgets during the probe, so the pass sees exactly one apparent hit —
+    a confident, wrong resolution. Caching it would pin it for the session's
+    lifetime and kill the gadgets reviewer once widgets#7 merges; before the
+    cache the next poll re-probed and self-healed, and it must still."""
+    widgets = make_pr()  # open for now
+    gadgets = dataclasses.replace(make_pr(), repo="gadgets")
+    w, gh, al = watcher(_watched(config, SLUG, "acme/gadgets"), widgets, [])
+    blip = {"acme/gadgets"}
+    _resolve_prs(gh, {(SLUG, 7): widgets, ("acme/gadgets", 7): gadgets}, failing=blip)
+    _live(al, "review-pr-7")
+
+    w.sweep_sessions()
+    assert "review-pr-7" not in w._probe_cache, "an error-tainted pass must not pin"
+
+    blip.clear()  # gh recovers; now the collision is visible
+    w.sweep_sessions()
+    assert w._probe_cache["review-pr-7"] is None, "two hits — sticky unresolvable"
+
+    # widgets#7 merges. The wrongly-pinned resolution would reap here.
+    gh._pr = dataclasses.replace(widgets, state="closed", merged=True)
+    _resolve_prs(
+        gh,
+        {(SLUG, 7): gh._pr, ("acme/gadgets", 7): gadgets},
+    )
+    w.sweep_sessions()
+
+    assert al.killed == [], "the gadgets reviewer must still be running"
+
+
+def test_an_all_candidates_failed_pass_does_not_pin_unresolvable_either(config):
+    """The negative needs the same gate: a pass where nothing answered is not
+    evidence that the number is unresolvable, and pinning it would spare the
+    session forever on a blip."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, SLUG), merged, [])
+    blip = {SLUG}
+    _resolve_prs(gh, {(SLUG, 7): merged}, failing=blip)
+    _live(al, "review-pr-7")
+
+    w.sweep_sessions()
+    assert "review-pr-7" not in w._probe_cache
+    assert al.killed == []
+
+    blip.clear()
+    w.sweep_sessions()
+
+    assert al.killed == ["review-pr-7"], "it resolves and reaps once gh answers"
+
+
+def test_a_definite_404_is_still_a_cacheable_answer(config):
+    """The distinction must not cost the normal path its cache: a repo that
+    genuinely has no PR #n is a fact, and pinning it is the whole point."""
+    merged = make_pr(state="closed", merged=True)
+    w, gh, al = watcher(_watched(config, "acme/gadgets", SLUG), merged, [])
+    _resolve_prs(gh, {(SLUG, 7): merged})  # gadgets 404s — a definite answer
+    _live(al, "review-pr-7")
+
+    w.sweep_sessions()
+
+    assert w._probe_cache["review-pr-7"] == (SLUG, 7)
+    assert al.killed == ["review-pr-7"]
+
+
+def test_a_failed_pr_fetch_records_a_reason_for_the_cap_alarm(config, caplog):
+    """A `gh` outage spares several sessions at once and fires the alarm with
+    a list of names — the case where `(no reason recorded)` was worst.
+
+    Note the shape: the alarm dedupes on the SURVIVOR SET, not on the reasons
+    (which carry minute counts and would re-page every poll), so this drops a
+    session as well as breaking the fetch to get a second page at all."""
+    cfg = dataclasses.replace(_watched(config, SLUG), reap_session_cap=1)
+    open_pr = make_pr()
+    w, gh, al = watcher(cfg, open_pr, [review()])
+    mapping = {(SLUG, n): open_pr for n in (7, 8, 9)}
+    _resolve_prs(gh, mapping)
+    for n in (7, 8, 9):
+        _live(al, f"review-pr-{n}")
+    w.sweep_sessions()  # resolves all three and caches them; pages once
+    caplog.clear()
+
+    al.sessions = [ses for ses in al.sessions if ses.name != "review-pr-9"]
+    _resolve_prs(gh, mapping, failing={SLUG})
+    with caplog.at_level(logging.ERROR):
+        w.sweep_sessions()
+
+    page = next(r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+    assert "no reason recorded" not in page
+    assert page.count("could not be fetched — retrying next poll") == 2
+
+
+def test_a_ledger_backed_session_also_records_a_failed_fetch(config, caplog):
+    """The other fetch-returning path out of _resolve_pr, which had the same
+    bare `return self._fetch_pr(...)`."""
+    cfg = dataclasses.replace(config, reap_session_cap=1)
+    pr = make_pr()
+    w, gh, al = watcher(cfg, pr, [review()])
+    s1 = _record(w, pr, 1)
+    s2 = _record(w, pr, 2)
+    _live(al, s1)
+    _live(al, s2)
+    _resolve_prs(gh, {}, failing={SLUG})
+
+    with caplog.at_level(logging.ERROR):
+        w.sweep_sessions()
+
+    page = next(r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+    assert "no reason recorded" not in page
+    assert al.killed == []
+
+
+def test_a_definite_404_and_a_failed_call_are_distinguishable():
+    """The signal the whole gate rests on. Biased toward 'failed': reading a
+    real 404 as transient costs one re-probe, the reverse pins a wrong PR."""
+    from alissa.tools.github.revloop.loop import _is_not_found
+
+    assert _is_not_found(CommandError(["gh"], 1, "gh: Not Found (HTTP 404)"))
+    assert _is_not_found(CommandError(["gh"], 1, "HTTP 404"))
+    assert not _is_not_found(CommandError(["gh"], 1, "HTTP 502: Bad Gateway"))
+    assert not _is_not_found(CommandError(["gh"], 1, ""))
 
 
 # -- round 2: the cap alarm explains itself, once per episode ---------------
