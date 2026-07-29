@@ -28,6 +28,8 @@ with open("README.md") as file:
 setup(
     name="alissa-tools-github-revloop",
     version=version,
+    license="Apache-2.0",
+    license_files=("LICENSE", "NOTICE"),
     description="ALISSA-TOOLS-GITHUB-REVLOOP",
     long_description=readme,
     long_description_content_type='text/markdown',

@@ -42,3 +42,11 @@ pip install -e ./alissa-tools-github-revloop
 distribution version lives in the plain-text `version` file next to the module
 it versions (`src/main/alissa/tools/github/revloop/version`), read by both
 `setup.py` and `version.py`.
+
+## License
+
+Licensed under the Apache License 2.0 — see the `LICENSE` and `NOTICE` files
+shipped with this distribution.
+
+"Alissa" and "Fahera" are trademarks of CORE FAHERA ENTERPRISE HOLDINGS S. DE
+R.L.; the license does not grant permission to use them.

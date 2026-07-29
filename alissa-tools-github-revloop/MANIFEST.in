@@ -1,2 +1,4 @@
 include requirements.txt
 include src/main/alissa/tools/github/revloop/version
+include LICENSE
+include NOTICE
