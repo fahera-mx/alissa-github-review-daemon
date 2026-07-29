@@ -402,15 +402,65 @@ def capout_kind(head_sha: str, granted: int) -> str:
 def identity_drift_kind(requested: str, author: str) -> str:
     """The ping-ledger kind that dedupes ONE request/author identity-drift warning.
 
-    Keyed on the CONDITION -- the ordered pair of logins -- and not merely on
-    the PR, so a deployment whose reviewer identity is later fixed (or broken a
-    second, different way) says so again instead of staying quiet because it
-    once warned about something else here. Durable rather than in-memory
-    because this is a configuration alarm: it is true of every PR the daemon
-    touches, so a restart re-stating it per PR would be a wall of noise, not
-    new information.
+    Scope is once per PR per ordered login pair -- the ledger keys on
+    `(repo, number, kind)`, so folding the pair into the kind narrows the
+    dedupe WITHIN a PR and cannot lift it above one. What the pair buys is that
+    a drift which later becomes a DIFFERENT drift announces itself again
+    instead of staying quiet because this PR once warned about something else.
+
+    Durable rather than in-memory because it is a configuration alarm, not a
+    per-poll observation: a restart re-stating it on every open PR would be a
+    wall of noise. Per-PR is bounded in practice by the withdrawal itself --
+    once the request is gone the PR leaves the poll set, so a drifted
+    deployment emits one block per PR it closes a round on, not one per poll.
     """
     return f"reqdrift:{requested}->{author}"
+
+
+def drift_probe_kind(head_sha: str) -> str:
+    """The ping-ledger kind that bounds the drift check's EXTRA read.
+
+    The check needs the unfiltered review list, which `my_reviews` cannot
+    supply -- a review by another identity is exactly what it filters out. That
+    is one more API call, and on a PR whose withdrawal fails permanently (a
+    reviewer identity without `pull_requests: write`) the close-out path runs
+    every poll, so "one extra call on the rare path" would quietly become one
+    per poll forever.
+
+    Keyed on the head so the probe re-runs when the code moves -- a new head
+    means a new round and a new chance for its verdict to land under the wrong
+    login -- and recorded only once the review list has actually been READ, so
+    an unreadable list retries instead of being settled by a failure.
+    """
+    return f"driftprobe:{head_sha}"
+
+
+def withdraw_failed_kind(exc: BaseException) -> str:
+    """The ping-ledger kind that dedupes a failing review-request withdrawal.
+
+    Retrying a failed DELETE is right -- a 403 can be a permission grant away
+    from working. Re-LOGGING it every poll is not: the common failure is
+    permanent and per-PR, so at a 30s poll interval one such PR would emit
+    ~2,880 warning lines a day that never converge on anything.
+
+    Keyed on the exception class, not its message: a message carries the PR
+    and the moment, which would defeat the dedupe, while a 403 that later
+    becomes a 422 is a genuinely different condition and says so once.
+    """
+    return f"withdraw-failed:{type(exc).__name__}"
+
+
+def withdrawn_kind(head_sha: str) -> str:
+    """The ping-ledger kind that marks a review request already withdrawn at
+    this head -- so a request that COMES BACK is distinguishable from the first
+    one.
+
+    Withdrawing is the daemon undoing a state change a human or an automation
+    made on GitHub. Doing it once at a head is routine close-out; doing it
+    again means somebody deliberately asked for another look and the daemon
+    took it away, which is worth a louder line than the first.
+    """
+    return f"withdrawn:{head_sha}"
 
 
 def _now() -> str:
@@ -1329,7 +1379,7 @@ class ReviewWatcher:
         envelope count) to reach this same no-op. Removing the request is what
         ends that: the search is the evaluation set, so the PR leaves it.
 
-        Three properties this must not violate:
+        Four properties this must not violate:
 
         * Only ever OUR login. Human reviewers and any second bot in the same
           `requested_reviewers` array are somebody else's pending work, and a
@@ -1338,16 +1388,44 @@ class ReviewWatcher:
           verdict of record stands at the current head and no further round can
           be owed; a request withdrawn while a round could still open would
           delete the very trigger that surfaces the PR.
+        * Only on a HEAD-BOUND verdict. `_convergence_reason` cannot check a
+          review that carries no `commit_id` and lets it converge anyway; that
+          convergence is not about the current head, so withdrawing on it would
+          take a PR out of the daemon's sight on a verdict that might be about
+          old code. Such a review is not producible today -- `submit_review`
+          always pins a commit and GitHub populates it -- but the terminal
+          argument must hold on its own terms rather than by inheritance, so
+          the check is repeated here.
         * Never blocking. The removal is a side effect of a decision already
           made, so any failure -- including a throttled one -- is logged and
           dropped rather than raised: the pass keeps walking and the next poll
           retries, which is strictly better than converting a no-op into an
           aborted pass. (Deliberately unlike the read paths, which let
           RateLimited reach run_forever's backoff.)
+
+        `my_reviews` is non-empty at every call site -- `_convergence_reason`
+        returns None on an empty one -- so its newest entry IS the verdict of
+        record, read positionally rather than defended against.
         """
         mine = self.github.login
         if mine not in pr.requested_reviewers:
             return
+
+        verdict = my_reviews[-1]
+        if not verdict.commit_id:
+            log.debug(
+                "%s: not withdrawing the review request — the converged review "
+                "%s carries no commit_id, so convergence is not head-bound",
+                pr.slug, verdict.url or "with no url",
+            )
+            return
+
+        # Above the dry-run guard: the drift check reads, records a ledger row
+        # and logs, but takes nothing on GitHub -- it OBSERVES the pass rather
+        # than acting in it, the same reasoning that writes poll snapshots in
+        # dry-run. Dry-run is also the mode an operator reaches for to diagnose
+        # exactly this, so staying silent about it there is the worst place.
+        self._warn_identity_drift(pr)
 
         if self.config.dry_run:
             log.info(
@@ -1357,32 +1435,48 @@ class ReviewWatcher:
             )
             return
 
-        # Before the removal, because it is a statement about the deployment's
-        # configuration and stays true whether or not the DELETE lands.
-        self._warn_identity_drift(pr)
-
-        verdict = my_reviews[-1] if my_reviews else None
         try:
             self.github.remove_review_request(pr.owner, pr.repo, pr.number, mine)
         except Exception as exc:
+            kind = withdraw_failed_kind(exc)
+            if self.state.pinged(pr.full_name, pr.number, kind):
+                # Still retried, just not re-announced; see withdraw_failed_kind.
+                log.debug(
+                    "%s: withdrawal still failing for %s (%s)", pr.slug, mine, exc
+                )
+                return
+            self.state.record_ping(pr.full_name, pr.number, kind)
             log.warning(
                 "%s: could not withdraw the dangling review request for %s (%s) "
                 "— the closed round will be re-evaluated next poll and the "
-                "removal retried",
+                "removal retried. Withdrawing needs `pull_requests: write`, "
+                "which is more than reviewing needs; further failures of this "
+                "kind log at debug",
                 pr.slug, mine, exc,
             )
             return
 
         others = [login for login in pr.requested_reviewers if login != mine]
+        left = ", ".join(others) if others else "no other reviewers"
+        kind = withdrawn_kind(pr.head_sha)
+        if self.state.pinged(pr.full_name, pr.number, kind):
+            # The request came back at a head this daemon already closed out.
+            # Someone asked for another look at code that still carries its
+            # approve -- and the daemon has just taken their request away, so
+            # say so where they will find it.
+            log.warning(
+                "%s round close-out: the review request for %s came back at "
+                "head %s and was withdrawn AGAIN — the approve at that head "
+                "still stands (%s), so no round is owed; only a new commit "
+                "opens one. Verdict of record %s. Left in place: %s",
+                pr.slug, mine, pr.head_sha[:8], why, verdict.url, left,
+            )
+            return
+        self.state.record_ping(pr.full_name, pr.number, kind)
         log.info(
             "%s round close-out: withdrew the dangling review request for %s — "
             "%s; verdict of record %s at head %s. Left in place: %s",
-            pr.slug,
-            mine,
-            why,
-            (verdict.url if verdict is not None else "none on GitHub"),
-            pr.head_sha[:8],
-            ", ".join(others) if others else "no other reviewers",
+            pr.slug, mine, why, verdict.url, pr.head_sha[:8], left,
         )
 
     def _warn_identity_drift(self, pr: PullRequest) -> None:
@@ -1397,12 +1491,21 @@ class ReviewWatcher:
 
         Diagnostic only -- it never gates the removal, and an unreadable review
         list just means no warning, not a stalled close-out.
+
+        The extra read it needs is bounded to once per (PR, head); see
+        drift_probe_kind for why that bound exists at all.
         """
+        probe = drift_probe_kind(pr.head_sha)
+        if self.state.pinged(pr.full_name, pr.number, probe):
+            return
+
         try:
             reviews = self.github.reviews(pr.owner, pr.repo, pr.number)
         except Exception as exc:
+            # Deliberately not recorded: a read that failed settles nothing.
             log.debug("%s: could not read reviews for the drift check: %s", pr.slug, exc)
             return
+        self.state.record_ping(pr.full_name, pr.number, probe)
 
         substantive = [r for r in reviews if r.is_substantive]
         if not substantive:

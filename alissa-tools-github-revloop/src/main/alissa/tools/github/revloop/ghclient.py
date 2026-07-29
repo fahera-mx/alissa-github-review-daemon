@@ -15,6 +15,7 @@ without it the client inherits, exactly as it always did.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -337,8 +338,22 @@ class GitHub:
             )
         return actual
 
-    def _api(self, *args: str, timeout: int = 60, forbidden_is_rate_limit: bool = True):
+    def _api(
+        self,
+        *args: str,
+        timeout: int = 60,
+        forbidden_is_rate_limit: bool = True,
+        body: "dict | None" = None,
+    ):
         """One `gh api` call, with GitHub's throttling mapped to RateLimited.
+
+        `body` is for requests whose payload must have a particular JSON SHAPE.
+        `gh`'s `-f` fields cannot express one portably: `-f 'k[]=v'` is encoded
+        as the array `{"k": ["v"]}` only by modern `gh`, and as a string field
+        NAMED `k[]` by the 2.4.0 this client targets -- silently, so the
+        request goes out well-formed and simply missing the key the endpoint
+        wants. Passing the body on stdin through `--input -` (which 2.4.0 does
+        support) takes every `gh` version out of the encoding decision.
 
         `forbidden_is_rate_limit` is about one ambiguity: GitHub answers a
         secondary rate limit with 403, so a bare "403" in stderr is read as
@@ -354,8 +369,13 @@ class GitHub:
         that pass False: an explicit throttling marker still raises
         RateLimited, and everything else stays a CommandError they can handle.
         """
+        argv = ["gh", "api", *args]
+        stdin = None
+        if body is not None:
+            argv += ["--input", "-"]
+            stdin = json.dumps(body)
         try:
-            return run_json(["gh", "api", *args], timeout=timeout, env=self._env())
+            return run_json(argv, timeout=timeout, env=self._env(), stdin=stdin)
         except CommandError as exc:
             blob = exc.stderr.lower()
             throttled = any(marker in blob for marker in RATE_LIMIT_MARKERS)
@@ -569,18 +589,24 @@ class GitHub:
         caller is the round close-out (loop._clear_own_review_request), and the
         only login it ever passes is the daemon's own.
 
+        The body goes out through `--input` rather than `-f 'reviewers[]=…'`,
+        because that field syntax means different things on different `gh`
+        versions and this client targets 2.4.0, where it produces a string
+        field literally named `reviewers[]` -- no `reviewers` key, a 422, and a
+        feature that never worked. See `_api`.
+
         `forbidden_is_rate_limit=False` for the same reason `submit_review`
         passes it: a 403 here is this identity not being allowed to edit the
         PR's reviewers, which is a fact about the deployment that its caller
         logs and degrades on -- not a throttle worth backing the whole poll
-        pass off for.
+        pass off for. Note the permission is `pull_requests: write`, strictly
+        more than reviewing needs.
         """
         self._api(
             "-X",
             "DELETE",
             f"repos/{owner}/{repo}/pulls/{number}/requested_reviewers",
-            "-f",
-            f"reviewers[]={login}",
+            body={"reviewers": [login]},
             forbidden_is_rate_limit=False,
         )
 

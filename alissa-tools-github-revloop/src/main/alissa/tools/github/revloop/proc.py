@@ -36,12 +36,20 @@ def run(
     check: bool = True,
     cwd: "str | os.PathLike[str] | None" = None,
     env: "Mapping[str, str] | None" = None,
+    stdin: "str | None" = None,
 ) -> str:
     """Run a command, return stdout. Never uses shell=True.
 
     `env`, when given, REPLACES the child's environment rather than adding to
     it -- that is what makes it an identity guarantee: a credential the caller
     did not put in the mapping cannot reach the child by inheritance.
+
+    `stdin` feeds the child's standard input. It exists for `gh api --input -`:
+    `gh`'s `-f key=value` fields are encoded differently across `gh` versions
+    (`key[]=v` is a JSON array only on modern builds, a string field named
+    `key[]` on the 2.4.0 this client targets), so a request whose body must
+    have a particular JSON SHAPE is built by the caller and piped in, where no
+    version gets a say in it.
     """
     log.debug("exec: %s", " ".join(argv))
     try:
@@ -52,6 +60,7 @@ def run(
             timeout=timeout,
             cwd=str(cwd) if cwd is not None else None,
             env=dict(env) if env is not None else None,
+            input=stdin,
         )
     except subprocess.TimeoutExpired as exc:
         raise CommandError(argv, -1, f"timed out after {timeout}s") from exc
@@ -66,9 +75,10 @@ def run_json(
     *,
     timeout: int = 60,
     env: "Mapping[str, str] | None" = None,
+    stdin: "str | None" = None,
 ):
     """Run a command whose stdout is JSON."""
-    out = run(argv, timeout=timeout, env=env).strip()
+    out = run(argv, timeout=timeout, env=env, stdin=stdin).strip()
     if not out:
         return None
     try:

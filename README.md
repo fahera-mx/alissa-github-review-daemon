@@ -275,15 +275,24 @@ still grant rounds, and the ack scan only runs while the PR is in the search).
   has read access will see the DELETE 403 every poll and keep the pre-0.16.5
   behaviour, with the failure named in the log rather than silent.
 - Round accounting, verdict envelopes, the cap and re-entry semantics are all
-  untouched. A fresh operator re-request after a withdrawal surfaces the PR
-  again and opens a round normally.
+  untouched. A re-request **against a new head** surfaces the PR and opens a
+  round normally — the head move is what makes the approve stale.
+- A re-request at the **unchanged** head does not open one, and the request is
+  withdrawn again: the approve still stands at that commit, and re-reviewing
+  code that already carries one is the stale-approve latch pointed the other
+  way. That second withdrawal logs at `WARNING` rather than `INFO`, naming the
+  head and saying the approve still stands, so an operator clicking the button
+  by hand can see why their request keeps vanishing. Push a commit to reopen
+  the loop.
 
 **Identity drift.** If the round's newest review carries a different login than
 the one the request is held against, the daemon logs one loud warning naming
 both. That mismatch means GitHub-native request consumption can never work for
 that deployment's configuration — every closed round will leave a dangling
-request behind — so it is a config alarm, deduped on the pair of logins rather
-than repeated per poll.
+request behind. It is deduped once per PR per pair of logins (durable, so a
+restart does not re-announce it, and a *changed* drift does), and the read it
+needs runs at most once per PR per head. It is emitted in `--dry-run` too:
+that is the mode an operator reaches for to diagnose exactly this.
 
 ### Operator re-entry after a cap-out
 
