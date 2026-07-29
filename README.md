@@ -259,7 +259,15 @@ allowlist: a name carrying a repo picks its entry, a bare `review-pr-<n>` is
 probed across the allowlist and must hit **exactly one** PR — zero or several is
 a guess, and the sweep spares rather than guesses. An empty allowlist can never
 resolve a bare name at all. The probe is paid once per session name, not once per
-poll (its answer, including "unresolvable", is cached for the session's lifetime).
+poll (its answer, including "unresolvable", is cached for the session's lifetime)
+— *unless a candidate repo fails to answer*, in which case that pass is discarded
+uncached and re-probed next poll rather than pinning what it may have half-seen.
+Each such pass stops at the first candidate that will not answer, so the cost is
+the allowlist prefix up to that repo rather than the whole list — and a failure
+that does not clear (a repo that hangs rather than 404s) is made *visible* by a
+page-worthy log, naming the repo, after three consecutive un-answerable probes.
+The probing itself continues at full cadence until it clears; the log bounds how
+long it stays invisible, not how long it runs.
 
 **Known v1 limits of bare-name resolution.** The allowlist *bounds the search*; it
 does not prove ownership, because a bare `review-pr-<n>` carries no repo. Two
@@ -273,6 +281,14 @@ consequences, both worth knowing before you widen `repos`:
   older one's — every bare `review-pr-<n>` in the overlap resolves to two hits
   and is spared *forever*. The symptom is the reviewer-session count quietly
   ceasing to fall while the cap alarm keeps firing.
+- **Losing read access to a watched repo looks like "no such PR".** GitHub
+  answers **404, not 403**, for a repo the token cannot see, so that repo drops
+  out of the candidate set silently — which can collapse a genuine two-repo
+  ambiguity into a confident single hit and reap the wrong session. Treating 404
+  as definite is what makes the normal path cacheable at all, so the bias is
+  deliberate; the daemon needs read access to every watched repo for the review
+  search to work in the first place, and losing it mid-run is the case to know
+  about.
 
 The durable fix is out of scope for the daemon: it needs the repo *in the session
 name* (a skill-side change to `spawn-a-reviewer-session.md`) or a ledger row for
