@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -63,6 +64,7 @@ from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     MAX_REENTRY_ROUNDS,
     MAX_VERDICT_POST_ATTEMPTS,
+    POLL_ESCALATE_SECONDS,
     REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
@@ -6123,19 +6125,120 @@ def test_the_summary_is_streak_limited_then_says_when_it_clears(config, caplog):
     assert len(cleared) == 1
 
 
-def test_the_gate_never_escalates_however_long_it_holds(config, caplog):
-    """A full container is the gate WORKING. The page-worthy condition is the
-    reap alarm's (sessions that will not go away), and duplicating it here
-    would make normal load look like a leak."""
-    w, _, _ = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+def _ticking(monkeypatch, step=60.0):
+    """Drive `loop.py`'s monotonic clock forward `step` seconds per call, so a
+    30-minute escalation window passes in the number of polls the deployed
+    daemon would really take -- without sleeping through it."""
+    now = {"t": 1000.0}
+
+    def monotonic():
+        now["t"] += step
+        return now["t"]
+
+    monkeypatch.setattr(loop_module.time, "monotonic", monotonic)
+    return now
+
+
+def test_a_draining_gate_never_escalates_however_long_it_holds(
+    config, caplog, monkeypatch
+):
+    """A full container that keeps handing out freed slots is the gate WORKING,
+    however long the backlog lasts. Paging on it would make normal load look
+    like a leak -- and a wave permanently larger than the limit would page
+    forever on a daemon that is reviewing everything, just serially."""
+    _ticking(monkeypatch)
+    w, _, al = _wave(config, list(range(11, 51)), limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")
 
     with caplog.at_level(logging.INFO):
-        for _ in range(30):
-            w.poll_once()
+        for _ in range(35):  # 35 min of polls at the deployed cadence
+            al.sessions = []  # exactly one slot frees each pass...
+            results = w.poll_once()
+            assert _spawned_numbers(results), "...so every pass spawns one"
 
     gate = [r for r in caplog.records if "spawn gate" in r.getMessage()]
     assert gate, "it did log"
     assert {r.levelno for r in gate} == {logging.INFO}
+    assert "NOTHING has spawned" not in caplog.text
+
+
+def test_a_gate_that_spawns_nothing_escalates_to_warning(
+    config, caplog, monkeypatch
+):
+    """The condition the INFO line cannot carry: a gate shut for half an hour
+    with nothing started. Three session classes hold it there with the reap
+    alarm silent -- busy sessions are never reaped, a hand-spawned
+    review-pr-<n> on an OPEN PR is outside the reaper's scope, and undecidable
+    sessions are spared every poll -- and the gated rounds write no ledger row,
+    so the stale-round probe cannot see them either."""
+    _ticking(monkeypatch)
+    w, _, _ = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(35):
+            w.poll_once()
+
+    warned = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "spawn gate" in r.getMessage()
+    ]
+    assert warned, "a gate that has started nothing for 30 min is page-worthy"
+    held = re.search(r"NOTHING has spawned for (\d+) min", warned[0].getMessage())
+    assert held, "it says for how long"
+    assert int(held.group(1)) >= POLL_ESCALATE_SECONDS // 60, "and only past the window"
+    assert "never frees a busy session" in warned[0].getMessage(), "and what to look at"
+    # It escalated only AFTER the window: the first lines are still INFO.
+    first = [r for r in caplog.records if "spawn gate" in r.getMessage()][0]
+    assert first.levelno == logging.INFO
+
+
+def test_one_spawn_clears_the_stall_escalation(config, caplog, monkeypatch):
+    """A spawn is the proof the queue is moving. Whatever the backlog, the pass
+    that spawns is not a stall -- and it says so past the streak limit, or the
+    operator's last word on the gate is a WARNING already recovered from."""
+    _ticking(monkeypatch)
+    w, _, al = _wave(config, [11, 12], limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(35):
+            w.poll_once()
+        assert any(
+            r.levelno == logging.WARNING and "spawn gate" in r.getMessage()
+            for r in caplog.records
+        ), "the gate escalated first"
+
+        caplog.clear()
+        al.sessions = []  # a slot frees: the oldest waiter takes it
+        results = w.poll_once()
+
+    assert _spawned_numbers(results) == [11]
+    gate = [r for r in caplog.records if "spawn gate" in r.getMessage()]
+    assert gate and {r.levelno for r in gate} == {logging.INFO}
+    assert any("spawning again after" in r.getMessage() for r in gate)
+    assert any("1 round(s) still waiting" in r.getMessage() for r in gate)
+
+
+def test_the_dry_run_census_counts_the_slots_production_would_free(
+    config, caplog, monkeypatch
+):
+    """`--dry-run` is the tool an operator reaches for during exactly this
+    incident class, so its gate decision must be production's. A dry-run sweep
+    kills nothing, so the census has to discount what it WOULD have reaped or
+    the diagnostic reports rounds queued that production spawns."""
+    pr = make_pr()
+
+    def census_after(dry_run):
+        cfg = dataclasses.replace(
+            config, max_concurrent_sessions=1, dry_run=dry_run
+        )
+        w, _, al = watcher(cfg, pr, [review("APPROVED")])
+        _live(al, _record(w, pr, 1))  # its round converged: reapable
+        w.sweep_sessions()
+        return w._session_census
+
+    assert census_after(dry_run=False) == 0, "production frees the slot"
+    assert census_after(dry_run=True) == 0, "and the diagnostic says so too"
 
 
 # -- what counts: revloop's own grammar, and nothing else -------------------

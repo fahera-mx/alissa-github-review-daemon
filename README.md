@@ -515,9 +515,20 @@ decides whether a round is owed — the daemon counts the live sessions matching
   the reaper.
 - **One line per pass**, at `INFO`, summarizing every deferral
   (`spawn gate: 2 round(s) deferred — 4/4 reviewer sessions live …`),
-  streak-limited like the poll firewall and never escalating however long it
-  holds: a full container is the gate *working*. The condition worth paging on is
-  the reap alarm's, above.
+  streak-limited like the poll firewall. A queue that keeps *moving* never
+  escalates however long it holds: a full container handing out freed slots is
+  the gate working, and paging on it would make normal load look like a leak.
+- **A gate that spawns nothing does escalate.** Deferrals across consecutive
+  passes with **no spawn at all**, for longer than the 30-minute
+  `POLL_ESCALATE_SECONDS` window, switch the line to `WARNING` naming how long
+  nothing has started. That is a different subject from a deferred round (which
+  still pages nobody): it is a review outage, and the reap alarm can miss it
+  entirely — a **busy** session is never reaped whatever its PR's state, a
+  hand-spawned `review-pr-<n>` on an **open** PR is outside the reaper's scope
+  by design, and an undecidable session is spared every poll. Four such sessions
+  against the shipped defaults is a permanently shut gate under a silent alarm
+  (`reap_session_cap` 6 > 4), and the gated rounds write no ledger row, so the
+  stale-round probe cannot see them either. Any single spawn clears it.
 - **Alarm coherence.** `Config.build` refuses a config whose `reap_session_cap`
   sits below `max_concurrent_sessions` — an alarm under the limit pages on
   healthy load. **Upgrade note:** a config that already sets `reap_session_cap`
@@ -539,11 +550,11 @@ console sidecar below can render live daemon state without spending any GitHub A
 budget of its own (the UI-1 pattern ported from the devloop). Each row carries
 the timestamp, the pass duration in ms, the candidate count, the decision-summary
 counts (`spawned`, `stale_reenqueued`, `in_flight`, `deferred`, `queued`,
-`converged`, `capped`, `escalated`, `skipped`) and the reap count, plus a JSON column of the
-pass's per-item stages (PR slug and number, round, session name, current stage,
-reason, task ref). It is built entirely from the per-PR decisions already in hand
-— **no extra GitHub calls** — and the table is self-bounding: the newest 1,000
-rows are kept and older ones pruned on every write.
+`converged`, `capped`, `escalated`, `skipped`) and the reap count, plus a JSON
+column of the pass's per-item stages (PR slug and number, round, session name,
+current stage, reason, task ref). It is built entirely from the per-PR decisions
+already in hand — **no extra GitHub calls** — and the table is self-bounding:
+the newest 1,000 rows are kept and older ones pruned on every write.
 
 A snapshot **observes** a pass; it is not an action the daemon takes, so it is
 written in `--dry-run` too (where the counts and stages reflect what *would* have

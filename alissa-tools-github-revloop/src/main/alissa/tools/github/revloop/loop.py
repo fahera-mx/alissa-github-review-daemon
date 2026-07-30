@@ -155,6 +155,34 @@ DEFERRAL_SUMMARY = (
     "attempt, and the oldest waiter takes the next free slot."
 )
 
+# What the summary becomes once the gate has been shut, with NOTHING spawning,
+# for longer than POLL_ESCALATE_SECONDS (PR #71 round-1 [major]). Deferral
+# itself is never page-worthy -- a container at its limit that keeps handing
+# out freed slots is the gate working -- but a gate that has spawned nothing
+# for half an hour is not that. Three session classes can hold it shut with the
+# reap alarm silent: a BUSY session is never reaped whatever its PR's state, a
+# hand-spawned `review-pr-<n>` on an OPEN PR is out of the reaper's scope by
+# design (issue #46), and an undecidable session is spared every poll. Four of
+# those against the shipped defaults (limit 4, alarm 6) is a fleet-wide review
+# outage that no other channel reports: the gated rounds write no ledger row,
+# so the stale-round probe cannot see them either.
+DEFERRAL_STALLED = (
+    "spawn gate: %d round(s) deferred — %d/%d reviewer sessions live, and "
+    "NOTHING has spawned for %.0f min. %s This is no longer back-pressure "
+    "doing its job: the reap sweep never frees a busy session, and never "
+    "frees a hand-spawned review-pr-<n> on an open PR, so a wedged session "
+    "holds its slot indefinitely — check the sweep's survivors above."
+)
+
+# The recovery line for an ESCALATED stall: the gate started something again
+# while rounds are still waiting. Logged unconditionally, outside the streak
+# limit, on the rule _note_ledger_writable states -- the operator's last word
+# on a degraded daemon must not be the degradation.
+GATE_STALL_CLEARED = (
+    "spawn gate: spawning again after %d pass(es) over %.0f min with nothing "
+    "started — %d round(s) still waiting, and the queue is moving"
+)
+
 # The recovery line, logged once when a deferral streak ends -- the operator's
 # only evidence in the log that a queue drained on its own.
 DEFERRAL_CLEARED = (
@@ -1095,8 +1123,18 @@ class ReviewWatcher:
         self._waiting: dict[tuple[str, int], Waiting] = {}
         self._wait_seq = 0
         # Consecutive passes that deferred at least one round -- the summary
-        # line's streak limiter.
+        # line's streak limiter, and ONLY that. It never escalates: a queue
+        # that keeps draining is the gate working, and a wave permanently
+        # larger than the limit would otherwise page forever on a daemon that
+        # is reviewing everything, just serially.
         self._gate_streak = Streak()
+        # Consecutive passes that deferred a round and spawned NOTHING -- the
+        # escalating one (PR #71 round-1 [major]). Cleared by any spawn,
+        # because a spawn is the proof the queue is moving; once it outlasts
+        # POLL_ESCALATE_SECONDS the summary switches to DEFERRAL_STALLED at
+        # WARNING. Separate from the limiter above so the predicate that pages
+        # is "the gate is stuck", not "the gate is busy".
+        self._gate_stall = Streak()
         # Consecutive passes refused by the ledger gate in poll_once, and when
         # the refusal began -- the same streak-limit-then-escalate shape the
         # poll firewall uses, for the same reason: a read-only volume refuses
@@ -1469,44 +1507,82 @@ class ReviewWatcher:
         )
 
     def _note_deferrals(self, results: list[tuple[str, Decision]]) -> None:
-        """One streak-limited INFO line per pass summarizing the gate.
+        """One streak-limited line per pass summarizing the gate.
 
-        INFO, never WARNING, and it never escalates however long the streak
-        runs: a full container is the gate WORKING. The condition an operator
-        must be paged about is the one the reap alarm already owns (sessions
-        that will not go away), and duplicating it here would make normal load
-        indistinguishable from a leak.
+        INFO while the queue MOVES -- a full container that keeps handing out
+        freed slots is the gate working, and paging on it would make normal
+        load indistinguishable from a leak. It escalates to WARNING on a
+        different predicate: passes that deferred and spawned NOTHING,
+        consecutively, for longer than POLL_ESCALATE_SECONDS. That is not
+        back-pressure, it is a review outage the reap alarm can miss entirely
+        (see DEFERRAL_STALLED), and this module's own rule for it is stated at
+        _note_ledger_unwritable: a daemon that is up, polling, and deciding
+        nothing is the most misleading state it can be in.
+
+        The two are separate streaks on purpose. One spawn proves the queue is
+        moving and clears the stall, but it does NOT end the deferral episode
+        the log limiter is rationing -- collapsing them would either page on a
+        draining wave or reset the limiter every pass and log one line per
+        poll, which is the spam the summary exists to avoid.
         """
+        now = time.monotonic()
         held = [(slug, d) for slug, d in results if d.action is Action.QUEUED]
         if not held:
-            ended = self._gate_streak.resolve(time.monotonic())
+            self._gate_stall.clear()
+            ended = self._gate_streak.resolve(now)
             if ended is not None:
                 passes, seconds = ended
                 log.info(DEFERRAL_CLEARED, passes, seconds / 60)
             return
 
-        should_log, _ = self._gate_streak.record(time.monotonic())
+        should_log, _ = self._gate_streak.record(now)
+        if any(d.action is Action.SPAWNED for _, d in results):
+            # The queue is draining: rounds waited, but a slot freed and the
+            # oldest waiter took it. Whatever the backlog, this is not a stall.
+            # A stall that had ESCALATED says so out loud on its way out, past
+            # the streak limit -- otherwise the last word an operator has on
+            # the gate is a WARNING the daemon has already recovered from.
+            escalated = self._gate_stall.escalated
+            ended = self._gate_stall.resolve(now)
+            if escalated and ended is not None:
+                passes, seconds = ended
+                log.info(GATE_STALL_CLEARED, passes, seconds / 60, len(held))
+        else:
+            _, crossing = self._gate_stall.record(now)
+            # The crossing BYPASSES the streak limit, on the same reasoning as
+            # the ledger gate's: it is a state change, and suppressing it would
+            # hide the one transition the line exists to show.
+            should_log = should_log or crossing
         if not should_log:
             return
         # A round is only ever deferred against a census the gate could read,
         # so this is never the fallback -- an unreadable count fails open and
         # produces no deferrals at all.
         live = self._session_census or 0
+        waiting = "Waiting, oldest first: " + ", ".join(
+            slug for slug, _ in sorted(
+                held,
+                key=lambda item: self._waiting.get(
+                    _slug_key(item[0]), Waiting(seq=0, since=0.0)
+                ).seq,
+            )
+        ) + "."
+        if self._gate_stall.escalated:
+            log.warning(
+                DEFERRAL_STALLED,
+                len(held),
+                live,
+                self.config.max_concurrent_sessions,
+                self._gate_stall.held(now) / 60,
+                waiting,
+            )
+            return
         log.info(
             DEFERRAL_SUMMARY,
             len(held),
             live,
             self.config.max_concurrent_sessions,
-            "Waiting, oldest first: "
-            + ", ".join(
-                slug for slug, _ in sorted(
-                    held,
-                    key=lambda item: self._waiting.get(
-                        _slug_key(item[0]), Waiting(seq=0, since=0.0)
-                    ).seq,
-                )
-            )
-            + ".",
+            waiting,
         )
 
     # -- native verdict post -----------------------------------------------
@@ -2684,6 +2760,13 @@ class ReviewWatcher:
         completed_cache: dict[tuple[str, int, str | None], float | None] = {}
         holdouts: dict[str, str] = {}
         reaped: list[str] = []
+        # Dry-run only: what a production sweep would have killed here. The
+        # spawn gate's census has to be seeded with production's slot count or
+        # `--dry-run` reports rounds QUEUED that production would spawn -- the
+        # opposite error to the one _spawn's self-increment fixes, in the one
+        # tool an operator reaches for during exactly this incident class (PR
+        # #71 round-1 [minor]). Empty in production, where `reaped` carries it.
+        would_reap: list[str] = []
 
         for ses in sessions:
             idle_for = time.time() - ses.last_activity
@@ -2731,6 +2814,7 @@ class ReviewWatcher:
             if self.config.dry_run:
                 log.info("[dry-run] would reap reviewer session %s (%s)", ses.name, evidence)
                 holdouts[ses.name] = f"dry-run: would have reaped ({evidence})"
+                would_reap.append(ses.name)
                 continue
             try:
                 self.alissa.kill_session(ses.name)
@@ -2745,7 +2829,7 @@ class ReviewWatcher:
             reaped.append(ses.name)
             log.info("reaped reviewer session %s (%s)", ses.name, evidence)
 
-        self._check_session_cap(sessions, reaped, holdouts)
+        self._check_session_cap(sessions, reaped, holdouts, would_reap)
         return len(reaped)
 
     def _hold(self, holdouts: dict[str, str], ses: ManagedSession, why: str) -> None:
@@ -2908,6 +2992,7 @@ class ReviewWatcher:
         sessions: list[ManagedSession],
         reaped: list[str],
         holdouts: dict[str, str],
+        would_reap: list[str] | None = None,
     ) -> None:
         """Page-worthy log when the sweep is not keeping up.
 
@@ -2939,7 +3024,19 @@ class ReviewWatcher:
         # list the alarm counts: what the sweep could not free is exactly what
         # is still holding CPU when the gate decides. Seeded here so the gate
         # never runs its own `alissa tmux ls`.
-        self._census_probed, self._session_census = True, len(remaining)
+        #
+        # `would_reap` is the dry-run correction and nothing else: a dry-run
+        # sweep kills nothing, so without it the census counts slots production
+        # would have freed and the diagnostic reports rounds gated that
+        # production spawns. Deliberately NOT subtracted from `remaining`
+        # below -- the alarm's own count is documented as "sessions this pass
+        # could not free", and a dry-run pass genuinely freed none of them
+        # (each carries a `dry-run: would have reaped` holdout reason that says
+        # so). That reading predates the gate; the census is the part the gate
+        # owns.
+        pretend = set(would_reap or ())
+        self._census_probed = True
+        self._session_census = sum(1 for name in remaining if name not in pretend)
         if len(remaining) <= self.config.reap_session_cap:
             self._paged_cap = None
             return
