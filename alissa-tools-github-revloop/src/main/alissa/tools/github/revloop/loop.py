@@ -3031,13 +3031,15 @@ class ReviewWatcher:
         #
         # So the gate is above everything, including the reap sweep (a kill is
         # a side effect and record_reap is a correctness write). The pass takes
-        # no decisions and returns empty; the loop stays alive and keeps
-        # probing. One race remains and is deliberate: a volume that flips
-        # read-only BETWEEN this probe and record_spawn costs one duplicate,
-        # which is the pre-firewall blast radius, and every pass after it is
-        # gated. Closing it would mean recording before enqueuing, which trades
-        # this for an orphan row that wedges the round for a full stale window
-        # on any enqueue failure.
+        # no decisions and raises LedgerUnwritable -- a SIGNAL, not an empty
+        # result, because neither caller can act correctly on a bare `[]`: see
+        # that class's docstring. The loop stays alive and keeps probing. One
+        # race remains and is deliberate: a volume that flips read-only BETWEEN
+        # this probe and record_spawn costs one duplicate, which is the
+        # pre-firewall blast radius, and every pass after it is gated. Closing
+        # it would mean recording before enqueuing, which trades this for an
+        # orphan row that wedges the round for a full stale window on any
+        # enqueue failure.
         # DRY-RUN IS EXEMPT, and vacuously so: it already suppresses every side
         # effect AND every correctness write (`_spawn` skips record_spawn, the
         # reaper logs instead of killing, the drift/cap-out/deferral paths
