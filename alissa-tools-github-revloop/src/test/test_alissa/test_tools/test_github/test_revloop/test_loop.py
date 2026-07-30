@@ -65,6 +65,7 @@ from alissa.tools.github.revloop.loop import (
     Action,
     ReviewWatcher,
     checks_hold_kind,
+    checks_unsettled_kind,
     deferral_activity_kind,
     drift_probe_kind,
     identity_drift_kind,
@@ -74,6 +75,7 @@ from alissa.tools.github.revloop.loop import (
     verdict_post_kind,
 )
 from alissa.tools.github.revloop.proc import CommandError
+from alissa.tools.github.revloop import state as state_module
 from alissa.tools.github.revloop.state import State
 
 OWNER, REPO, NUMBER = "acme", "widgets", 7
@@ -180,10 +182,26 @@ class FakeGitHub:
     def submit_review(self, owner, repo, number, *, event, body, commit_id=None):
         """Mirrors GitHub.submit_review: assert the identity, then land a real
         review record — so a posted verdict shows up in my_reviews exactly as
-        GitHub would show it on the next poll."""
+        GitHub would show it on the next poll.
+
+        AND what GitHub does next: submitting a review as the requested identity
+        CONSUMES the pending review request, whatever the event is (the loop's
+        whole edge-trigger design rests on this, and studio #210 ran three
+        comment-mode rounds through it). Since the search IS
+        `review-requested:@me`, that drops the PR out of `review_requests` too.
+        Modelled here so no test can assert a re-entry that production would
+        never get.
+        """
         self.assert_review_identity()
         if self.submit_error:
             raise self.submit_error
+        self._pr = dataclasses.replace(
+            self._pr,
+            requested_reviewers=tuple(
+                r for r in self._pr.requested_reviewers if r != self.login
+            ),
+        )
+        self.requests = [r for r in self.requests if r != (owner, repo, number)]
         self.submitted.append(
             {"event": event, "body": body, "commit_id": commit_id}
         )
@@ -3486,13 +3504,19 @@ def test_a_red_rollup_verdict_does_not_converge_the_loop(config, no_post_grace):
 
 
 def test_a_later_green_round_approves_the_same_code(config, no_post_grace):
-    """The whole point of not converging: CI goes green, the next round runs,
-    and it approves — no new commit required."""
+    """The whole point of not converging: the implementer re-requests, CI is
+    green by then, the next round runs and approves — no new commit required.
+
+    The re-request is explicit because it has to be: submitting round 1's
+    verdict consumed the pending request (the fake models that), so the PR is
+    out of the poll set until someone asks again."""
     st = State(config.state_db)
     w, gh, al = envelope_ahead(config, VERDICT_APPROVE, state=st)
     gh.default_rollup = rollup_of([failing_check()])
     w.evaluate(OWNER, REPO, NUMBER)  # round 1: red, REQUEST_CHANGES
+    assert gh.requests == [], "the verdict consumed the review request"
 
+    gh.requests = [(OWNER, REPO, NUMBER)]  # the DEV side re-requests
     gh.default_rollup = rollup_of([CheckContext("test", "success")])
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED, "round 2 is owed"
     al.verdict_count = 2  # round 2's envelope lands, approve again
@@ -3557,7 +3581,10 @@ def test_a_pending_rollup_holds_the_round_open_without_posting(config, no_post_g
     assert d.action is Action.AWAITING_POST
     assert gh.submitted == [], "no verdict at all while the checks run"
     assert "pending" in d.reason
-    assert st.get_verdict_post(SLUG, NUMBER, 1)["checks_held_at"] is not None
+    assert st.checks_hold(SLUG, NUMBER, 1) == (
+        st.get_verdict_post(SLUG, NUMBER, 1)["checks_held_at"],
+        CHECKS_PENDING,
+    )
 
 
 def test_a_held_round_posts_normally_once_the_checks_go_green(config, no_post_grace):
@@ -3594,8 +3621,7 @@ def test_a_held_round_notes_the_wait_once_and_posts_no_comment(config, no_post_g
 
 
 def test_a_rollup_that_never_concludes_degrades_to_a_comment(config, no_post_grace):
-    """Past the bound the verdict is recorded, but never as an approve: the
-    round leaves a readable record and stays re-enterable."""
+    """Past the bound the verdict is recorded, but never as an approve."""
     st = State(config.state_db)
     impatient = dataclasses.replace(config, checks_wait_seconds=0)
     w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE, state=st)
@@ -3607,9 +3633,46 @@ def test_a_rollup_that_never_concludes_degrades_to_a_comment(config, no_post_gra
     assert gh.submitted[0]["event"] == "COMMENT"
     assert "never concluded" in gh.submitted[0]["body"]
     assert "`test`" in gh.submitted[0]["body"]
+    assert "re-request review" in gh.submitted[0]["body"], "says how to re-enter"
 
-    # ...and the comment verdict converges nothing: round 2 is owed.
+    # ...and it converges nothing, so a re-requested round 2 is owed.
+    gh.requests = [(OWNER, REPO, NUMBER)]
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+
+
+def test_a_degraded_verdict_pages_the_operator_exactly_once(config, no_post_grace):
+    """The degraded COMMENT consumes the review request, so nothing re-enters
+    the loop on its own — the round owes the operator one loud page rather than
+    a re-request nobody is prompted to make."""
+    st = State(config.state_db)
+    impatient = dataclasses.replace(config, checks_wait_seconds=0)
+    w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE, state=st)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.requests == [], "GitHub consumed the request when the review landed"
+    pages = [c for c in operator_comments(gh) if "could not approve" in c]
+    assert len(pages) == 1, pages
+    assert "re-request review from `alissa-app`" in pages[0]
+    assert "waiver" in pages[0], "names the operator's other option"
+    assert st.pinged(SLUG, NUMBER, checks_unsettled_kind(1, "abc123"))
+
+    # A re-requested round that degrades AGAIN is a new round, and pages again;
+    # the same round re-evaluated does not.
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert len([c for c in operator_comments(gh) if "could not approve" in c]) == 1
+
+
+def test_a_red_verdict_does_not_page_the_operator(config, no_post_grace):
+    """REQUEST_CHANGES is exactly the signal the DEV fix/re-request flow
+    consumes, so the red path re-enters by itself and a page would be noise."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    gh.default_rollup = rollup_of([failing_check()])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert operator_comments(gh) == []
 
 
 def test_an_unreadable_rollup_is_never_treated_as_green(config, no_post_grace):
@@ -3621,24 +3684,66 @@ def test_an_unreadable_rollup_is_never_treated_as_green(config, no_post_grace):
 
     assert gh.submitted[0]["event"] == "COMMENT"
     assert "403" in gh.submitted[0]["body"], "says why it could not be read"
+    assert "checks: read" in gh.submitted[0]["body"], "and how to fix it"
     assert d.action is Action.POSTED
 
 
-def test_a_missing_commit_is_left_to_the_pinned_head_handling(config, no_post_grace):
-    """A commit that is gone from the repo is not a CI answer. Holding on it
-    would stall a round the force-push path already knows how to release."""
+def test_a_404_rollup_holds_and_degrades_like_any_unreadable_one(config, no_post_grace):
+    """A 404 is NOT read as "the commit is gone" — it also answers "this token
+    cannot see this repo", and the branch that stepped aside on that substring
+    posted an ungated APPROVE on a head whose rollup was never read. The
+    force-push case is still released: the degraded post gets the same 422 and
+    reaches _abandon_verdict, which proves absence from the commit list."""
     st = State(config.state_db)
     w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
     gh.default_rollup = CheckRollup(
-        CHECKS_UNKNOWN, unreadable="CommandError: 404 Not Found", commit_missing=True
+        CHECKS_UNKNOWN, unreadable="CommandError: 404 Not Found"
     )
-    gh.commits = ["def456"]  # the judged head is not in the PR any more
+
+    held = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert held.action is Action.AWAITING_POST, "held, never approved"
+    assert gh.submitted == []
+    assert st.checks_hold(SLUG, NUMBER, 1)[1] == CHECKS_UNKNOWN
+
+    # At the bound, on a head a force-push really did remove: the COMMENT post
+    # is rejected and the existing pinned-head handling releases the round.
+    w.config = dataclasses.replace(w.config, checks_wait_seconds=0)
+    gh.commits = ["def456"]
     gh.submit_error = CommandError(["gh"], 1, "422 Unprocessable Entity: commit_id")
 
-    d = w.evaluate(OWNER, REPO, NUMBER)
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ABANDONED
 
-    assert d.action is Action.ABANDONED
-    assert st.get_verdict_post(SLUG, NUMBER, 1)["checks_held_at"] is None
+
+def test_a_transient_unreadable_poll_does_not_eat_the_pending_bound(
+    config, no_post_grace, monkeypatch
+):
+    """The bound is defined against the first observation of the condition being
+    waited on, and a flaky read is not that observation — so the clock restarts
+    once when an `unknown` hold is promoted to a `pending` one."""
+    st = State(config.state_db)
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(loop_module.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+
+    gh.default_rollup = CheckRollup(CHECKS_UNKNOWN, unreadable="CommandError: 502")
+    w.evaluate(OWNER, REPO, NUMBER)  # transient: the provisional clock starts
+
+    clock["t"] += 25 * 60  # 25 min later the checks are genuinely running
+    gh.default_rollup = rollup_of([running_check("test")])
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert st.checks_hold(SLUG, NUMBER, 1) == (int(clock["t"]), CHECKS_PENDING)
+
+    clock["t"] += 20 * 60  # 20 min of REAL pending: still inside the 30m bound
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
+    assert gh.submitted == [], "the suite still has its bound to finish in"
+
+    # ...and the promotion happens at most once: flapping back does not restart.
+    stamp = st.checks_hold(SLUG, NUMBER, 1)[0]
+    gh.default_rollup = CheckRollup(CHECKS_UNKNOWN, unreadable="CommandError: 502")
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert st.checks_hold(SLUG, NUMBER, 1)[0] == stamp
 
 
 def test_a_request_changes_verdict_is_never_gated_on_checks(config, no_post_grace):
@@ -3681,6 +3786,12 @@ def test_the_dry_run_pass_reports_the_gate_without_acting(config, no_post_grace)
     assert gh.submitted == []
     assert "red" in d.reason, "dry-run diagnoses the gate rather than staying silent"
     assert st.get_verdict_post(SLUG, NUMBER, 1) is None, "and writes no ledger row"
+
+    # ...once per round per head, not every poll: the dry-run branch returns
+    # before any ledger bookkeeping, so the dedupe has to be in-memory.
+    for _ in range(3):
+        w.evaluate(OWNER, REPO, NUMBER)
+    assert gh.rollup_reads == ["abc123"]
 
 
 def test_the_wait_bound_default_is_pinned():
@@ -3786,49 +3897,134 @@ def test_a_failure_outranks_a_still_running_check():
     assert [c.name for c in rollup.failing] == ["test"]
 
 
-def test_an_unreadable_rollup_reports_why_and_never_raises():
-    gh = GitHub("alissa-app")
-    gh._api = lambda *a, **k: (_ for _ in ()).throw(
-        CommandError(["gh"], 1, "403 Resource not accessible")
-    )
+def test_a_403_read_degrades_the_verdict_instead_of_aborting_the_pass(monkeypatch):
+    """Asserted BELOW `_api`, on purpose: `_api` maps a bare 403 to RateLimited
+    by default, so a test that fakes `_api` itself cannot see whether this read
+    opted out — and with the default in place a credential without `checks: read`
+    aborts every poll pass and doubles run_forever's backoff instead of
+    degrading one verdict."""
 
-    rollup = gh.check_rollup(OWNER, REPO, "abc123")
+    def run_json(argv, **kwargs):
+        raise CommandError(argv, 1, "403 Resource not accessible by integration")
+
+    monkeypatch.setattr(ghclient_module, "run_json", run_json)
+    rollup = GitHub("alissa-app").check_rollup(OWNER, REPO, "abc123")
 
     assert rollup.state == CHECKS_UNKNOWN
     assert "403" in rollup.unreadable
-    assert not rollup.commit_missing
 
 
-def test_a_404_rollup_says_the_commit_is_missing():
-    gh = GitHub("alissa-app")
-    gh._api = lambda *a, **k: (_ for _ in ()).throw(
-        CommandError(["gh"], 1, "gh: Not Found (HTTP 404)")
-    )
+def test_a_404_read_is_just_unreadable_not_a_verdict(monkeypatch):
+    """No error-string special case: a 404 also answers "this token cannot see
+    this private repo", and the branch that read it as "the commit is gone"
+    stepped aside to an ungated approve."""
 
-    assert gh.check_rollup(OWNER, REPO, "abc123").commit_missing
+    def run_json(argv, **kwargs):
+        raise CommandError(argv, 1, "gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(ghclient_module, "run_json", run_json)
+    rollup = GitHub("alissa-app").check_rollup(OWNER, REPO, "abc123")
+
+    assert rollup.state == CHECKS_UNKNOWN
+    assert "404" in rollup.unreadable
 
 
-def test_a_rate_limited_rollup_still_reaches_the_backoff():
-    gh = GitHub("alissa-app")
-    gh._api = lambda *a, **k: (_ for _ in ()).throw(RateLimited("rate limit"))
+def test_a_throttled_read_still_reaches_the_backoff(monkeypatch):
+    """Opting out of the 403 mapping must not cost the case it was for: an
+    explicit throttling marker is still RateLimited, whatever the status."""
+
+    def run_json(argv, **kwargs):
+        raise CommandError(argv, 1, "You have exceeded a secondary rate limit")
+
+    monkeypatch.setattr(ghclient_module, "run_json", run_json)
 
     with pytest.raises(RateLimited):
-        gh.check_rollup(OWNER, REPO, "abc123")
+        GitHub("alissa-app").check_rollup(OWNER, REPO, "abc123")
 
 
-def test_too_many_check_runs_is_unknown_not_green():
+def rollup_api(pages, key="check_runs", total=None):
+    """A fake `_api` serving `pages` (a list of item-lists) for `key`, with the
+    endpoint's own `total_count`. The other endpoint answers empty."""
+
+    def api(*args, **kwargs):
+        path = [a for a in args if a.startswith("repos/")][0]
+        if not path.endswith("check-runs" if key == "check_runs" else "status"):
+            return {"total_count": 0, key: []}
+        page = int([a for a in args if a.startswith("page=")][0].split("=")[1])
+        items = pages[page - 1] if page <= len(pages) else []
+        count = sum(len(p) for p in pages) if total is None else total
+        return {"total_count": count, key: items}
+
+    return api
+
+
+def test_commit_statuses_are_paged_so_a_late_red_context_cannot_hide():
+    """The combined-status endpoint's default page size is 30. Unpaged, a
+    35-context commit read 30 successes and the gate approved a red head."""
+    statuses = [
+        {"context": f"ci-{i}", "state": "failure" if i == 33 else "success"}
+        for i in range(1, 36)
+    ]
     gh = GitHub("alissa-app")
-    gh._api = lambda *a, **k: {
-        "check_runs": [
-            {"name": f"job{i}", "status": "completed", "conclusion": "success"}
-            for i in range(PER_PAGE)
-        ]
-    }
+    gh._api = rollup_api([statuses[:30], statuses[30:]], key="statuses")
+
+    rollup = gh.check_rollup(OWNER, REPO, "abc123")
+
+    assert rollup.total == 35
+    assert rollup.state == CHECKS_RED
+    assert [c.name for c in rollup.failing] == ["ci-33"]
+
+
+def test_a_count_the_endpoint_will_not_serve_is_unknown_not_green():
+    """`total_count` says 40, the endpoint serves 20 and then nothing: the read
+    is incomplete, so it cannot be called green."""
+    gh = GitHub("alissa-app")
+    gh._api = rollup_api(
+        [[{"context": f"ci-{i}", "state": "success"} for i in range(20)]],
+        key="statuses",
+        total=40,
+    )
 
     rollup = gh.check_rollup(OWNER, REPO, "abc123")
 
     assert rollup.state == CHECKS_UNKNOWN
-    assert str(CHECK_RUN_PAGE_LIMIT * PER_PAGE) in rollup.unreadable
+    assert "40" in rollup.unreadable and "20" in rollup.unreadable
+
+
+def test_exactly_the_page_bound_is_a_complete_read():
+    """`total_count` is what makes the bound exact: a listing of exactly
+    CHECK_RUN_PAGE_LIMIT * PER_PAGE entries is complete, not truncated."""
+    full = [
+        [
+            {"name": f"job{p}-{i}", "status": "completed", "conclusion": "success"}
+            for i in range(PER_PAGE)
+        ]
+        for p in range(CHECK_RUN_PAGE_LIMIT)
+    ]
+    gh = GitHub("alissa-app")
+    gh._api = rollup_api(full)
+
+    rollup = gh.check_rollup(OWNER, REPO, "abc123")
+
+    assert rollup.state == CHECKS_GREEN
+    assert rollup.total == CHECK_RUN_PAGE_LIMIT * PER_PAGE
+
+
+def test_more_contexts_than_the_page_bound_is_unknown_not_green():
+    over = [
+        [
+            {"name": f"job{p}-{i}", "status": "completed", "conclusion": "success"}
+            for i in range(PER_PAGE)
+        ]
+        for p in range(CHECK_RUN_PAGE_LIMIT + 1)
+    ]
+    gh = GitHub("alissa-app")
+    gh._api = rollup_api(over)
+
+    rollup = gh.check_rollup(OWNER, REPO, "abc123")
+
+    assert rollup.state == CHECKS_UNKNOWN
+    assert str(CHECK_RUN_PAGE_LIMIT) in rollup.unreadable
 
 
 def test_a_comment_review_is_a_submitted_round_but_not_an_approval():

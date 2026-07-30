@@ -359,9 +359,7 @@ class Config:
 
         checks_wait = int(raw.get("checks_wait_seconds", cls.checks_wait_seconds))
         if checks_wait < 0:
-            raise ValueError(
-                f"checks_wait_seconds must be >= 0, got {checks_wait}"
-            )
+            raise ValueError(f"checks_wait_seconds must be >= 0, got {checks_wait}")
 
         token_env = raw.get("reviewer_token_env")
         if token_env is not None:

@@ -394,10 +394,11 @@ def test_the_new_snapshot_columns_are_altered_into_an_older_database(tmp_path):
         assert len(st.read_snapshots()) == 2
 
 
-def test_the_checks_hold_column_is_altered_into_an_older_database(tmp_path):
+def test_the_checks_hold_columns_are_altered_into_an_older_database(tmp_path):
     """Same argument one table over: a database whose `verdict_posts` predates
-    the CI gate must gain `checks_held_at` on open, and NULL is the true value
-    for every historical row (no round was ever held on checks)."""
+    the CI gate must gain `checks_held_at` and `checks_held_state` on open, and
+    NULL is the true value for every historical row (no round was ever held on
+    checks)."""
     path = tmp_path / "state.db"
     con = sqlite3.connect(str(path))
     con.executescript(
@@ -417,28 +418,30 @@ def test_the_checks_hold_column_is_altered_into_an_older_database(tmp_path):
     con.close()
 
     with State(path) as st:
-        assert st.get_verdict_post("acme/widgets", 7, 1)["checks_held_at"] is None
-        held = st.note_checks_hold("acme/widgets", 7, 1)
-        assert st.get_verdict_post("acme/widgets", 7, 1)["checks_held_at"] == held
+        assert st.checks_hold("acme/widgets", 7, 1) == (None, None)
+        held = st.record_checks_hold("acme/widgets", 7, 1, "pending")
+        assert st.checks_hold("acme/widgets", 7, 1) == (held, "pending")
 
-    # Idempotent: a second open must not try to re-ALTER the column.
+    # Idempotent: a second open must not try to re-ALTER the columns.
     with State(path) as st:
-        assert st.get_verdict_post("acme/widgets", 7, 1)["checks_held_at"] is not None
+        assert st.checks_hold("acme/widgets", 7, 1)[1] == "pending"
 
 
-def test_the_first_checks_hold_is_the_one_the_bound_is_measured_from(
-    ledger, monkeypatch
-):
-    """A timestamp refreshed on every poll would push the wait bound out
-    forever — the same bug the `first_seen_at` comment warns about."""
+def test_the_checks_hold_records_when_and_on_what(ledger, monkeypatch):
+    """The ledger remembers the stamp and its condition; WHEN to (re)stamp is
+    the gate's policy, not this table's — see loop._gate_on_checks."""
     clock = {"t": 1000.0}
     monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
     ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
 
-    first = ledger.note_checks_hold(REPO, 7, 1)
-    clock["t"] = 9000.0
+    assert ledger.checks_hold(REPO, 7, 1) == (None, None)
+    assert ledger.record_checks_hold(REPO, 7, 1, "unknown") == 1000
+    assert ledger.checks_hold(REPO, 7, 1) == (1000, "unknown")
 
-    assert ledger.note_checks_hold(REPO, 7, 1) == first == 1000
+    clock["t"] = 9000.0
+    assert ledger.record_checks_hold(REPO, 7, 1, "pending") == 9000
+    assert ledger.checks_hold(REPO, 7, 1) == (9000, "pending")
+    assert ledger.read_verdict_posts(1)[0]["checks_held_state"] == "pending"
 
 
 def test_an_abandoned_verdict_post_is_terminal(ledger):

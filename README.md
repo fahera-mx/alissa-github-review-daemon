@@ -211,15 +211,25 @@ rollup is the same error as stamping an old verdict onto a new head):
 | --- | --- |
 | success — including `skipped`/`neutral` contexts (path-filtered matrix jobs) and commits with no checks at all | approves exactly as before |
 | still running, or unreadable | **holds** the round open, re-checking each poll, up to `checks_wait_seconds`; one log line per poll and **one** note in the activity comment, no comment of its own |
-| still unsettled at that bound | records the verdict as a `COMMENT` saying the checks never concluded — never an approve on an unverified head — and the round stays re-enterable |
+| still unsettled at that bound | records the verdict as a `COMMENT` saying the checks never concluded — never an approve on an unverified head — **and pages the operator once**, see below |
 | failure/error | posts `REQUEST_CHANGES` leading with the failing check names and run URLs, and no approve |
 
-Two consequences worth stating:
+Three consequences worth stating:
 
 - a non-approve verdict the daemon posted at the current head **outranks the
   approve envelope behind it** for convergence, so a gated round does not
-  converge the loop: re-request review and a later round approves the same code
+  converge the loop: **on a re-request**, a later round approves the same code
   once CI is green (no new commit required);
+- **a degraded `COMMENT` cannot re-enter the loop by itself, so it pages.**
+  GitHub consumes a pending review request when the requested identity submits
+  *any* review, comment-mode included — that is the same edge-trigger the whole
+  loop is built on — so the PR leaves `review-requested:@me` the moment the
+  degraded verdict lands, and a `COMMENT` is not what the DEV fix flow keys on.
+  The daemon therefore posts one operator comment per (round, head) naming the
+  rollup, the fact that nothing further is queued, and the two ways back in
+  (conclude/fix the checks and re-request review, or merge with a recorded
+  waiver). The red path needs none of this: `REQUEST_CHANGES` *is* the signal
+  that flow consumes;
 - the gate only ever shapes revloop's **own verdict**. It adds and removes no
   labels — `alissa:maintain` and every other cross-daemon trigger stays an
   operator/devloop concern — and `REQUEST_CHANGES` verdicts are not gated at
@@ -264,7 +274,7 @@ Leave it on `skip` unless you want unattended clones.
 | that post keeps failing | retried with a growing backoff, paged after 5 attempts — the round stays open |
 | the head that round judged is gone (force-push) | the post is abandoned and the round released — a fresh round is owed against the new head |
 | an approve verdict, but the judged head's CI rollup is red | `REQUEST_CHANGES` leading with the failing checks — never an approve on a red head |
-| an approve verdict, but the checks are still running | the round is held open (bounded by `checks_wait_seconds`), then recorded as a `COMMENT` if they never conclude |
+| an approve verdict, but the checks are still running | the round is held open (bounded by `checks_wait_seconds`), then recorded as a `COMMENT` if they never conclude — plus one operator page, since a comment-mode verdict consumes the review request and nothing re-enters on its own |
 | approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | converged, and the daemon's own review request is *still* pending | that request is withdrawn, so the closed round leaves the poll set — see below |

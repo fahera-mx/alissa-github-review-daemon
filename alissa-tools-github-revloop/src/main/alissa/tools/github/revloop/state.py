@@ -113,6 +113,14 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     -- distance from the first observation rather than from whenever the last
     -- poll happened to land. NULL means the gate never held this round.
     checks_held_at INTEGER,
+    -- WHICH unsettled condition that stamp belongs to ('pending' -- checks are
+    -- genuinely running -- or 'unknown' -- the rollup could not be read). The
+    -- bound is defined against the first observation of the condition being
+    -- waited on, and a transient read error is not that observation, so the
+    -- clock gets exactly one restart when an 'unknown' hold is promoted to a
+    -- 'pending' one. The policy lives in loop._gate_on_checks; this column is
+    -- what lets it be decided from the ledger instead of from memory.
+    checks_held_state TEXT,
     review_url    TEXT,
     last_error    TEXT,
     PRIMARY KEY (repo, number, round)
@@ -152,7 +160,10 @@ _ADDED_COLUMNS = {
         ("awaiting_post", "INTEGER NOT NULL DEFAULT 0"),
         ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
     ),
-    "verdict_posts": (("checks_held_at", "INTEGER"),),
+    "verdict_posts": (
+        ("checks_held_at", "INTEGER"),
+        ("checks_held_state", "TEXT"),
+    ),
 }
 
 
@@ -498,30 +509,40 @@ class State:
         row = self.get_verdict_post(repo, number, round_)
         return int(row["attempts"]) if row else 0
 
-    def note_checks_hold(self, repo: str, number: int, round_: int) -> int:
-        """Stamp (once) when this round's approve was first held on CI, and
-        return that first-observation timestamp.
+    def checks_hold(
+        self, repo: str, number: int, round_: int
+    ) -> "tuple[int | None, str | None]":
+        """When this round's approve was first held on CI, and on WHICH
+        condition -- (None, None) if it has never been held.
 
-        The wait bound is measured from the FIRST hold, so the UPDATE is
-        conditional on the column still being NULL: a timestamp refreshed on
-        every poll would push the bound out forever, which is the same bug the
-        `first_seen_at` comment above warns about one column over.
-
-        Returns `now` when there is no row to stamp -- unreachable through the
-        verdict path, which notes the owed post before it ever gates, and a
-        conservative answer anyway: the caller reads it as "the hold starts now"
-        and holds rather than degrading a verdict on missing bookkeeping.
+        A read, deliberately: whether an existing stamp still applies is a
+        policy question about CI (see loop._gate_on_checks), and this table's job
+        is to remember the answer, not to make it.
         """
-        self._db.execute(
-            "UPDATE verdict_posts SET checks_held_at = ? "
-            "WHERE repo=? AND number=? AND round=? AND checks_held_at IS NULL",
-            (int(time.time()), repo, number, round_),
-        )
-        self._db.commit()
         row = self.get_verdict_post(repo, number, round_)
         if row is None or not row["checks_held_at"]:
-            return int(time.time())
-        return int(row["checks_held_at"])
+            return None, None
+        return int(row["checks_held_at"]), (row["checks_held_state"] or None)
+
+    def record_checks_hold(
+        self, repo: str, number: int, round_: int, condition: str
+    ) -> int:
+        """Start (or restart) the hold clock for this round; return the stamp.
+
+        The caller decides WHEN to call this -- once when the hold begins, and at
+        most once more when an unreadable hold is promoted to a genuinely pending
+        one, because the bound is defined against the first observation of the
+        condition actually being waited on. Unconditional here so that policy
+        stays in one place instead of being half-expressed as a WHERE clause.
+        """
+        now = int(time.time())
+        self._db.execute(
+            "UPDATE verdict_posts SET checks_held_at = ?, checks_held_state = ? "
+            "WHERE repo=? AND number=? AND round=?",
+            (now, condition, repo, number, round_),
+        )
+        self._db.commit()
+        return now
 
     def record_verdict_post_abandoned(
         self, repo: str, number: int, round_: int, why: str
@@ -582,7 +603,7 @@ class State:
         return self._read_rows(
             "SELECT repo, number, round, first_seen_at, head_sha, attempts, "
             "last_attempt_at, posted_at, abandoned_at, checks_held_at, "
-            "review_url, last_error "
+            "checks_held_state, review_url, last_error "
             "FROM verdict_posts "
             "ORDER BY first_seen_at DESC, number DESC",
             limit,

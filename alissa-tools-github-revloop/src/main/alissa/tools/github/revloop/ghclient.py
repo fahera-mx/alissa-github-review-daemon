@@ -106,17 +106,11 @@ _STATUS_CONCLUSIONS = {
     "pending": "",
 }
 
-# How many pages of check runs a rollup read will walk. A matrix job set can be
-# large; it cannot plausibly be 500 runs on one commit, and a bound is what
-# keeps a pathological commit from stalling a poll pass. Past it the rollup is
-# UNKNOWN rather than green -- a partial read cannot support an approve.
+# How many pages either rollup listing will walk. A matrix job set can be large;
+# it cannot plausibly be 500 contexts on one commit, and a bound is what keeps a
+# pathological commit from stalling a poll pass. Past it the rollup is UNKNOWN
+# rather than green -- a partial read cannot support an approve.
 CHECK_RUN_PAGE_LIMIT = 5
-
-# `gh` stderr that says the commit itself is not there. The gate then steps
-# aside: a verdict pinned to a commit the repo no longer serves is the
-# force-push case, and it already has handling (loop._abandon_verdict) that
-# runs off the review POST's own rejection.
-_COMMIT_GONE_MARKERS = ("404", "not found")
 
 # The hidden marker the daemon stamps into every native verdict review it
 # submits, carrying the round it closes. Two jobs, both load-bearing:
@@ -246,11 +240,17 @@ class CheckRollup:
     failing: tuple[CheckContext, ...] = ()
     running: tuple[CheckContext, ...] = ()
     total: int = 0
-    # Why `state` is CHECKS_UNKNOWN -- an API error, or the page bound.
+    # Why `state` is CHECKS_UNKNOWN -- an API error, or the page bound. EVERY
+    # read failure lands here, including a 404: this deliberately does not try
+    # to tell "the commit is gone" from any other failure by its error string.
+    # A 404 also answers "the token cannot see this private repo", and the
+    # branch that stepped aside for a presumed force-push posted an UNGATED
+    # approve on a head whose rollup was never read -- fail-open, on a substring
+    # match, in the one component whose contract is to fail closed. The
+    # force-push case is still released: the degraded post gets the same 422
+    # from GitHub and reaches loop._abandon_verdict, which proves absence from
+    # the PR's commit list rather than trusting the message.
     unreadable: str = ""
-    # The commit is not in the repo at all. Reported instead of guessing at a
-    # rollup: the caller steps aside for the force-push handling it already has.
-    commit_missing: bool = False
 
     @property
     def summary(self) -> str:
@@ -672,71 +672,117 @@ class GitHub:
         except TruncatedListing as exc:
             return CheckRollup(CHECKS_UNKNOWN, unreadable=str(exc)[:300])
         except Exception as exc:
-            blob = str(exc).lower()
-            gone = any(marker in blob for marker in _COMMIT_GONE_MARKERS)
             return CheckRollup(
-                CHECKS_UNKNOWN,
-                unreadable=f"{type(exc).__name__}: {exc}"[:300],
-                commit_missing=gone,
+                CHECKS_UNKNOWN, unreadable=f"{type(exc).__name__}: {exc}"[:300]
             )
         return rollup_of(contexts)
 
+    def _rollup_listing(self, path: str, key: str, what: str) -> list[dict]:
+        """Page ONE rollup listing to completion, or refuse to answer.
+
+        Completeness is decided by two signals, and the pair is the point --
+        neither alone is sound here:
+
+        * the payload's own `total_count`. Verified against this repo's live
+          `check-runs` (6 runs, `total_count: 6`), and it is what makes the page
+          bound exact rather than off by one: a listing of exactly
+          CHECK_RUN_PAGE_LIMIT * PER_PAGE entries is COMPLETE and says so,
+          instead of reading as truncated because its last page happened to be
+          full.
+        * a short page, the standard end-of-listing signal, used when the
+          endpoint reports no count.
+
+        `total_count` never ends the read EARLY except by being satisfied, and a
+        page that comes back empty ends it too -- an endpoint that claims more
+        than it will serve must not spin the bound. But a count that is still
+        unsatisfied when the pages run out REFUSES: `TruncatedListing`, which
+        `check_rollup` turns into CHECKS_UNKNOWN. That is the case the finding
+        on this method was about -- an unpaged read of a 35-context commit saw
+        30 successes and called a red head green -- and the direction has to be
+        "cannot answer", never "nothing failing in what I got".
+
+        `forbidden_is_rate_limit=False` for the same reason `submit_review`
+        passes it: a 403 here is an authorization fact about the deployment (a
+        credential without `checks: read`) with its own handling one layer up,
+        and collapsing it into RateLimited would abort the whole poll pass and
+        double run_forever's backoff instead of degrading this one verdict.
+        """
+        out: list[dict] = []
+        total: int | None = None
+        for page in range(1, CHECK_RUN_PAGE_LIMIT + 1):
+            data = (
+                self._api(
+                    "-X",
+                    "GET",
+                    path,
+                    "-f",
+                    f"per_page={PER_PAGE}",
+                    "-f",
+                    f"page={page}",
+                    forbidden_is_rate_limit=False,
+                )
+                or {}
+            )
+            items = list(data.get(key) or [])
+            if total is None and isinstance(data.get("total_count"), int):
+                total = int(data["total_count"])
+            out.extend(items)
+            if total is None:
+                if len(items) < PER_PAGE:
+                    return out
+                continue
+            if len(out) >= total:
+                return out
+            if not items:
+                break
+        raise TruncatedListing(
+            f"{path} reports {total if total is not None else 'more'} {what} but "
+            f"served {len(out)} within {CHECK_RUN_PAGE_LIMIT} page(s); the rollup "
+            f"cannot be read completely, so it cannot be called green"
+        )
+
     def _check_runs(self, owner: str, repo: str, sha: str) -> list[CheckContext]:
-        """The commit's check runs, paged to CHECK_RUN_PAGE_LIMIT.
+        """The commit's check runs.
 
         A run that is not `completed` carries no conclusion here whatever its
         payload says, so "queued", "in_progress" and "waiting" all read as
         running -- the states GitHub can add to that list are exactly the ones a
         gate must not mistake for a verdict.
         """
-        out: list[CheckContext] = []
-        for page in range(1, CHECK_RUN_PAGE_LIMIT + 1):
-            data = (
-                self._api(
-                    "-X",
-                    "GET",
-                    f"repos/{owner}/{repo}/commits/{sha}/check-runs",
-                    "-f",
-                    f"per_page={PER_PAGE}",
-                    "-f",
-                    f"page={page}",
-                )
-                or {}
-            )
-            runs = data.get("check_runs") or []
-            for run_ in runs:
-                completed = str(run_.get("status") or "").lower() == "completed"
-                out.append(
-                    CheckContext(
-                        name=str(run_.get("name") or "unnamed check"),
-                        conclusion=(
-                            str(run_.get("conclusion") or "").lower()
-                            if completed
-                            else ""
-                        ),
-                        url=str(run_.get("html_url") or run_.get("details_url") or ""),
-                    )
-                )
-            if len(runs) < PER_PAGE:
-                return out
-        raise TruncatedListing(
-            f"{owner}/{repo}@{sha[:8]} has more than "
-            f"{CHECK_RUN_PAGE_LIMIT * PER_PAGE} check runs; the rollup cannot be "
-            f"read completely, so it cannot be called green"
+        runs = self._rollup_listing(
+            f"repos/{owner}/{repo}/commits/{sha}/check-runs", "check_runs", "check runs"
         )
+        out: list[CheckContext] = []
+        for run_ in runs:
+            completed = str(run_.get("status") or "").lower() == "completed"
+            out.append(
+                CheckContext(
+                    name=str(run_.get("name") or "unnamed check"),
+                    conclusion=(
+                        str(run_.get("conclusion") or "").lower() if completed else ""
+                    ),
+                    url=str(run_.get("html_url") or run_.get("details_url") or ""),
+                )
+            )
+        return out
 
     def _commit_statuses(self, owner: str, repo: str, sha: str) -> list[CheckContext]:
         """The commit's legacy statuses, one context each.
 
-        `total_count == 0` means the repo posts no commit statuses at all, and
-        the endpoint's own `state` for that case is `pending` -- which is why
-        only the `statuses` array is read and the combined state is ignored.
+        Paged like the check runs, and for a sharper reason: this endpoint's
+        default page size is 30, so the unpaged read this replaced could see 30
+        successes on a 35-context commit and call a red head green.
+
+        The combined `state` is deliberately ignored and only the `statuses`
+        array is read: the endpoint answers `state: pending` for a commit with NO
+        statuses at all (verified live: `total_count: 0`, `state: pending`), so
+        trusting it would hold every approve on every check-runs-only repo.
         """
-        data = (
-            self._api("-X", "GET", f"repos/{owner}/{repo}/commits/{sha}/status") or {}
+        statuses = self._rollup_listing(
+            f"repos/{owner}/{repo}/commits/{sha}/status", "statuses", "statuses"
         )
         out: list[CheckContext] = []
-        for status in data.get("statuses") or []:
+        for status in statuses:
             state = str(status.get("state") or "").lower()
             out.append(
                 CheckContext(
