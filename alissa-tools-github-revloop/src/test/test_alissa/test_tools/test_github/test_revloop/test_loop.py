@@ -65,11 +65,13 @@ from alissa.tools.github.revloop.loop import (
     MAX_REENTRY_ROUNDS,
     MAX_VERDICT_POST_ATTEMPTS,
     POLL_ESCALATE_SECONDS,
+    POLL_FAILURE_LOG_EVERY,
     REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
     VERDICT_POST_GRACE_SECONDS,
     Action,
+    Decision,
     ReviewWatcher,
     checks_hold_kind,
     checks_unsettled_kind,
@@ -6217,6 +6219,72 @@ def test_one_spawn_clears_the_stall_escalation(config, caplog, monkeypatch):
     assert gate and {r.levelno for r in gate} == {logging.INFO}
     assert any("spawning again after" in r.getMessage() for r in gate)
     assert any("1 round(s) still waiting" in r.getMessage() for r in gate)
+
+
+def _gate_pass(*, spawned):
+    """One poll pass's Decision list: a round the gate held, and — when the
+    queue is draining — one that took a freed slot."""
+    results = [(f"{SLUG}#11", Decision(Action.QUEUED, "waiting", 1))]
+    if spawned:
+        results.append((f"{SLUG}#12", Decision(Action.SPAWNED, "went", 1)))
+    return results
+
+
+def test_the_crossing_bypasses_the_deferral_limiter(config, caplog, monkeypatch):
+    """The stall escalation must land on the pass that CROSSES the window, not
+    on the next pass the deferral limiter happens to allow.
+
+    Driven at `_note_deferrals` because the property is about which pass logs:
+    the two streaks have to be decoupled first (a queue that drains for a while
+    and only THEN wedges — a merge wave running normally until one session goes
+    busy-forever), and by then the limiter is deep into its one-in-ten phase.
+    Without the bypass the WARNING waits for the limiter's next multiple, up to
+    POLL_FAILURE_LOG_EVERY polls of an already page-worthy outage in silence.
+
+    This is the regression `Streak`'s own docstring records this module having
+    once (PR #63 round-2): the extraction protects callers that take
+    `Streak.should_log` verbatim, and this caller cannot — it ORs one streak's
+    crossing into the other's limit — so it re-implements the bypass by hand.
+    """
+    now = {"t": 1000.0}
+    monkeypatch.setattr(loop_module.time, "monotonic", lambda: now["t"])
+    w, _, _ = _gated(config, limit=1)
+    w._session_census = 1
+    draining = 25
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(draining):
+            now["t"] += 60
+            w._note_deferrals(_gate_pass(spawned=True))
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        wedged_at, first_warning = now["t"], None
+        for wedge_pass in range(1, 41):
+            now["t"] += 60
+            w._note_deferrals(_gate_pass(spawned=False))
+            if first_warning is None and any(
+                r.levelno == logging.WARNING for r in caplog.records
+            ):
+                first_warning = wedge_pass
+                break
+
+    assert first_warning is not None, "a wedged gate must escalate"
+    # The stall streak starts on the first wedged pass, so the window closes one
+    # pass later than the tick count alone suggests.
+    assert now["t"] - wedged_at == POLL_ESCALATE_SECONDS + 60
+    # ...and that pass is NOT one the limiter would have let through on its own:
+    # the deferral streak is at 25 + first_warning, and the limiter only speaks
+    # every POLL_FAILURE_LOG_EVERY. So only the crossing can have logged it.
+    assert (draining + first_warning) % POLL_FAILURE_LOG_EVERY != 0
+
+
+def test_the_stalled_line_reports_the_observation_not_a_diagnosis(config):
+    """Four legitimately slow reviews satisfy the predicate exactly as well as a
+    wedged session does. The line may not name a cause it cannot know — it says
+    what it saw and sends the operator to the survivor list, which is the only
+    thing that tells the two apart."""
+    assert "may no longer be back-pressure" in loop_module.DEFERRAL_STALLED
+    assert "check the sweep's survivors" in loop_module.DEFERRAL_STALLED
 
 
 def test_the_dry_run_census_counts_the_slots_production_would_free(

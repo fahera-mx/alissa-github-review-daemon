@@ -166,12 +166,20 @@ DEFERRAL_SUMMARY = (
 # those against the shipped defaults (limit 4, alarm 6) is a fleet-wide review
 # outage that no other channel reports: the gated rounds write no ledger row,
 # so the stale-round probe cannot see them either.
+#
+# It states the OBSERVATION and hands the diagnosis to the operator (PR #71
+# round-2 [nit]): the predicate is "deferred and started nothing for half an
+# hour", which four legitimately slow reviews satisfy exactly as well as a
+# wedged session. Both are worth an operator's eyes at that duration, but only
+# the survivor list tells them which they have -- so the line points there
+# instead of naming a cause it cannot know.
 DEFERRAL_STALLED = (
     "spawn gate: %d round(s) deferred — %d/%d reviewer sessions live, and "
-    "NOTHING has spawned for %.0f min. %s This is no longer back-pressure "
-    "doing its job: the reap sweep never frees a busy session, and never "
-    "frees a hand-spawned review-pr-<n> on an open PR, so a wedged session "
-    "holds its slot indefinitely — check the sweep's survivors above."
+    "NOTHING has spawned for %.0f min. %s Nothing has started for long enough "
+    "that this may no longer be back-pressure doing its job: the reap sweep "
+    "never frees a busy session, and never frees a hand-spawned "
+    "review-pr-<n> on an open PR, so a wedged session holds its slot "
+    "indefinitely — check the sweep's survivors above."
 )
 
 # The recovery line for an ESCALATED stall: the gate started something again
