@@ -29,13 +29,13 @@ from alissa.tools.github.revloop.__main__ import main
 from alissa.tools.github.revloop.config import Config
 from alissa.tools.github.revloop.loop import (
     POLL_BACKOFF_CAP_SECONDS,
-    LedgerUnwritable,
-    Streak,
     POLL_ESCALATE_SECONDS,
     POLL_FAILURE_LOG_EVERY,
     POLL_FAILURE_LOG_HEAD,
+    LedgerUnwritable,
     PollFailures,
     ReviewWatcher,
+    Streak,
 )
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
