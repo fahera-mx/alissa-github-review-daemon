@@ -240,8 +240,10 @@ ARG ALISSA_REVIEWER_TOKEN_ENV=""
 ARG ALISSA_REAP_GRACE_SECONDS=""
 ARG ALISSA_REAP_SESSION_CAP=""
 # How long a round holds its APPROVE while the judged head's CI rollup is still
-# running (or unreadable) before recording the verdict as a comment instead. A
-# RED rollup never waits and never approves, whatever this says. Pass-through,
+# running (or unreadable) before recording the verdict as a comment instead --
+# PER CONDITION waited on, so an unreadable hold promoted to a pending one
+# restarts the clock once and the worst case is twice this. A RED rollup never
+# waits and never approves, whatever this says. Pass-through,
 # and it REQUIRES REVLOOP_VERSION >= 0.16.7 for the same reason the two keys
 # above it do: an older library rejects the unknown config key at load.
 ARG ALISSA_CHECKS_WAIT_SECONDS=""

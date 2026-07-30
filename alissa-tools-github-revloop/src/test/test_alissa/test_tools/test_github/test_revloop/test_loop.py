@@ -3581,9 +3581,11 @@ def test_a_pending_rollup_holds_the_round_open_without_posting(config, no_post_g
     assert d.action is Action.AWAITING_POST
     assert gh.submitted == [], "no verdict at all while the checks run"
     assert "pending" in d.reason
-    assert st.checks_hold(SLUG, NUMBER, 1) == (
+    hold = st.checks_hold(SLUG, NUMBER, 1)
+    assert (hold.first_at, hold.condition, hold.promoted) == (
         st.get_verdict_post(SLUG, NUMBER, 1)["checks_held_at"],
         CHECKS_PENDING,
+        False,
     )
 
 
@@ -3675,6 +3677,47 @@ def test_a_red_verdict_does_not_page_the_operator(config, no_post_grace):
     assert operator_comments(gh) == []
 
 
+def test_a_promoted_hold_reports_the_real_total_wait(
+    config, no_post_grace, monkeypatch, caplog
+):
+    """The bound is per condition, so a promoted hold can run up to 2x it. The
+    record has to say so: "held 30 min (30 min bound)" after 60 real minutes is
+    the verdict body being wrong about the one number an operator tunes."""
+    st = State(config.state_db)
+    clock = {"t": 2_000_000.0}
+    monkeypatch.setattr(loop_module.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st)
+
+    gh.default_rollup = CheckRollup(CHECKS_UNKNOWN, unreadable="CommandError: 502")
+    w.evaluate(OWNER, REPO, NUMBER)  # unreadable: the provisional clock starts
+
+    clock["t"] += 29 * 60  # promoted one minute before the bound would have run out
+    gh.default_rollup = rollup_of([running_check("test")])
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    clock["t"] += 30 * 60  # the promoted clock now runs its own full bound
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED
+    body = gh.submitted[0]["body"]
+    assert "30 min" in body and "59 min in total" in body, body
+    assert "59m held in total" in caplog.text, "and the log says it too"
+
+
+def test_an_unpromoted_hold_does_not_report_a_second_number(config, no_post_grace):
+    """The total-held clause is only meaningful after a promotion; on the common
+    path the two numbers are the same and repeating one is noise."""
+    impatient = dataclasses.replace(config, checks_wait_seconds=0)
+    w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "in total across both waits" not in gh.submitted[0]["body"]
+
+
 def test_an_unreadable_rollup_is_never_treated_as_green(config, no_post_grace):
     impatient = dataclasses.replace(config, checks_wait_seconds=0)
     w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE)
@@ -3704,7 +3747,7 @@ def test_a_404_rollup_holds_and_degrades_like_any_unreadable_one(config, no_post
 
     assert held.action is Action.AWAITING_POST, "held, never approved"
     assert gh.submitted == []
-    assert st.checks_hold(SLUG, NUMBER, 1)[1] == CHECKS_UNKNOWN
+    assert st.checks_hold(SLUG, NUMBER, 1).condition == CHECKS_UNKNOWN
 
     # At the bound, on a head a force-push really did remove: the COMMENT post
     # is rejected and the existing pinned-head handling releases the round.
@@ -3733,17 +3776,21 @@ def test_a_transient_unreadable_poll_does_not_eat_the_pending_bound(
     clock["t"] += 25 * 60  # 25 min later the checks are genuinely running
     gh.default_rollup = rollup_of([running_check("test")])
     w.evaluate(OWNER, REPO, NUMBER)
-    assert st.checks_hold(SLUG, NUMBER, 1) == (int(clock["t"]), CHECKS_PENDING)
+    hold = st.checks_hold(SLUG, NUMBER, 1)
+    assert (hold.since, hold.condition, hold.promoted) == (
+        int(clock["t"]), CHECKS_PENDING, True
+    )
+    assert hold.first_at == int(clock["t"]) - 25 * 60, "the first hold is kept"
 
     clock["t"] += 20 * 60  # 20 min of REAL pending: still inside the 30m bound
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
     assert gh.submitted == [], "the suite still has its bound to finish in"
 
     # ...and the promotion happens at most once: flapping back does not restart.
-    stamp = st.checks_hold(SLUG, NUMBER, 1)[0]
+    stamp = st.checks_hold(SLUG, NUMBER, 1).since
     gh.default_rollup = CheckRollup(CHECKS_UNKNOWN, unreadable="CommandError: 502")
     w.evaluate(OWNER, REPO, NUMBER)
-    assert st.checks_hold(SLUG, NUMBER, 1)[0] == stamp
+    assert st.checks_hold(SLUG, NUMBER, 1).since == stamp
 
 
 def test_a_request_changes_verdict_is_never_gated_on_checks(config, no_post_grace):

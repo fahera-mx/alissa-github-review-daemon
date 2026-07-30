@@ -15,7 +15,11 @@ import sqlite3
 import pytest
 
 from alissa.tools.github.revloop import state as state_module
-from alissa.tools.github.revloop.state import SNAPSHOT_RETENTION, State
+from alissa.tools.github.revloop.state import (
+    SNAPSHOT_RETENTION,
+    ChecksHold,
+    State,
+)
 
 REPO = "acme/widgets"
 
@@ -418,13 +422,16 @@ def test_the_checks_hold_columns_are_altered_into_an_older_database(tmp_path):
     con.close()
 
     with State(path) as st:
-        assert st.checks_hold("acme/widgets", 7, 1) == (None, None)
+        assert st.checks_hold("acme/widgets", 7, 1) == ChecksHold()
         held = st.record_checks_hold("acme/widgets", 7, 1, "pending")
-        assert st.checks_hold("acme/widgets", 7, 1) == (held, "pending")
+        hold = st.checks_hold("acme/widgets", 7, 1)
+        assert (hold.first_at, hold.condition, hold.pending_at) == (
+            held, "pending", None
+        )
 
     # Idempotent: a second open must not try to re-ALTER the columns.
     with State(path) as st:
-        assert st.checks_hold("acme/widgets", 7, 1)[1] == "pending"
+        assert st.checks_hold("acme/widgets", 7, 1).condition == "pending"
 
 
 def test_the_checks_hold_records_when_and_on_what(ledger, monkeypatch):
@@ -434,14 +441,22 @@ def test_the_checks_hold_records_when_and_on_what(ledger, monkeypatch):
     monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
     ledger.note_verdict_post_owed(REPO, 7, 1, "abc123")
 
-    assert ledger.checks_hold(REPO, 7, 1) == (None, None)
+    assert ledger.checks_hold(REPO, 7, 1) == ChecksHold()
     assert ledger.record_checks_hold(REPO, 7, 1, "unknown") == 1000
-    assert ledger.checks_hold(REPO, 7, 1) == (1000, "unknown")
+    assert ledger.checks_hold(REPO, 7, 1) == ChecksHold(1000, "unknown", None)
+    assert ledger.checks_hold(REPO, 7, 1).since == 1000
+    assert not ledger.checks_hold(REPO, 7, 1).promoted
 
+    # The promotion moves the clock the bound uses WITHOUT destroying when the
+    # round was first held — the two numbers can differ by a whole bound, and a
+    # report that keeps only one of them understates a promoted hold.
     clock["t"] = 9000.0
     assert ledger.record_checks_hold(REPO, 7, 1, "pending") == 9000
-    assert ledger.checks_hold(REPO, 7, 1) == (9000, "pending")
-    assert ledger.read_verdict_posts(1)[0]["checks_held_state"] == "pending"
+    hold = ledger.checks_hold(REPO, 7, 1)
+    assert hold == ChecksHold(1000, "pending", 9000)
+    assert hold.since == 9000 and hold.promoted
+    row = ledger.read_verdict_posts(1)[0]
+    assert row["checks_held_state"] == "pending" and row["checks_pending_at"] == 9000
 
 
 def test_an_abandoned_verdict_post_is_terminal(ledger):

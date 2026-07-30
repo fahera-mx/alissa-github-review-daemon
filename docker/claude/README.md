@@ -173,7 +173,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_ROUND_CAP` | *daemon default* (currently 10) | CR9 round cap; **pass-through** — unset ⇒ library default |
 | `ALISSA_REAP_GRACE_SECONDS` | *daemon default* (currently 1800) | how long a reviewer session must be idle **and** quiet before the reap sweep kills it; **pass-through** — unset ⇒ library default |
 | `ALISSA_REAP_SESSION_CAP` | *daemon default* (currently 6) | live reviewer sessions after a sweep above which the daemon logs page-worthy; **pass-through** — unset ⇒ library default |
-| `ALISSA_CHECKS_WAIT_SECONDS` | *daemon default* (currently 1800) | how long a round holds its approve while the judged head's CI rollup is still running before recording the verdict as a comment; a **red** rollup never waits and never approves; **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.16.7` |
+| `ALISSA_CHECKS_WAIT_SECONDS` | *daemon default* (currently 1800) | how long a round holds its approve while the judged head's CI rollup is still running before recording the verdict as a comment, **per condition waited on** (an unreadable hold promoted to a pending one restarts the clock once, so the worst case is 2×); a **red** rollup never waits and never approves; **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.16.7` |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
 | `ALISSA_AGENT_MODEL` | `opus` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |

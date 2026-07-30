@@ -115,7 +115,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `on_missing_hub` | `skip` | `skip` \| `add` — see *Provisioning new repos* |
 | `reap_grace_seconds` | `1800` | how long a reviewer session must be idle **and** quiet before the sweep reaps it (and before a stale round reads it as dead); must be **well under** the 90-minute stale-round window, which the loader enforces |
 | `reap_session_cap` | `6` | more live reviewer sessions than this after a sweep and the daemon logs page-worthy; an alarm threshold, not a capacity limit |
-| `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead; a **red** rollup never waits and never approves — see *Never approve a red head* |
+| `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead. Applies **per condition waited on**: an unreadable hold that becomes a genuine *pending* one restarts the clock once, so the worst-case hold is **twice** this. A **red** rollup never waits and never approves — see *Never approve a red head* |
 
 ### Config file discovery
 
@@ -214,6 +214,17 @@ rollup is the same error as stamping an old verdict onto a new head):
 | still unsettled at that bound | records the verdict as a `COMMENT` saying the checks never concluded — never an approve on an unverified head — **and pages the operator once**, see below |
 | failure/error | posts `REQUEST_CHANGES` leading with the failing check names and run URLs, and no approve |
 
+> **The bound is per condition, so the worst case is 2×.** An unreadable rollup
+> and a genuinely pending one are different waits: a transient read error must
+> not eat the bound a real check suite is entitled to (that was a review finding
+> against the first version), so the clock restarts **once** when an `unknown`
+> hold is promoted to a `pending` one — and never again, because a reader
+> flapping between the two would otherwise push the bound out forever. With the
+> 30-minute default, a rollup that is unreadable for 29 minutes and then starts
+> reporting a running suite is held ~59 minutes, not ~30. The daemon reports both
+> numbers (this condition, and total held) in its log line and in the degraded
+> verdict body, so the record never claims the shorter one.
+
 Three consequences worth stating:
 
 - a non-approve verdict the daemon posted at the current head **outranks the
@@ -274,7 +285,7 @@ Leave it on `skip` unless you want unattended clones.
 | that post keeps failing | retried with a growing backoff, paged after 5 attempts — the round stays open |
 | the head that round judged is gone (force-push) | the post is abandoned and the round released — a fresh round is owed against the new head |
 | an approve verdict, but the judged head's CI rollup is red | `REQUEST_CHANGES` leading with the failing checks — never an approve on a red head |
-| an approve verdict, but the checks are still running | the round is held open (bounded by `checks_wait_seconds`), then recorded as a `COMMENT` if they never conclude — plus one operator page, since a comment-mode verdict consumes the review request and nothing re-enters on its own |
+| an approve verdict, but the checks are still running | the round is held open (bounded by `checks_wait_seconds` **per condition waited on** — up to 2× it if an unreadable hold is promoted), then recorded as a `COMMENT` if they never conclude — plus one operator page, since a comment-mode verdict consumes the review request and nothing re-enters on its own |
 | approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | converged, and the daemon's own review request is *still* pending | that request is withdrawn, so the closed round leaves the poll set — see below |
