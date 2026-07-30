@@ -134,8 +134,11 @@ gh auth setup-git 2>/dev/null \
 #     but `auth login` also stores + verifies it, which is the real preflight.
 [ -n "${ALISSA_API_TOKEN:-}" ] \
   || die "no ALISSA_API_TOKEN — cannot reach tasks / session queue"
-alissa auth login --token "${ALISSA_API_TOKEN}" >/dev/null 2>&1 \
-  || die "ALISSA_API_TOKEN rejected (alissa auth login failed)"
+if ! command -v alissa >/dev/null 2>&1; then
+  die "alissa CLI missing from PATH (image-layer loss?) — cannot preflight ALISSA_API_TOKEN"
+fi
+LOGIN_ERR="$(alissa auth login --token "${ALISSA_API_TOKEN}" 2>&1 >/dev/null)" \
+  || die "alissa auth login failed: ${LOGIN_ERR:-<no output>}"
 log "alissa authenticated"
 
 # -----------------------------------------------------------------------------
