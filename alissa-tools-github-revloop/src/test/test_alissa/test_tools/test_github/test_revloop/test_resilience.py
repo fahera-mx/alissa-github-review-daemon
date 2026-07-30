@@ -29,6 +29,8 @@ from alissa.tools.github.revloop.__main__ import main
 from alissa.tools.github.revloop.config import Config
 from alissa.tools.github.revloop.loop import (
     POLL_BACKOFF_CAP_SECONDS,
+    LedgerUnwritable,
+    Streak,
     POLL_ESCALATE_SECONDS,
     POLL_FAILURE_LOG_EVERY,
     POLL_FAILURE_LOG_HEAD,
@@ -357,7 +359,11 @@ def test_the_poll_loop_completes_further_passes_over_a_readonly_ledger(tmp_path,
         _read_only(db)
         try:
             for _ in range(3):
-                assert w.poll_once() == []
+                # The refusal is a SIGNAL, not an empty result: `run_forever`
+                # has to tell it apart from "polled, nothing to do" so it does
+                # not read a pass the daemon never took as a recovery.
+                with pytest.raises(LedgerUnwritable):
+                    w.poll_once()
         finally:
             _writable(db)
 
@@ -598,3 +604,158 @@ class _StaleHandle:
 
     def close(self):
         self.closed = True
+
+
+# -- round 2: a refused pass is not a successful one ------------------------
+
+
+def test_a_gate_refused_pass_does_not_clear_the_failure_streak(tmp_path, clock, caplog):
+    """A refused pass must leave the firewall's streak EXACTLY as it was.
+
+    The gate returning normally made `run_forever` treat it as a recovery: it
+    printed "poll recovered" at the moment the daemon stopped deciding
+    anything, and re-armed POLL_ESCALATE_SECONDS for a fault that had not
+    cleared. That is the same power the RateLimited branch was stripped of --
+    a refused pass is not evidence the fault cleared, it is evidence the daemon
+    did not look.
+    """
+    caplog.set_level(logging.INFO)
+    db = tmp_path / "state.db"
+    config = Config(
+        workspace_root=tmp_path,
+        hub_template="{root}/{repo}/main",
+        state_path=db,
+        poll_interval=60,
+    )
+    missing = FileNotFoundError(2, "No such file or directory", "alissa")
+    with State(db) as ledger:
+        w = _watcher(config, [missing] * 40)
+        w.state = ledger
+        # Every 4th pass the ledger is unwritable: the flapping-volume shape.
+        real_poll, calls = w.poll_once, {"n": 0}
+
+        def flapping_poll():
+            calls["n"] += 1
+            if calls["n"] % 4 == 0:
+                w._note_ledger_unwritable()
+                raise LedgerUnwritable(str(db))
+            w._note_ledger_writable()   # as the real gate does on a live pass
+            return real_poll()
+
+        w.poll_once = flapping_poll  # type: ignore[method-assign]
+        w.run_forever()
+
+    # Specifically the FIREWALL's page, not the gate's own -- the gate escalates
+    # on its own streak either way, and matching that would pass vacuously.
+    escalations = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and "poll has failed with" in r.getMessage()
+    ]
+    assert escalations, "interleaved refusals must not cancel the fault's page"
+    assert "FileNotFoundError" in escalations[0].getMessage()
+    # ...and the daemon never claimed to have recovered while deciding nothing.
+    assert "poll recovered" not in caplog.text
+
+
+def test_a_refused_pass_resets_the_backoff_to_the_poll_interval(tmp_path, clock):
+    """Deliberate, and the counterpart of the assertion above: the streak is
+    untouched, but the CADENCE returns to normal. Probing at cadence is the
+    point of the gate -- inheriting a failing streak's 15-minute backoff would
+    leave a healed volume unnoticed that long."""
+    config = Config(
+        workspace_root=tmp_path,
+        hub_template="{root}/{repo}/main",
+        state_path=tmp_path / "state.db",
+        poll_interval=60,
+    )
+    missing = FileNotFoundError(2, "No such file or directory", "alissa")
+    w = _watcher(config, [missing, missing, LedgerUnwritable("/x"), missing])
+
+    w.run_forever()
+
+    # 120, 240 while failing; back to the interval on the refusal; doubling
+    # resumes from there.
+    assert clock.slept[:4] == [120, 240, 60, 120]
+
+
+def test_a_one_shot_over_an_unwritable_ledger_exits_non_zero(tmp_path, monkeypatch, capsys):
+    """`--once` reports rather than retries, so a refused pass must not look
+    clean to `... --once && echo ok` or to a health probe."""
+    monkeypatch.setattr(loop_module.ReviewWatcher, "preflight", lambda self: [])
+    monkeypatch.setattr(
+        loop_module.ReviewWatcher, "poll_once",
+        lambda self: (_ for _ in ()).throw(LedgerUnwritable("/vol/state.db")),
+    )
+
+    rc = main(["--once", "--workspace-root", str(tmp_path)])
+
+    err = capsys.readouterr().err
+    assert rc == 1, "1 is 'the environment failed'; 2 is reserved for a bad config"
+    assert "ledger error" in err
+    assert "/vol/state.db" in err
+    assert "no decisions were taken" in err
+
+
+def test_dry_run_is_not_gated_by_an_unwritable_ledger(tmp_path, caplog):
+    """Dry-run suppresses every side effect AND every correctness write already,
+    so the gate protects nothing there -- and refusing it would cost the
+    operator the one tool that answers "what would you do right now" during
+    exactly the incident this change is about."""
+    caplog.set_level(logging.INFO)
+    db = tmp_path / "state.db"
+    config = Config(
+        workspace_root=tmp_path,
+        hub_template="{root}/{repo}/main",
+        state_path=db,
+        dry_run=True,
+    )
+    with State(db) as ledger:
+        w = ReviewWatcher(config, github=_NoRequests(), alissa=_NoSessions(), state=ledger)
+        _read_only(db)
+        try:
+            assert w.poll_once() == []   # evaluated, not refused
+        finally:
+            _writable(db)
+
+    assert "skipping this pass entirely" not in caplog.text
+    # Its one ledger write is the snapshot, which degrades to best-effort.
+    assert "poll snapshot failed" in caplog.text
+
+
+def test_the_ledger_gate_shares_the_firewall_s_escalation_contract(tmp_path, clock, caplog):
+    """The gate's streak is the same `Streak` the firewall uses, so the
+    crossing bypasses the streak limit here too -- the hand-rolled copy landed
+    the first page-worthy line on whichever later pass happened to satisfy the
+    modulo filter instead of on the pass that crossed the window."""
+    caplog.set_level(logging.INFO)
+    config = Config(
+        workspace_root=tmp_path,
+        hub_template="{root}/{repo}/main",
+        state_path=tmp_path / "state.db",
+    )
+    w = ReviewWatcher(config, github=_NoRequests(), alissa=_NoSessions(), state=None)
+
+    # Past the log head, still inside the window: suppressed.
+    for _ in range(5):
+        w._note_ledger_unwritable()
+    before = len([r for r in caplog.records if r.levelno == logging.ERROR])
+    # The pass that crosses the window logs, whatever the modulo says.
+    clock.now += POLL_ESCALATE_SECONDS + 1
+    w._note_ledger_unwritable()
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert before == 0 and len(errors) == 1
+    assert "no longer transient" in errors[0].getMessage()
+
+
+def test_streak_is_one_implementation_for_both_users():
+    """The nit's actual contract: whatever the streak limit and escalation are,
+    both callers get the same ones, including the crossing's bypass."""
+    s = Streak()
+    logged = [s.record(float(i))[0] for i in range(1, 6)]
+
+    assert logged[:POLL_FAILURE_LOG_HEAD] == [True] * POLL_FAILURE_LOG_HEAD
+    assert logged[POLL_FAILURE_LOG_HEAD] is False
+    assert s.record(POLL_ESCALATE_SECONDS + 1) == (True, True), "crossing bypasses the limit"
+    assert s.resolve(POLL_ESCALATE_SECONDS + 2)[0] == 6
+    assert s.resolve(0.0) is None

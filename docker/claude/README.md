@@ -513,11 +513,31 @@ container is not assumed to be well-behaved any more:
 * **Telemetry never outranks the loop.** The `poll_snapshots` write — pure
   observability for the console — is best-effort: a database error is absorbed,
   retried once through a reconnect, and reported as a streak-limited `WARN`.
-  Every *other* ledger write (spawn records, escalations, pings, grants, verdict
-  posts) stays strict, because each is a dedupe key for an action the daemon
-  takes and losing one silently re-spawns a round or re-pages an operator.
+* **The daemon never takes an action it cannot record.** Before each pass it
+  probes whether the ledger can be written. If it cannot, that pass decides
+  *nothing at all* — no reviewer spawned, no operator paged, no cap granted, no
+  verdict posted, and no session reaped — and the daemon keeps probing until the
+  volume comes back, then resumes by itself.
 
-What this means operationally: a substrate fault degrades the daemon instead of
-killing it, and the log tells you which. A container that is up but logging
-`ERROR: poll has failed with … on every attempt` needs a look; one logging
-`WARN: poll failed … retrying in 120s` is riding out a blip.
+  This is the part that is easy to get wrong, so it is worth being precise about:
+  the ledger's other writes stay **strict** (they raise), but strictness is not
+  what protects you. Raising only aborts the pass that failed; the firewall then
+  hands the loop straight back to the same code, with the side effect already
+  taken. Without the gate, a read-only volume turned "queue a reviewer, then fail
+  to record it" into a *fresh reviewer agent every poll, forever*. Strictness
+  makes an unrecordable action visible; the gate is what stops it repeating.
+  (`--dry-run` is exempt — it takes no action to protect — so it still answers
+  "what would you do right now" during an incident.)
+
+What this means operationally — three states, and the third is the one that
+needs a runbook line:
+
+| log line | what it means | what to do |
+| --- | --- | --- |
+| `WARN: poll failed … retrying in 120s` | riding out a blip; still deciding | nothing |
+| `ERROR: poll has failed with … on every attempt` | same fault every poll for 30 min; still deciding, still retrying | look at it — this one is not healing |
+| `ERROR: ledger at … cannot be written` | **up, polling, and deliberately deciding nothing.** No review will be queued | fix the volume mount or its ownership; the daemon resumes on its own, no restart |
+
+A container that is up is therefore not the same as a container that is working
+— the third row is the case where everything looks healthy and no review is
+being queued at all.

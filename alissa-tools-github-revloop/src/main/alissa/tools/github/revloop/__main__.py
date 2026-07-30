@@ -19,7 +19,7 @@ from .config import (
     resolve_config_path,
 )
 from .ghclient import IdentityMismatch
-from .loop import ReviewWatcher
+from .loop import LedgerUnwritable, ReviewWatcher
 from .proc import CommandError
 
 log = logging.getLogger(__name__)
@@ -197,7 +197,8 @@ def main(argv: list[str] | None = None) -> int:
     # subprocess ENOENT or a bad response: `run_forever` now firewalls those
     # per iteration and never lets them reach here at all. The one-shot modes
     # (`--pr`, `--once`) still surface a failure to their caller, as a
-    # one-shot must.
+    # one-shot must -- including a refused pass, which leaves through the
+    # LedgerUnwritable handler below with exit 1 rather than looking clean.
     try:
         config = resolve_config(args)
         log.info("workspace: %s", config.workspace_root)
@@ -216,6 +217,20 @@ def main(argv: list[str] | None = None) -> int:
             watcher.poll_once()
         else:
             watcher.run_forever()
+    except LedgerUnwritable as exc:
+        # Only reachable from `--once`: run_forever handles its own refusals and
+        # keeps polling. A one-shot REPORTS rather than retries, so this must
+        # not look like a clean pass to `... --once && echo ok` or to a health
+        # probe. Exit 1 ("the environment failed"), not the 2 reserved for
+        # "your config is wrong" -- a config error tells you to edit a file, an
+        # unwritable ledger tells you to look at the volume mount.
+        print(
+            f"ledger error: {exc} is not writable — no decisions were taken. "
+            "The daemon refuses to spawn, escalate, grant or post what it "
+            "cannot record; fix the volume mount or its ownership.",
+            file=sys.stderr,
+        )
+        return 1
     except IdentityMismatch as exc:
         print(f"identity error: {exc}", file=sys.stderr)
         return 2
