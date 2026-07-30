@@ -15,6 +15,7 @@ without it the client inherits, exactly as it always did.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -96,6 +97,12 @@ class PullRequest:
     # "open" or "closed"; merged PRs report state "closed" AND merged True.
     state: str = "open"
     merged: bool = False
+    # Logins GitHub currently holds a pending review request against. Read off
+    # the same PR payload as everything else here, so knowing whether this
+    # daemon's own request is still dangling costs no extra call. USERS only:
+    # `requested_teams` is a separate field and is deliberately not carried,
+    # because nothing in the loop may ever withdraw a team's request.
+    requested_reviewers: tuple[str, ...] = ()
 
     @property
     def full_name(self) -> str:
@@ -331,8 +338,22 @@ class GitHub:
             )
         return actual
 
-    def _api(self, *args: str, timeout: int = 60, forbidden_is_rate_limit: bool = True):
+    def _api(
+        self,
+        *args: str,
+        timeout: int = 60,
+        forbidden_is_rate_limit: bool = True,
+        body: "dict | None" = None,
+    ):
         """One `gh api` call, with GitHub's throttling mapped to RateLimited.
+
+        `body` is for requests whose payload must have a particular JSON SHAPE.
+        `gh`'s `-f` fields cannot express one portably: `-f 'k[]=v'` is encoded
+        as the array `{"k": ["v"]}` only by modern `gh`, and as a string field
+        NAMED `k[]` by the 2.4.0 this client targets -- silently, so the
+        request goes out well-formed and simply missing the key the endpoint
+        wants. Passing the body on stdin through `--input -` (which 2.4.0 does
+        support) takes every `gh` version out of the encoding decision.
 
         `forbidden_is_rate_limit` is about one ambiguity: GitHub answers a
         secondary rate limit with 403, so a bare "403" in stderr is read as
@@ -348,8 +369,13 @@ class GitHub:
         that pass False: an explicit throttling marker still raises
         RateLimited, and everything else stays a CommandError they can handle.
         """
+        argv = ["gh", "api", *args]
+        stdin = None
+        if body is not None:
+            argv += ["--input", "-"]
+            stdin = json.dumps(body)
         try:
-            return run_json(["gh", "api", *args], timeout=timeout, env=self._env())
+            return run_json(argv, timeout=timeout, env=self._env(), stdin=stdin)
         except CommandError as exc:
             blob = exc.stderr.lower()
             throttled = any(marker in blob for marker in RATE_LIMIT_MARKERS)
@@ -402,6 +428,11 @@ class GitHub:
             url=data.get("html_url", ""),
             state=data.get("state") or "open",
             merged=bool(data.get("merged")),
+            requested_reviewers=tuple(
+                str((u or {}).get("login") or "")
+                for u in (data.get("requested_reviewers") or [])
+                if (u or {}).get("login")
+            ),
         )
 
     def reviews(self, owner: str, repo: str, number: int) -> list[Review]:
@@ -546,6 +577,38 @@ class GitHub:
         # retry-and-page path instead of backing off the whole poll pass.
         data = self._api(*argv, forbidden_is_rate_limit=False) or {}
         return str(data.get("html_url") or "")
+
+    def remove_review_request(
+        self, owner: str, repo: str, number: int, login: str
+    ) -> None:
+        """Withdraw the pending review request held against ONE login.
+
+        The payload names exactly one reviewer, never the whole list: GitHub's
+        DELETE removes only what it is given, so a human reviewer or a second
+        bot sitting in the same `requested_reviewers` array is untouched. The
+        caller is the round close-out (loop._clear_own_review_request), and the
+        only login it ever passes is the daemon's own.
+
+        The body goes out through `--input` rather than `-f 'reviewers[]=…'`,
+        because that field syntax means different things on different `gh`
+        versions and this client targets 2.4.0, where it produces a string
+        field literally named `reviewers[]` -- no `reviewers` key, a 422, and a
+        feature that never worked. See `_api`.
+
+        `forbidden_is_rate_limit=False` for the same reason `submit_review`
+        passes it: a 403 here is this identity not being allowed to edit the
+        PR's reviewers, which is a fact about the deployment that its caller
+        logs and degrades on -- not a throttle worth backing the whole poll
+        pass off for. Note the permission is `pull_requests: write`, strictly
+        more than reviewing needs.
+        """
+        self._api(
+            "-X",
+            "DELETE",
+            f"repos/{owner}/{repo}/pulls/{number}/requested_reviewers",
+            body={"reviewers": [login]},
+            forbidden_is_rate_limit=False,
+        )
 
     def comment(self, owner: str, repo: str, number: int, body: str) -> None:
         run_json(

@@ -7,6 +7,7 @@ it is in flight, when the loop has converged, and when CR9 caps out.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import time
 
@@ -42,9 +43,12 @@ from alissa.tools.github.revloop.ghclient import (
     countable_rounds,
     verdict_marker,
 )
+from alissa.tools.github.revloop import ghclient as ghclient_module
 from alissa.tools.github.revloop import loop as loop_module
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
+    drift_probe_kind,
+    identity_drift_kind,
     MAX_REENTRY_ROUNDS,
     MAX_VERDICT_POST_ATTEMPTS,
     REENTRY_GRAMMAR,
@@ -89,10 +93,40 @@ class FakeGitHub:
         # says otherwise (a force-push).
         self.commits: list[str] = [pr.head_sha, "abc123"]
         self.commits_error: BaseException | None = None
+        # Review requests withdrawn through remove_review_request, and an
+        # optional failure to raise instead of withdrawing.
+        self.removed: list[str] = []
+        self.remove_error: BaseException | None = None
+        self.reviews_error: BaseException | None = None
+        # Unfiltered review-list reads — the drift check's extra call, whose
+        # per-poll cost is what the probe ledger exists to bound.
+        self.reviews_calls = 0
 
     def pull_request(self, owner, repo, number):
         self.pr_fetches += 1
         return self._pr
+
+    def reviews(self, owner, repo, number):
+        self.reviews_calls += 1
+        if self.reviews_error:
+            raise self.reviews_error
+        return list(self._reviews)
+
+    def remove_review_request(self, owner, repo, number, login):
+        """Mirrors GitHub.remove_review_request AND what GitHub does next: the
+        request drops off the PR, and -- because the search IS
+        review-requested:@me -- withdrawing my own drops the PR out of it."""
+        if self.remove_error:
+            raise self.remove_error
+        self.removed.append(login)
+        self._pr = dataclasses.replace(
+            self._pr,
+            requested_reviewers=tuple(
+                r for r in self._pr.requested_reviewers if r != login
+            ),
+        )
+        if login == self.login:
+            self.requests = [r for r in self.requests if r != (owner, repo, number)]
 
     def my_reviews(self, owner, repo, number):
         # Mirrors GitHub.my_reviews: mine, substantive, oldest first.
@@ -209,7 +243,15 @@ class FakeTask:
     is_open = True
 
 
-def make_pr(*, draft=False, author="teammate", sha="abc123", state="open", merged=False) -> PullRequest:
+def make_pr(
+    *,
+    draft=False,
+    author="teammate",
+    sha="abc123",
+    state="open",
+    merged=False,
+    requested=(),
+) -> PullRequest:
     return PullRequest(
         owner=OWNER,
         repo=REPO,
@@ -221,6 +263,7 @@ def make_pr(*, draft=False, author="teammate", sha="abc123", state="open", merge
         url=f"https://github.com/{SLUG}/pull/{NUMBER}",
         state=state,
         merged=merged,
+        requested_reviewers=tuple(requested),
     )
 
 
@@ -3544,7 +3587,7 @@ def _gh_raising(monkeypatch, stderr):
     gh = GitHub("alissa-app")
     monkeypatch.setattr(GitHub, "assert_review_identity", lambda self: "alissa-app")
 
-    def boom(argv, *, timeout=60, env=None):
+    def boom(argv, *, timeout=60, env=None, stdin=None):
         raise CommandError(argv, 1, stderr)
 
     monkeypatch.setattr("alissa.tools.github.revloop.ghclient.run_json", boom)
@@ -4011,3 +4054,532 @@ def test_the_length_ceiling_no_longer_drives_redaction():
     assert _is_credential_shaped("A_LONG_BUT_CLEARLY_DELIMITED_VARIABLE_NAME") is False
     assert _is_credential_shaped("a" * 40) is True, "an undelimited alnum run is"
     assert _is_credential_shaped("ghp_" + "a" * 36) is True
+
+
+# -- round close-out: the dangling self review request (issue #54) ----------
+#
+# A review request is normally consumed by the requested identity submitting a
+# review. When it is not, the PR stays in review-requested:@me forever and
+# every poll pays a full re-verification to reach the same no-op. Close-out
+# withdraws the daemon's OWN request -- and only in the terminal branch.
+
+
+def _converged(config, **pr_kwargs):
+    """A PR whose round-1 approve stands at the current head."""
+    pr = make_pr(**pr_kwargs)
+    return watcher(config, pr, [review("APPROVED")])
+
+
+def test_a_closed_round_withdraws_its_own_dangling_review_request(config):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert gh.removed == ["alissa-app"]
+
+
+def test_close_out_removes_only_the_daemons_own_login(config):
+    """Human reviewers and any second bot are somebody else's pending work."""
+    w, gh, _ = _converged(
+        config, requested=("human-dev", "alissa-app", "other-bot")
+    )
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.removed == ["alissa-app"]
+    assert gh._pr.requested_reviewers == ("human-dev", "other-bot")
+
+
+def test_a_closed_round_with_no_dangling_request_calls_nothing(config):
+    """The normal case: the verdict post already consumed the request."""
+    w, gh, _ = _converged(config)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert gh.removed == []
+
+
+def test_no_removal_once_the_head_moved_past_the_verdict(config):
+    """Round k+1 is owed, and the request is what will surface it."""
+    pr = make_pr(sha="def456", requested=("alissa-app",))
+    w, gh, _ = watcher(config, pr, [review("APPROVED", sha="abc123")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert gh.removed == []
+
+
+def test_no_removal_on_a_request_changes_round(config):
+    w, gh, _ = watcher(
+        config,
+        make_pr(requested=("alissa-app",)),
+        [review("COMMENTED")],
+        verdict="request_changes",
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert gh.removed == []
+
+
+def test_no_removal_while_a_round_is_in_flight(config):
+    pr = make_pr(requested=("alissa-app",))
+    w, gh, _ = watcher(config, pr, [])
+    _record(w, pr, 1)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert gh.removed == []
+
+
+def test_no_removal_on_a_capped_pr(config):
+    """A capped PR is exactly where a re-entry ack can still open a round, and
+    the ack scan only runs while the PR is in the search — withdrawing its
+    request there would delete the operator's own way back in."""
+    reviews = [review("COMMENTED", at=f"2026-07-18T1{i}:00:00Z") for i in range(3)]
+    w, gh, _ = watcher(
+        config, make_pr(requested=("alissa-app",)), reviews, verdict=None
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+    assert gh.removed == []
+    # ...and again on the next poll, when the page is already delivered.
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CAPPED
+    assert gh.removed == []
+
+
+def test_no_removal_when_a_round_still_owes_its_native_verdict(config):
+    """An envelope ahead of the native count means the round is not closed:
+    the post that is owed is what consumes the request."""
+    w, gh, _ = watcher(
+        config,
+        make_pr(requested=("alissa-app",)),
+        [review("COMMENTED")],
+        verdict="approve",
+        verdict_count=2,
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.AWAITING_POST
+    assert gh.removed == []
+
+
+def test_dry_run_withdraws_nothing(config, caplog):
+    config = dataclasses.replace(config, dry_run=True)
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    assert gh.removed == []
+    assert "[dry-run] would withdraw" in caplog.text
+
+
+def test_a_failed_delete_logs_and_never_blocks_the_walk(config, caplog):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "422 Unprocessable Entity")
+
+    with caplog.at_level(logging.WARNING):
+        results = w.poll_once()
+
+    assert [d.action for _, d in results] == [Action.CONVERGED]
+    assert "could not withdraw the dangling review request" in caplog.text
+
+
+def test_a_throttled_delete_does_not_abort_the_pass(config):
+    """RateLimited reaches run_forever's backoff from the READ paths. Here the
+    decision is already made and the removal is a side effect of it, so a
+    throttle must not turn a no-op into an aborted pass — the next poll
+    retries."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = RateLimited("secondary rate limit")
+
+    results = w.poll_once()
+
+    assert [d.action for _, d in results] == [Action.CONVERGED]
+    assert gh.removed == []
+
+
+def test_the_withdrawn_pr_leaves_the_per_poll_evaluation_set(config):
+    """AC2: no repeated full re-verification passes for a closed round."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    first = w.poll_once()
+    assert [d.action for _, d in first] == [Action.CONVERGED]
+    assert gh.pr_fetches == 1
+
+    second = w.poll_once()
+
+    assert second == [], "the closed round must not be evaluated again"
+    assert gh.pr_fetches == 1, "and must not be re-fetched"
+
+
+def test_a_failed_removal_keeps_the_pr_in_the_set_for_the_retry(config):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+
+    w.poll_once()
+    w.poll_once()
+
+    assert gh.pr_fetches == 2, "still evaluated — nothing was withdrawn"
+
+
+def test_identity_drift_warns_once_naming_both_identities(config, caplog):
+    """The #298 shape: the request is held against one login, the round's
+    newest review carries another, so GitHub can never consume it."""
+    reviews = [
+        review("APPROVED", at="2026-07-18T10:00:00Z"),
+        dataclasses.replace(
+            review("COMMENTED", at="2026-07-18T11:00:00Z"), author="RHDZMOTA"
+        ),
+    ]
+    w, gh, _ = watcher(
+        config, make_pr(requested=("alissa-app",)), reviews, verdict_count=1
+    )
+    # The removal keeps failing, so the drift path is walked twice.
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+
+    with caplog.at_level(logging.WARNING):
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    drift = [r for r in caplog.records if "IDENTITY DRIFT" in r.getMessage()]
+    assert len(drift) == 1, "a config alarm, not a per-poll line"
+    assert "'alissa-app'" in drift[0].getMessage()
+    assert "'RHDZMOTA'" in drift[0].getMessage()
+
+
+def test_no_drift_warning_when_the_verdict_of_record_is_ours(config, caplog):
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+
+    with caplog.at_level(logging.WARNING):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "IDENTITY DRIFT" not in caplog.text
+    assert gh.removed == ["alissa-app"]
+
+
+def test_an_unreadable_review_list_does_not_block_the_removal(config):
+    """The drift check is a diagnostic; close-out does not depend on it."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.reviews_error = CommandError(["gh"], 1, "500")
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.removed == ["alissa-app"]
+
+
+def test_the_removal_log_line_carries_its_evidence(config, caplog):
+    """A full-length SHA, so the [:8] truncation is actually pinned — the
+    6-character fixture made `sha[:8] in line` an assertion that could not
+    fail."""
+    sha = "5f702b61e5f9a06f19d813ca16ae360f13fbf4c4"
+    pr = make_pr(sha=sha, requested=("alissa-app", "human-dev"))
+    w, gh, _ = watcher(config, pr, [review("APPROVED", sha=sha)])
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    line = next(
+        r.getMessage() for r in caplog.records if "round close-out" in r.getMessage()
+    )
+    assert SLUG in line and str(NUMBER) in line       # which PR
+    assert sha[:8] in line and sha not in line        # at which head, short
+    assert "#r1" in line                              # the verdict of record
+    assert "human-dev" in line                        # what was left alone
+    # ...and the convergence reason, interpolated verbatim. This pins that the
+    # log line carries `why`, not anything about GitHub's own review state.
+    assert "last GitHub review state is APPROVED" in line
+
+
+def test_the_drift_kind_is_keyed_on_both_identities():
+    assert identity_drift_kind("alissa-app", "RHDZMOTA") != identity_drift_kind(
+        "alissa-app", "someone-else"
+    )
+
+
+def test_the_delete_body_is_a_json_array_naming_one_login(monkeypatch):
+    """The wire shape, pinned at the layer that reaches `gh`.
+
+    Pinning the argv was not enough: `-f 'reviewers[]=x'` is encoded as the
+    array `{"reviewers": ["x"]}` by modern gh and as a string field NAMED
+    `reviewers[]` by the 2.4.0 this client targets, so an argv assertion passes
+    identically in both worlds. The body is now built here and piped in, and
+    this asserts the bytes.
+    """
+    seen: dict = {}
+
+    def fake_run_json(argv, *, timeout=60, env=None, stdin=None):
+        seen["argv"], seen["stdin"] = list(argv), stdin
+        return None
+
+    monkeypatch.setattr(ghclient_module, "run_json", fake_run_json)
+    GitHub("alissa-app").remove_review_request(OWNER, REPO, NUMBER, "alissa-app")
+
+    assert seen["argv"] == [
+        "gh",
+        "api",
+        "-X",
+        "DELETE",
+        f"repos/{OWNER}/{REPO}/pulls/{NUMBER}/requested_reviewers",
+        "--input",
+        "-",
+    ]
+    assert "-f" not in seen["argv"], "no gh field syntax may decide the encoding"
+    assert json.loads(seen["stdin"]) == {"reviewers": ["alissa-app"]}
+
+
+def test_the_pr_carries_the_pending_review_requests():
+    """Read off the PR payload the loop already fetches — knowing whether the
+    request dangles costs no extra call. Users only: a requested TEAM is never
+    something this daemon may withdraw."""
+    gh = GitHub("alissa-app")
+    gh._api = lambda *a, **k: {
+        "title": "Add widget cache",
+        "user": {"login": "teammate"},
+        "head": {"sha": "abc123"},
+        "requested_reviewers": [{"login": "alissa-app"}, {"login": "human-dev"}, {}],
+        "requested_teams": [{"slug": "platform"}],
+    }
+
+    pr = gh.pull_request(OWNER, REPO, NUMBER)
+
+    assert pr.requested_reviewers == ("alissa-app", "human-dev")
+
+
+def test_a_pr_with_no_pending_requests_reads_as_empty():
+    gh = GitHub("alissa-app")
+    gh._api = lambda *a, **k: {"head": {"sha": "abc123"}}
+    assert gh.pull_request(OWNER, REPO, NUMBER).requested_reviewers == ()
+
+
+# -- round-1 findings (PR #55) ---------------------------------------------
+
+
+def test_a_permanently_failing_withdrawal_warns_once_and_keeps_retrying(config, caplog):
+    """[major] The common failure — an identity without `pull_requests: write`
+    — is permanent and per-PR, so an undeduped warning is ~2,880 lines a day
+    that never converge on anything. Retry yes, re-announce no."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(4):
+            w.evaluate(OWNER, REPO, NUMBER)
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "could not withdraw" in r.getMessage()
+    ]
+    assert len(warnings) == 1, "one line per condition, not per poll"
+    assert "pull_requests: write" in warnings[0].getMessage(), "name the likely cause"
+
+
+def test_a_different_failure_class_announces_itself_once_more(config, caplog):
+    """Keyed on the exception class: a 403 that becomes a 422 is a genuinely
+    different condition."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+    w.evaluate(OWNER, REPO, NUMBER)
+    # caplog's handler is live for the whole test, so the first pass's warning
+    # is already in `records` — without this the assertion below cannot fail.
+    caplog.clear()
+
+    gh.remove_error = RateLimited("secondary rate limit")
+    with caplog.at_level(logging.WARNING):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert [
+        r for r in caplog.records if "could not withdraw" in r.getMessage()
+    ], "a new failure class is new information"
+
+
+def test_the_drift_probe_is_paid_once_per_head_not_once_per_poll(config):
+    """[major] The drift check's extra read runs on the same path a permanent
+    403 walks every poll, so it needs its own bound."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+
+    for _ in range(4):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.reviews_calls == 1, "one unfiltered review read for this head"
+
+
+def test_an_unreadable_review_list_leaves_the_probe_owed(config):
+    """A read that failed settles nothing, so it must not record the bound."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    gh.remove_error = CommandError(["gh"], 1, "403 Forbidden")
+    gh.reviews_error = CommandError(["gh"], 1, "500")
+
+    w.evaluate(OWNER, REPO, NUMBER)
+    gh.reviews_error = None
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.reviews_calls == 2, "the failed probe retried"
+
+
+def test_dry_run_still_names_the_drifted_identities(config, caplog):
+    """[minor] Dry-run is the mode an operator reaches for to DIAGNOSE the #298
+    shape; the drift line is the only thing that names the root cause."""
+    reviews = [
+        review("APPROVED", at="2026-07-18T10:00:00Z"),
+        dataclasses.replace(
+            review("COMMENTED", at="2026-07-18T11:00:00Z"), author="RHDZMOTA"
+        ),
+    ]
+    w, gh, _ = watcher(
+        config=dataclasses.replace(config, dry_run=True),
+        pr=make_pr(requested=("alissa-app",)),
+        reviews=reviews,
+        verdict_count=1,
+    )
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "IDENTITY DRIFT" in caplog.text
+    assert "[dry-run] would withdraw" in caplog.text
+    assert gh.removed == [], "still takes nothing on GitHub"
+
+
+def test_a_verdict_with_no_commit_id_is_not_withdrawn_on(config):
+    """[question] `_convergence_reason` lets a review with no commit_id
+    converge — that convergence is not head-bound, so it must not also take the
+    PR out of the daemon's sight. Not producible today; the terminal-branch
+    argument holds on its own terms anyway."""
+    w, gh, _ = watcher(
+        config,
+        make_pr(requested=("alissa-app",)),
+        [dataclasses.replace(review("APPROVED"), commit_id="")],
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert gh.removed == [], "convergence was never bound to this head"
+
+
+def test_a_request_that_comes_back_at_the_same_head_is_named_loudly(config, caplog):
+    """[major] A human's explicit re-request being undone deserves more than
+    the INFO line the first withdrawal gets."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert gh.removed == ["alissa-app"]
+
+    # The operator re-requests at the unchanged head.
+    gh._pr = dataclasses.replace(gh._pr, requested_reviewers=("alissa-app",))
+    gh.requests = [(OWNER, REPO, NUMBER)]
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.removed == ["alissa-app", "alissa-app"]
+    again = next(
+        r for r in caplog.records if "withdrawn AGAIN" in r.getMessage()
+    )
+    assert again.levelno == logging.WARNING
+    assert "only a new commit opens one" in again.getMessage()
+
+
+def test_the_first_withdrawal_at_a_new_head_is_not_loud(config, caplog):
+    """The louder line is about a request COMING BACK, not about withdrawing:
+    a fresh head gets the ordinary INFO close-out."""
+    w, gh, _ = _converged(config, requested=("alissa-app",))
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    gh._pr = dataclasses.replace(
+        gh._pr, head_sha="def456", requested_reviewers=("alissa-app",)
+    )
+    gh._reviews.append(review("APPROVED", sha="def456", at="2026-07-19T10:00:00Z"))
+    gh.requests = [(OWNER, REPO, NUMBER)]
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "withdrawn AGAIN" not in caplog.text
+    assert gh.removed == ["alissa-app", "alissa-app"]
+
+
+def test_run_actually_feeds_stdin_to_the_child():
+    """The one layer the monkeypatched wire test cannot reach: that `stdin`
+    becomes the child's standard input for real, so `gh api --input -` gets the
+    body rather than an empty pipe."""
+    from alissa.tools.github.revloop.proc import run
+    body = json.dumps({"reviewers": ["alissa-app"]})
+    assert run(["cat"], stdin=body) == body
+
+
+# -- round-2 findings (PR #55) ---------------------------------------------
+
+
+def _drifted_reviews():
+    """Our approve at head, and a NEWER write-up by another identity — the
+    #298 shape the drift alarm exists for."""
+    return [
+        review("APPROVED", at="2026-07-18T10:00:00Z"),
+        dataclasses.replace(
+            review("COMMENTED", at="2026-07-18T11:00:00Z"), author="RHDZMOTA"
+        ),
+    ]
+
+
+def _drift_watcher(config, state=None):
+    return watcher(
+        config=config,
+        pr=make_pr(requested=("alissa-app",)),
+        reviews=_drifted_reviews(),
+        state=state,
+        verdict_count=1,
+    )
+
+
+def test_a_dry_run_pass_leaves_the_ping_ledger_clean(config):
+    """[major] `state_db` has no dry-run branch, so a ledger row written by a
+    diagnostic pass lands in the file the production daemon reads."""
+    w, _, _ = _drift_watcher(dataclasses.replace(config, dry_run=True))
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not w.state.pinged(SLUG, NUMBER, drift_probe_kind("abc123"))
+    assert not w.state.pinged(
+        SLUG, NUMBER, identity_drift_kind("alissa-app", "RHDZMOTA")
+    )
+
+
+def test_a_dry_run_does_not_silence_the_production_alarm(config, caplog):
+    """The half that actually matters: an operator diagnosing with --dry-run
+    must not make the daemon that runs next permanently quiet."""
+    state = State(config.state_db)
+    dry, _, _ = _drift_watcher(dataclasses.replace(config, dry_run=True), state=state)
+    dry.evaluate(OWNER, REPO, NUMBER)
+
+    live, gh, _ = _drift_watcher(config, state=state)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        live.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.removed == ["alissa-app"]
+    assert "IDENTITY DRIFT" in caplog.text
+
+
+def test_a_dry_run_does_not_silence_itself_either(config, caplog):
+    """Not reading the ledger matters as much as not writing it: a production
+    pass that already probed this head must not make the operator's dry-run
+    print nothing."""
+    state = State(config.state_db)
+    live, _, _ = _drift_watcher(config, state=state)
+    live.evaluate(OWNER, REPO, NUMBER)
+    assert state.pinged(SLUG, NUMBER, drift_probe_kind("abc123"))
+
+    dry, gh, _ = _drift_watcher(dataclasses.replace(config, dry_run=True), state=state)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        dry.evaluate(OWNER, REPO, NUMBER)
+
+    assert "IDENTITY DRIFT" in caplog.text
+    assert gh.removed == [], "still takes nothing on GitHub"
