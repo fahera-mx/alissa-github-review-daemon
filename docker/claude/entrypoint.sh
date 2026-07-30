@@ -166,6 +166,13 @@ gh auth setup-git 2>/dev/null \
 
 # The official installer, and the CLI's own two location knobs, with the same
 # defaults the CLI itself applies.
+#
+# ALISSA_INSTALL_URL is overridable for tests-entrypoint-auth.sh ONLY. It is
+# NOT a supported production lever: pointing it elsewhere makes this entrypoint
+# execute remote code from wherever it points. A deploy leaves it unset. (No
+# checksum is pinned against the default deliberately — a pin in this repo goes
+# stale on every installer release, and a stale pin turns the self-healing
+# re-bootstrap into a hard failure during exactly the incident it exists for.)
 ALISSA_INSTALL_URL="${ALISSA_INSTALL_URL:-https://share.alissa.app/install}"
 ALISSA_CONFIG_DIR="${ALISSA_CONFIG_DIR:-${HOME}/.config/alissa}"
 ALISSA_API_BASE="${ALISSA_API_BASE:-https://api.alissa.app}"
@@ -179,6 +186,17 @@ AUTH_RETRY_CAP_SECONDS="${ALISSA_AUTH_RETRY_CAP_SECONDS:-600}"
 # names the one thing a human could act on. Retrying forever is the contract;
 # retrying forever without ever saying so is how a silent outage happens.
 AUTH_ESCALATE_SECONDS="${ALISSA_AUTH_ESCALATE_SECONDS:-600}"
+
+# Strip the token out of anything captured from a child before it is logged.
+# The entrypoint hands the token on the command line (`--token "${…}"`), so
+# whether it comes back in an error string is the CLI's choice, not ours — and
+# the retry loop below logs its capture on EVERY iteration, forever, so a token
+# echoed once would be echoed into the platform's log retention indefinitely.
+# Redacting at capture covers every consumer (the retry line and the `die`) by
+# construction. Bash pattern replacement: no subprocess, no new dependency.
+redact_token() {
+  printf '%s' "${1//"${ALISSA_API_TOKEN}"/***REDACTED***}"
+}
 
 # A genuine server-side rejection: `auth login` RAN, reached the API and was
 # told no. Matched on the CLI's own error text, which carries the HTTP status.
@@ -235,7 +253,10 @@ while :; do
     if BOOTSTRAP_ERR="$({ curl -fsSL "${ALISSA_INSTALL_URL}" | bash; } 2>&1 >/dev/null)"; then
       log "alissa CLI re-bootstrapped"
     else
-      log "WARN: alissa CLI re-bootstrap failed: ${BOOTSTRAP_ERR:-<no output>}"
+      # Redacted like the login capture: the token is not passed to the
+      # installer, but this is an unconstrained shell pipeline's output and the
+      # boundary is the only part of that we control.
+      log "WARN: alissa CLI re-bootstrap failed: $(redact_token "${BOOTSTRAP_ERR:-<no output>}")"
     fi
     # The installer drops the launcher into a directory already on PATH, but
     # bash caches lookups — clear it before deciding whether this worked.
@@ -268,7 +289,7 @@ while :; do
     log "alissa authenticated"
     break
   fi
-  LOGIN_ERR="${LOGIN_ERR:-<no output>}"
+  LOGIN_ERR="$(redact_token "${LOGIN_ERR:-<no output>}")"
   if auth_rejected "${LOGIN_ERR}"; then
     die "ALISSA_API_TOKEN rejected by ${ALISSA_API_BASE} — the API answered and refused this token. Rotate ALISSA_API_TOKEN in the Railway service env (Variables -> ALISSA_API_TOKEN) and redeploy; retrying cannot fix a credential. alissa auth login said: ${LOGIN_ERR}"
   fi

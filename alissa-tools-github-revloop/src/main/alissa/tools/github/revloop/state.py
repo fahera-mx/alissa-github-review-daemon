@@ -341,14 +341,62 @@ class State:
     #   writes, `age_out_spawn`). Each is a dedupe key or an in-flight marker
     #   for an action the daemon TAKES: swallowing one does not lose a
     #   datapoint, it re-spawns a reviewer round, re-pages an operator, or
-    #   re-grants a cap. Those stay strict and raise -- and the poll-loop
-    #   firewall in `loop.run_forever` is what keeps them from ending the
-    #   daemon now, which is the right place for that decision because it can
-    #   also back off and escalate.
+    #   re-grants a cap. Those stay strict and raise.
+    #
+    # STRICTNESS IS NOT, BY ITSELF, THE PROTECTION -- and the first draft of
+    # this change claimed it was (PR #63 round-1 blocker). Raising aborts the
+    # pass that failed; it says nothing about the next one. The poll firewall
+    # then hands the loop straight back to the same code path, and the side
+    # effect the write was meant to dedupe has ALREADY been taken -- so a
+    # read-only volume turned "enqueue a reviewer, fail to record it" into a
+    # fresh reviewer session every poll, indefinitely, where before it merely
+    # killed the daemon after one. What actually protects the side effect is
+    # `writable()` above, checked by `loop.poll_once` before the pass takes any
+    # decision at all: the daemon does not take an action it cannot record.
+    # Strictness is what makes an unrecordable action VISIBLE; the gate is what
+    # makes it not repeat.
+
+    @staticmethod
+    def _write_probe(db: sqlite3.Connection) -> bool:
+        """Can this connection actually write? A no-op header write, which
+        exercises exactly the path a real write needs, changes nothing, and
+        costs one page. Read-only-ness is the thing being detected, so it
+        cannot be answered by inspecting the file's mode: sqlite decides it at
+        open time and a handle can be read-only over a writable file (and, for
+        one recoverable moment, the reverse)."""
+        try:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            db.execute(f"PRAGMA user_version = {int(version)}")
+            db.commit()
+        except sqlite3.DatabaseError:
+            return False
+        return True
+
+    def writable(self) -> bool:
+        """Whether the ledger can accept a write RIGHT NOW.
+
+        The daemon asks this before it takes any action it would have to
+        record (issue #62, round-1 blocker). Keeping a correctness write strict
+        aborts the pass that fails, but the poll firewall hands the loop
+        straight back to the same code path -- so without this gate a read-only
+        volume turns "enqueue a reviewer, then fail to record it" into a fresh
+        reviewer session every poll, forever, each one a live agent. The
+        invariant the gate buys is simple: the daemon does not take an action
+        it cannot record.
+
+        A failing probe retries through `_reconnect`, whose candidate is
+        write-probed before adoption -- so a stale handle over a live file
+        heals here too, and only a genuinely unwritable ledger answers False.
+        A read-only `State` (the console's) is never writable by construction.
+        """
+        if self._read_only:
+            return False
+        return self._write_probe(self._db) or self._reconnect()
 
     def _reconnect(self) -> bool:
         """Swap in a fresh connection, but ONLY if the fresh one is better.
-        True when the swap happened.
+        True when the swap happened -- which, because the candidate is
+        write-probed, is also proof that the ledger is writable.
 
         Deliberately raw: it re-establishes the connection and NOTHING else --
         no schema script, no migration. The reconnect exists for the
@@ -366,28 +414,28 @@ class State:
         heals by itself the moment writes are possible again. Replacing the
         healable handle with a poisoned one would trade a transient outage for
         a permanent one.
+
+        WRITE MODE ONLY. A read-only `State` is the console's, it must never
+        write, and there is nothing a reconnect could improve for it -- so it
+        returns False rather than swapping one equivalent handle for another.
+        That also keeps the contract absolute: a True from here always means a
+        candidate passed the write probe, which is what `writable()` relies on.
         """
+        if self._read_only:
+            return False
         candidate: sqlite3.Connection | None = None
         try:
-            if self._read_only:
-                uri = Path(self._path).absolute().as_uri() + "?mode=ro"
-                candidate = sqlite3.connect(uri, uri=True)
-            else:
-                candidate = sqlite3.connect(str(self._path))
+            candidate = sqlite3.connect(str(self._path))
             candidate.row_factory = sqlite3.Row
-            if not self._read_only:
-                # A no-op header write: it exercises exactly the path the real
-                # write needs, changes nothing, and costs one page.
-                version = candidate.execute("PRAGMA user_version").fetchone()[0]
-                candidate.execute(f"PRAGMA user_version = {int(version)}")
-                candidate.commit()
         except sqlite3.Error as exc:
             log.debug("state: reconnect to %s declined: %s", self._path, exc)
-            if candidate is not None:
-                try:
-                    candidate.close()
-                except sqlite3.Error:
-                    pass
+            return False
+        if not self._write_probe(candidate):
+            log.debug("state: reconnect to %s declined (candidate cannot write)", self._path)
+            try:
+                candidate.close()
+            except sqlite3.Error:
+                pass
             return False
         try:
             self._db.close()

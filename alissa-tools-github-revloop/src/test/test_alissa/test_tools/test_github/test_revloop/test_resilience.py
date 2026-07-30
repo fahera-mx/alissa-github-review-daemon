@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time as real_time
 
 import pytest
 
@@ -54,9 +55,17 @@ def config(tmp_path):
 
 
 class _Clock:
-    """A monotonic clock the loop drives itself: every `sleep(n)` advances it
-    by n. So a test can watch a 30-minute escalation window pass in the same
-    number of iterations the daemon would really take, without sleeping."""
+    """A stand-in for `loop.py`'s view of the `time` module: a monotonic clock
+    the loop drives itself, where every `sleep(n)` advances it by n. So a test
+    can watch a 30-minute escalation window pass in the same number of
+    iterations the daemon would really take, without sleeping.
+
+    It replaces the module ATTRIBUTE rather than patching `time.sleep` on the
+    stdlib module object, which `loop_module.time` *is* — patching that would
+    stop the whole process sleeping for the duration of the test, an isolation
+    claim the fixture could not honour. `time()` still delegates to the real
+    module: `loop.py` uses wall-clock time on paths these tests do not stub.
+    """
 
     def __init__(self):
         self.now = 1000.0
@@ -69,12 +78,14 @@ class _Clock:
     def monotonic(self):
         return self.now
 
+    def time(self):
+        return real_time.time()
+
 
 @pytest.fixture
 def clock(monkeypatch):
     c = _Clock()
-    monkeypatch.setattr(loop_module.time, "sleep", c.sleep)
-    monkeypatch.setattr(loop_module.time, "monotonic", c.monotonic)
+    monkeypatch.setattr(loop_module, "time", c)
     return c
 
 
@@ -204,6 +215,32 @@ def test_rate_limiting_is_not_counted_as_a_substrate_failure(config, clock, capl
     assert "poll recovered" not in caplog.text
 
 
+def test_a_rate_limit_does_not_cancel_a_pending_escalation(config, clock, caplog):
+    """A rate limit must not END a substrate streak either.
+
+    `review_requests` is the first GitHub call in a pass, so a rate limit can
+    pre-empt the failing call site entirely. Letting it resolve the streak
+    re-armed the escalation clock, and a busy hour could keep a genuine fault
+    from ever reaching the page-worthy ERROR the DoD requires.
+    """
+    caplog.set_level(logging.INFO)
+    missing = FileNotFoundError(2, "No such file or directory", "alissa")
+    limited = loop_module.RateLimited("secondary rate limit")
+    # A real fault, interleaved with rate limits throughout.
+    w = _watcher(config, [missing, limited, missing, limited, missing] * 3)
+
+    w.run_forever()
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors, "the interleaved rate limits must not cancel the page"
+    assert "FileNotFoundError" in errors[0].getMessage()
+    # ...and the rate-limited polls did not inflate the failure count either.
+    counted = [
+        r.getMessage() for r in caplog.records if "of this streak" in r.getMessage()
+    ]
+    assert all("OSError" not in m and "RateLimited" not in m for m in counted)
+
+
 def test_the_firewall_log_is_streak_limited(config, clock):
     """A substrate outage costs a handful of lines an hour, not one per poll."""
     streak = PollFailures()
@@ -300,7 +337,14 @@ def test_a_readonly_ledger_warns_and_never_raises(tmp_path, caplog):
 
 def test_the_poll_loop_completes_further_passes_over_a_readonly_ledger(tmp_path, caplog):
     """AC 2: >=3 further poll cycles with the ledger read-only, and persistence
-    resumes once it is writable again -- no restart in between."""
+    resumes once it is writable again -- no restart in between.
+
+    What the pass DOES over a read-only ledger is decide nothing at all: the
+    gate at the top of `poll_once` refuses it, because the daemon must not take
+    an action it cannot record (PR #63 round-1 blocker). The point that matters
+    for this AC is unchanged and is what is asserted -- the loop survives, it
+    says so, streak-limited, and it heals by itself.
+    """
     caplog.set_level(logging.INFO)
     db = tmp_path / "state.db"
     config = Config(
@@ -317,17 +361,95 @@ def test_the_poll_loop_completes_further_passes_over_a_readonly_ledger(tmp_path,
         finally:
             _writable(db)
 
-        # Healed: the very next pass persists again, through the same object
-        # and with no restart. Note WHICH connection heals it -- the one opened
-        # before the fault. The reconnect attempt on the streak's first failure
-        # correctly DECLINED to adopt a handle opened while the volume was
-        # read-only, because sqlite fixes read-only-ness at open time and that
-        # handle would never have recovered (the reconnect path proper is
-        # exercised by the stale-handle test below).
+        assert "cannot be written — skipping this pass entirely" in caplog.text
+
+        # Healed: the very next pass decides and persists again, through the
+        # same object and with no restart. Note WHICH connection heals it --
+        # the one opened before the fault. A reconnect correctly DECLINES to
+        # adopt a handle opened while the volume was read-only, because sqlite
+        # fixes read-only-ness at open time and that handle would never have
+        # recovered (the reconnect path proper is exercised below).
         assert w.poll_once() == []
         assert len(ledger.read_snapshots()) == 1
 
-    assert "telemetry is persisting again" in caplog.text
+    assert "is writable again after 3 skipped pass(es)" in caplog.text
+
+
+def test_a_snapshot_failure_alone_does_not_end_the_pass(tmp_path, monkeypatch, caplog):
+    """The gate and the best-effort writer are BOTH live, and neither makes the
+    other redundant. The gate probes at the start of a pass; a telemetry write
+    happens at the end of it, and can fail on its own (a lock timeout, a full
+    disk, a handle that died mid-pass) over a ledger that probed writable.
+    That must still not end the pass."""
+    caplog.set_level(logging.INFO)
+    db = tmp_path / "state.db"
+    config = Config(
+        workspace_root=tmp_path,
+        hub_template="{root}/{repo}/main",
+        state_path=db,
+    )
+    with State(db) as ledger:
+        w = ReviewWatcher(config, github=_NoRequests(), alissa=_NoSessions(), state=ledger)
+        monkeypatch.setattr(State, "_reconnect", lambda self: False)
+        monkeypatch.setattr(
+            ledger, "_insert_snapshot",
+            lambda **kw: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+        )
+
+        for _ in range(3):
+            assert w.poll_once() == []
+
+    assert "poll snapshot failed" in caplog.text
+    assert "best-effort" in caplog.text
+    # The gate never fired: the ledger itself was writable throughout.
+    assert "skipping this pass entirely" not in caplog.text
+
+
+def test_a_failed_correctness_write_does_not_re_enqueue_on_the_next_pass(tmp_path, clock, caplog):
+    """THE round-1 blocker, pinned at the loop level (PR #63).
+
+    `State`-level strictness only aborts the pass that fails. The firewall then
+    hands the loop straight back to the same code path, and the side effect the
+    write was meant to dedupe has already been taken -- so a read-only volume
+    turned "enqueue a reviewer, fail to record it" into a fresh reviewer session
+    every poll, forever. Driven through the REAL `poll_once` so the gate is what
+    is under test, not a paraphrase of it.
+    """
+    caplog.set_level(logging.INFO)
+    db = tmp_path / "state.db"
+    config = Config(
+        workspace_root=tmp_path,
+        hub_template="{root}/{repo}/main",
+        state_path=db,
+        poll_interval=60,
+    )
+    with State(db) as ledger:
+        w = _SpawningWatcher(
+            config, github=_OneRequest(), alissa=_NoSessions(), state=ledger
+        )
+        _read_only(db)
+        try:
+            # Five passes' worth of loop, then the stop signal.
+            w.stop_after = 5
+            w.run_forever()
+
+            assert w.enqueued == [], "no session may be queued that cannot be recorded"
+            assert w.polls == 5, "and the daemon must still be polling"
+            assert "cannot be written — skipping this pass entirely" in caplog.text
+            assert any(
+                r.levelno >= logging.WARNING
+                and "skipping this pass entirely" in r.getMessage()
+                for r in caplog.records
+            ), "a daemon deciding nothing must say so at WARNING or above"
+        finally:
+            _writable(db)
+
+        # The gate is a gate, not a permanent stop: one pass once writable.
+        w.stop_after = w.polls + 1
+        w.run_forever()
+
+        assert len(w.enqueued) == 1
+        assert ledger.get_spawn("acme/widgets", 7, 1) is not None
 
 
 def test_the_first_failure_of_a_streak_reconnects_once(tmp_path, caplog):
@@ -416,6 +538,41 @@ class _NoRequests:
 
     def review_requests(self, repos):
         return []
+
+
+class _OneRequest(_NoRequests):
+    """One pending review request, so the pass has something to decide."""
+
+    def review_requests(self, repos):
+        return [("acme", "widgets", 7)]
+
+
+class _SpawningWatcher(ReviewWatcher):
+    """A watcher whose `evaluate` is the shape of `_spawn`: it takes the side
+    effect FIRST (enqueue a reviewer session) and only then records it, which
+    is the ordering the real `_spawn` has and the reason the blocker existed."""
+
+    stop_after = 1
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enqueued: list[str] = []
+        self.polls = 0
+
+    def poll_once(self):
+        if self.polls >= self.stop_after:
+            raise KeyboardInterrupt
+        self.polls += 1
+        return super().poll_once()
+
+    def evaluate(self, owner, repo, number):
+        session = f"review-{repo}-pr{number}-r1-{len(self.enqueued)}"
+        self.enqueued.append(session)          # the side effect, taken
+        self.state.record_spawn(               # ...and then recorded. Strict.
+            repo=f"{owner}/{repo}", number=number, round_=1,
+            head_sha="abc", session=session, task_ref=None,
+        )
+        return loop_module.Decision(loop_module.Action.SPAWNED, "spawned", 1)
 
 
 class _NoSessions:

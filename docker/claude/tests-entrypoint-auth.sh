@@ -20,6 +20,11 @@
 #   4. token rejected (401)  -> FATAL, fast, ONE login attempt, names the real
 #                               stderr and ALISSA_API_TOKEN rotation
 #
+# Plus one property that cuts across them, because surfacing stderr on a loop
+# that retries forever is a new exposure the muted version did not have:
+#
+#   5. a CLI that echoes the token in its error -> redacted before it is logged
+#
 # Usage: bash docker/claude/tests-entrypoint-auth.sh
 # Needs: bash, python3, jq (the entrypoint's own config rendering uses both).
 # =============================================================================
@@ -76,6 +81,14 @@ case "$1 $2" in
     echo "login" >> "${SPY_DIR}/login-attempts"
     if [ "${ALISSA_STUB_LOGIN:-ok}" = "reject" ]; then
       echo "Error: request failed with HTTP 401 Unauthorized (token is invalid or revoked)" >&2
+      exit 1
+    fi
+    # A CLI that echoes the credential it was handed back in its error text —
+    # a plausible shape, and the entrypoint passes it on the command line. NOT
+    # a rejection, so this exercises the forever-retry path, which is where the
+    # exposure compounds (one line per backoff step, indefinitely).
+    if [ "${ALISSA_STUB_LOGIN:-ok}" = "echo-token" ]; then
+      echo "Error: connection reset while authenticating with --token ${ALISSA_API_TOKEN}" >&2
       exit 1
     fi
     echo "Authenticated."
@@ -261,6 +274,27 @@ if [ "${BOOT_STATUS}" != "0" ]; then
 else
   bad "the entrypoint should have exited non-zero on a rejected token"
 fi
+
+# -----------------------------------------------------------------------------
+info "5. a CLI that echoes the token in its error -> redacted before logging"
+# -----------------------------------------------------------------------------
+reset_spies
+LOG5="${TMPROOT}/redaction.log"
+start_boot "${LOG5}" ALISSA_STUB_LOGIN=echo-token
+# Not a rejection, so it retries forever: let a couple of lines accumulate.
+for _ in $(seq 1 20); do
+  [ "$(grep -c 'connection reset' "${LOG5}" 2>/dev/null || true)" -ge 2 ] && break
+  sleep 1
+done
+kill -TERM "${BOOT_PID}" 2>/dev/null || true
+wait "${BOOT_PID}" 2>/dev/null || true
+
+assert_contains "${LOG5}" "connection reset while authenticating" \
+  "the real stderr still reaches the log"
+assert_contains "${LOG5}" "***REDACTED***" "with the credential substituted out"
+assert_not_contains "${LOG5}" "stub-alissa-token" \
+  "and the token value NEVER appears, on any of the repeated retry lines"
+assert_not_contains "${LOG5}" "FATAL" "a token-echoing transport error is not a rejection"
 
 echo
 if [ "${fail}" = "0" ]; then

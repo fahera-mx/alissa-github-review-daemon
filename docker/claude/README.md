@@ -97,11 +97,22 @@ further attempt also logs an `ERROR` naming token rotation as the thing to check
 | `ALISSA_AUTH_RETRY_SECONDS` | `30` | first backoff step for the self-healing classes |
 | `ALISSA_AUTH_RETRY_CAP_SECONDS` | `600` | ceiling the doubling stops at |
 | `ALISSA_AUTH_ESCALATE_SECONDS` | `600` | after this much total waiting, each retry also logs page-worthy `ERROR` |
-| `ALISSA_INSTALL_URL` | `https://share.alissa.app/install` | installer used to re-bootstrap a missing CLI |
 
-The defaults are the intended production values; the knobs exist so
+The defaults are the intended production values; these three knobs exist so
 `tests-entrypoint-auth.sh` can exercise the retry loop without waiting out real
-minutes. The daemon itself has the matching property in-process — see
+minutes.
+
+> **`ALISSA_INSTALL_URL` is test-only — do not set it in a deploy.** The
+> re-bootstrap runs `curl -fsSL "$ALISSA_INSTALL_URL" | bash`, so overriding it
+> makes the entrypoint execute remote code from wherever it points. It exists
+> for `tests-entrypoint-auth.sh` and is **not** a supported production lever;
+> leave it unset and the official installer
+> (`https://share.alissa.app/install`) is used. No checksum is pinned against
+> that default on purpose: a pin in this repo goes stale on every installer
+> release, and a stale pin would turn the self-healing re-bootstrap into a hard
+> failure during exactly the incident it exists for.
+
+The daemon itself has the matching property in-process — see
 [Crash resilience](#crash-resilience-the-daemon-survives-its-substrate).
 
 ### claude auth: log in once, persisted on the volume (recommended)
