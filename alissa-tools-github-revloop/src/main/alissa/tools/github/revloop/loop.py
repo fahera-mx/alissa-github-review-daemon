@@ -36,8 +36,14 @@ from .config import (
     Config,
 )
 from .ghclient import (
+    CHECKS_GREEN,
+    CHECKS_PENDING,
+    CHECKS_RED,
+    CHECKS_UNKNOWN,
     EVENT_APPROVE,
+    EVENT_COMMENT,
     EVENT_REQUEST_CHANGES,
+    CheckRollup,
     GitHub,
     IssueComment,
     PullRequest,
@@ -93,6 +99,14 @@ MAX_VERDICT_POST_ATTEMPTS = 5
 # day, per stuck PR, with the operator paged exactly once.
 MAX_VERDICT_POST_BACKOFF_SECONDS = 60 * 60
 
+# The GitHub review states the CI gate can produce for a round it refused to
+# approve: a red head lands as CHANGES_REQUESTED, a rollup that never concluded
+# as COMMENTED. Read by _convergence_reason, which must not converge on an
+# approve envelope whose native verdict is one of these -- and must not be
+# broader than this, or it would silently redefine what a DISMISSED review means
+# for convergence (see the comment there).
+GATED_VERDICT_STATES = ("COMMENTED", "CHANGES_REQUESTED")
+
 
 def _post_delay_after(attempts: int) -> float:
     """Seconds to wait after attempt `attempts` before trying again.
@@ -136,6 +150,83 @@ HEAD_MOVED_NOTE = (
     "\n\n> This verdict judged `{judged}`; the head is now `{head}`. It is "
     "recorded against the commit it actually reviewed, so it does **not** "
     "count as a verdict on the newer code — the next round is owed."
+)
+
+# Prepended to a verdict body whose APPROVE the CI gate turned into a
+# REQUEST_CHANGES: the head's own checks are red. It leads with the failing
+# names and run URLs because that is the only actionable content of the review
+# -- the code review found nothing (the envelope reads approve) and the operator
+# would otherwise have to go hunting for what "not approved" refers to.
+CHECKS_RED_LEAD = (
+    "**Not approving `{sha}` — its CI checks are red.**\n\n"
+    "{failing}\n\n"
+    "The code review itself reached `{verdict}`: nothing below is a new finding "
+    "about the diff. What blocks the approve is the head's own check rollup. An "
+    "approve from this identity is the operator's merge cue, so it has to mean "
+    "*reviewed AND green* — on 2026-07-29 (studio #323) a round approved 3.4 "
+    "hours after CI had gone red, and the red sat unaddressed because the "
+    "approve read as ready.\n\n"
+    "Fix (or re-run) the check(s) above and re-request review; the next round "
+    "can approve the same code on a green head. No label was touched.\n\n"
+)
+
+# One bullet per blocking context. The URL is what makes the finding walkable;
+# a check run without one (rare, and never for Actions) still names itself.
+CHECKS_FAILING_LINE = "- `{name}` — {conclusion}{url}"
+
+# Prepended when the gate held the approve for the whole wait bound and the
+# rollup still had not settled, so the verdict lands as a COMMENT.
+CHECKS_UNSETTLED_LEAD = (
+    "**Recorded as a comment, not an approve — the CI rollup at `{sha}` never "
+    "concluded.**\n\n"
+    "{detail}\n\n"
+    "This round's verdict was held for {waited} min waiting for the head's "
+    "checks to settle ({bound} min bound) and they did not, so it is recorded "
+    "as a comment: an approve would claim a head this loop never saw go green. "
+    "Nothing about the review itself changed — the verdict below is the round's "
+    "own.\n\n"
+    "Submitting this review consumes the pending review request, so the daemon "
+    "will not look at this PR again on its own: **conclude or fix the checks and "
+    "re-request review**, and the next round can approve the same code on a "
+    "green head. No label was touched.\n\n"
+)
+
+# The operator page that follows a DEGRADED verdict, and the reason it exists:
+# submitting any review -- `COMMENT` included -- consumes the pending review
+# request, so the PR leaves `review-requested:@me` the moment the degraded
+# verdict lands. Nothing then brings it back on its own: a `COMMENT` is not what
+# the DEV fix/re-request flow keys on (that reads REQUEST_CHANGES), and the
+# operator's own cue, an APPROVE, never comes. Without this the PR strands
+# silently with an unsettled rollup and no cap-out -- the same class as the #227
+# latch. The red path needs no page: REQUEST_CHANGES re-enters by itself.
+#
+# One page per (round, judged head) through the ping ledger, and it names what
+# to do rather than just what happened.
+CHECKS_UNSETTLED_PAGE = (
+    "**Review round {round} could not approve `{sha}` — its CI rollup never "
+    "concluded.**\n\n"
+    "{detail}\n\n"
+    "The round's verdict is on the PR as a comment-mode review ({url}) rather "
+    "than an approve: the code review itself reached `{verdict}`, but an approve "
+    "from `{reviewer}` is the merge cue and this loop never saw the head go "
+    "green.\n\n"
+    "**This needs a human, because the loop cannot re-enter on its own.** "
+    "Submitting that review consumed the pending review request, so this PR has "
+    "left the daemon's attention set. Two ways forward:\n\n"
+    "1. conclude or fix the checks, then **re-request review from "
+    "`{reviewer}`** — the next round reviews the same code and can approve it on "
+    "a green head;\n"
+    "2. merge with a recorded waiver, if the unsettled checks are known-broken "
+    "rather than known-red.\n\n"
+    "No label was touched and no further round is queued."
+)
+
+# The `{detail}` above, per reason the rollup did not settle.
+CHECKS_STILL_RUNNING = "Still running at the bound: {names}."
+CHECKS_UNREADABLE = (
+    "The rollup could not be read: `{why}`. An unreadable rollup is not a green "
+    "one — check that the reviewer credential carries `checks: read` on this "
+    "repo."
 )
 
 # The operator page for a native verdict post that keeps failing. Loud on
@@ -546,6 +637,33 @@ def parse_reentry_ack(body: str) -> Ack:
     return Ack(rounds=rounds)
 
 
+def checks_unsettled_kind(round_: int, head_sha: str) -> str:
+    """The ping-ledger kind that dedupes ONE degraded round's operator page.
+
+    Per (round, head) like the hold note, and recorded only AFTER the comment
+    lands: this page is the operator's only signal that a PR has left the loop
+    holding an unsettled rollup, so a transient comment failure must retry
+    rather than be swallowed.
+    """
+    return f"checks-unsettled:{round_}:{head_sha}"
+
+
+def checks_hold_kind(round_: int, head_sha: str) -> str:
+    """The ping-ledger kind that dedupes ONE held round's activity line.
+
+    A hold is re-decided every poll, so an append per decision would grow the
+    activity comment by an identical line a minute for as long as CI runs. One
+    line per (round, head) says the whole thing -- "this round is waiting on the
+    checks at this commit" -- and the head is in the key because a round whose
+    verdict is pinned to a different commit is a different wait.
+
+    The issue's contract is at most ONE waiting note per round and no new
+    comments; this appends to the existing mechanical activity comment rather
+    than posting its own, so a held round costs zero new comments.
+    """
+    return f"checks-hold:{round_}:{head_sha}"
+
+
 def verdict_post_kind(round_: int) -> str:
     """The ping-ledger kind that dedupes ONE round's failed-post page.
 
@@ -597,6 +715,32 @@ class Decision:
     task_ref: str | None = None
     deferred: bool = False
     reenqueued: bool = False
+
+
+@dataclass(frozen=True)
+class ChecksGate:
+    """What the head's CI rollup does to a round's APPROVE verdict.
+
+    Three shapes, matching the three things the gate can decide:
+
+    * `hold` set -- do not post at all this poll (the rollup has not settled and
+      the wait bound has not run out). The round stays open, exactly as it does
+      inside the pre-post grace window.
+    * `event` changed -- post, but not as an approve: REQUEST_CHANGES on a red
+      head, COMMENT when the rollup never settled. `lead` is prepended to the
+      verdict body and names the checks.
+    * neither -- green (or nothing to gate): the post proceeds unchanged.
+    """
+
+    hold: Decision | None = None
+    event: str = EVENT_APPROVE
+    lead: str = ""
+    # The rollup state that produced this decision, for the log/activity line.
+    state: str = CHECKS_GREEN
+    # The human-readable "why it did not settle", reused verbatim in the
+    # operator page that follows a degraded verdict (see _page_unsettled_checks)
+    # so the page and the review record cannot drift apart.
+    detail: str = ""
 
 
 def session_name(pr: PullRequest, round_: int) -> str:
@@ -651,6 +795,12 @@ class ReviewWatcher:
         # dry-run should not re-announce the same drift every poll either --
         # see _warn_identity_drift.
         self._dry_run_drift: set[tuple[str, int, str]] = set()
+        # (repo slug, number, round, judged head) -> the rollup summary this
+        # process already read for it in DRY-RUN. The dry-run branch returns
+        # before any ledger write, so without this the diagnostic re-reads the
+        # rollup (two API calls) on every poll, forever, for every PR with an
+        # owed approve. In-memory for the same reason _dry_run_drift is.
+        self._dry_run_rollups: dict[tuple[str, int, int, str], str] = {}
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -809,14 +959,37 @@ class ReviewWatcher:
             )
 
         if self.config.dry_run:
+            # The rollup is READ here even in dry-run (a read takes nothing on
+            # GitHub and writes no ledger row), because "would this approve have
+            # been gated?" is exactly the question an operator reaches for
+            # dry-run to answer -- the same argument the identity-drift check
+            # makes for observing rather than staying silent.
+            # ...but ONCE per round per head, not every poll. A dry-run pass
+            # returns before the ledger bookkeeping (deliberately: it must write
+            # no durable state), so the dedupe is in-memory and
+            # process-lifetime, exactly as _dry_run_drift is and for the same
+            # reason -- a dry-run observation must never be silenced by
+            # something a production pass could have written, or the other way
+            # round.
+            checks = ""
+            if verdict == VERDICT_APPROVE:
+                judged = self._judged_head(pr, round_)
+                seen = (pr.full_name, pr.number, round_, judged)
+                if seen not in self._dry_run_rollups:
+                    rollup = self.github.check_rollup(pr.owner, pr.repo, judged)
+                    self._dry_run_rollups[seen] = rollup.summary
+                checks = (
+                    f"; CI rollup at the judged head is "
+                    f"{self._dry_run_rollups[seen]}"
+                )
             log.info(
-                "[dry-run] would submit a native %s review for round %d of %s",
-                verdict, round_, pr.slug,
+                "[dry-run] would submit a native %s review for round %d of %s%s",
+                verdict, round_, pr.slug, checks,
             )
             return Decision(
                 Action.AWAITING_POST,
                 f"[dry-run] round {round_} would be closed with a native "
-                f"{verdict} review",
+                f"{verdict} review{checks}",
                 round_,
                 task_ref=task.ref,
             )
@@ -853,7 +1026,18 @@ class ReviewWatcher:
         judged = str(row["head_sha"] or pr.head_sha)
         moved = bool(judged) and judged != pr.head_sha
         event = EVENT_APPROVE if verdict == VERDICT_APPROVE else EVENT_REQUEST_CHANGES
-        body = NATIVE_VERDICT_BODY.format(
+
+        # THE CI GATE (issue #58). Only an APPROVE is gated: a REQUEST_CHANGES on
+        # a red head is already a "not ready" signal and says nothing that CI
+        # could contradict.
+        gate = ChecksGate()
+        if event == EVENT_APPROVE:
+            gate = self._gate_on_checks(pr, task, round_, judged)
+            if gate.hold is not None:
+                return gate.hold
+            event = gate.event
+
+        body = gate.lead + NATIVE_VERDICT_BODY.format(
             round=round_,
             verdict=verdict,
             task_note=_VERDICT_TASK_NOTE.format(task_ref=task.ref),
@@ -881,23 +1065,225 @@ class ReviewWatcher:
             # take down a poll pass that has other PRs to decide.
             return self._verdict_post_failed(pr, task, round_, verdict, judged, exc)
 
+        # Named in all three records when the gate downgraded the verdict, so
+        # "the envelope says approve but GitHub says otherwise" is never a
+        # mystery in the log, the activity comment, or the poll snapshot.
+        gate_note = (
+            ""
+            if gate.state == CHECKS_GREEN
+            else f" — CI gate: the rollup at {judged[:8]} is {gate.state}, so the "
+            f"{verdict} envelope did not post as an APPROVE"
+        )
         self.state.record_verdict_post(pr.full_name, pr.number, round_, url)
         log.info(
-            "%s round %d closed: native %s review submitted as %s (%s)",
-            pr.slug, round_, event, self.github.login, url or "no url",
+            "%s round %d closed: native %s review submitted as %s (%s)%s",
+            pr.slug, round_, event, self.github.login, url or "no url", gate_note,
         )
         self._append_activity(
             pr,
             f"- {_now()} — round {round_} — native `{event}` review submitted "
-            f"as `{self.github.login}` (verdict of record)",
+            f"as `{self.github.login}` (verdict of record){gate_note}",
         )
+        if event == EVENT_COMMENT:
+            # A degraded verdict takes the PR out of the loop (the review
+            # request is consumed) without leaving a signal anything acts on.
+            self._page_unsettled_checks(pr, round_, judged, verdict, url, gate.detail)
         return Decision(
             Action.POSTED,
             f"round {round_} closed with a native {event} review as "
-            f"{self.github.login}",
+            f"{self.github.login}{gate_note}",
             round_,
             task_ref=task.ref,
         )
+
+    def _gate_on_checks(
+        self, pr: PullRequest, task: Task, round_: int, judged: str
+    ) -> ChecksGate:
+        """Decide what the CI rollup at `judged` does to this round's approve.
+
+        The rule the gate exists to keep: an APPROVE by the reviewer identity
+        means *reviewed AND green*, because it is the operator's cue to merge.
+        On studio #323 a round approved 3.4 hours after the head's `test` check
+        had gone red, the operator's merge gate received an "approved, ready" PR
+        that was unmergeable-red, and the failure sat unaddressed until a human
+        noticed (issue #58).
+
+        Read on the head the verdict is PINNED to, never the PR's current head:
+        approving commit A on commit B's rollup is the same class of error as
+        stamping an old verdict onto a new head (see _judged_head). When the two
+        differ the existing head-moved handling still does its job -- the review
+        is recorded against `judged` and does not converge the loop -- and this
+        gate additionally refuses to call that commit green on someone else's
+        checks.
+
+        What it never does: touch labels. `alissa:maintain` and every other
+        cross-daemon trigger stays an operator/devloop concern; revloop shapes
+        its own verdict and nothing else. Nor does it post a comment of its own
+        while waiting -- the wait note goes into the existing mechanical activity
+        comment, once per held round (checks_hold_kind).
+        """
+        rollup = self.github.check_rollup(pr.owner, pr.repo, judged)
+
+        if rollup.state == CHECKS_GREEN:
+            log.debug(
+                "%s round %d: CI rollup at %s is %s — approving as usual",
+                pr.slug, round_, judged[:8], rollup.summary,
+            )
+            return ChecksGate()
+
+        if rollup.state == CHECKS_RED:
+            log.warning(
+                "%s round %d: NOT approving %s — its CI rollup is %s. The "
+                "%s envelope lands as a %s review instead",
+                pr.slug, round_, judged[:8], rollup.summary,
+                VERDICT_APPROVE, EVENT_REQUEST_CHANGES,
+            )
+            failing = "\n".join(
+                CHECKS_FAILING_LINE.format(
+                    name=context.name,
+                    conclusion=context.conclusion or "not concluded",
+                    url=f" — {context.url}" if context.url else "",
+                )
+                for context in rollup.failing
+            )
+            return ChecksGate(
+                event=EVENT_REQUEST_CHANGES,
+                lead=CHECKS_RED_LEAD.format(
+                    sha=judged[:8], failing=failing, verdict=VERDICT_APPROVE
+                ),
+                state=CHECKS_RED,
+            )
+
+        # PENDING (checks still running) or UNKNOWN (the rollup could not be
+        # read) -- neither can support an approve, and both can settle, so both
+        # HOLD the round first and only degrade at the bound.
+        #
+        # The clock is stamped against the CONDITION being waited on, and gets
+        # exactly one restart: when an `unknown` hold is promoted to a `pending`
+        # one. A transient read failure is not an observation of checks running,
+        # so it must not eat the bound a real suite is entitled to. One restart,
+        # never "restart whenever the state changes" -- a reader flapping between
+        # the two would then push the bound out forever, which is precisely the
+        # unbounded hold this bound exists to prevent.
+        held_at, held_state = self.state.checks_hold(pr.full_name, pr.number, round_)
+        promoted = held_state == CHECKS_UNKNOWN and rollup.state == CHECKS_PENDING
+        if held_at is None or promoted:
+            held_at = self.state.record_checks_hold(
+                pr.full_name, pr.number, round_, rollup.state
+            )
+        waited = max(time.time() - held_at, 0)
+        bound = self.config.checks_wait_seconds
+        if waited < bound:
+            # One line per poll, one activity note per held round; see
+            # checks_hold_kind.
+            log.info(
+                "%s round %d: holding its %s — CI rollup at %s is %s (%dm of the "
+                "%dm bound waited)",
+                pr.slug, round_, VERDICT_APPROVE, judged[:8], rollup.summary,
+                waited // 60, bound // 60,
+            )
+            self._note_checks_hold(pr, round_, judged, rollup)
+            return ChecksGate(
+                hold=Decision(
+                    Action.AWAITING_POST,
+                    f"round {round_} holds its {VERDICT_APPROVE} — the CI rollup "
+                    f"at {judged[:8]} is {rollup.summary}; "
+                    f"{int((bound - waited) // 60)}m of the wait bound left",
+                    round_,
+                    task_ref=task.ref,
+                ),
+                state=rollup.state,
+            )
+
+        log.warning(
+            "%s round %d: the CI rollup at %s is still %s after %dm — recording "
+            "the %s envelope as a %s review, never an APPROVE on an unverified "
+            "head",
+            pr.slug, round_, judged[:8], rollup.summary, waited // 60,
+            VERDICT_APPROVE, EVENT_COMMENT,
+        )
+        detail = (
+            CHECKS_STILL_RUNNING.format(
+                names=", ".join(f"`{c.name}`" for c in rollup.running) or "none"
+            )
+            if rollup.state == CHECKS_PENDING
+            else CHECKS_UNREADABLE.format(why=rollup.unreadable or "no reason recorded")
+        )
+        return ChecksGate(
+            event=EVENT_COMMENT,
+            lead=CHECKS_UNSETTLED_LEAD.format(
+                sha=judged[:8],
+                detail=detail,
+                waited=int(waited // 60),
+                bound=int(bound // 60),
+            ),
+            state=rollup.state,
+            detail=detail,
+        )
+
+    def _page_unsettled_checks(
+        self,
+        pr: PullRequest,
+        round_: int,
+        judged: str,
+        verdict: str,
+        url: str,
+        detail: str,
+    ) -> None:
+        """Page the operator ONCE for a round that degraded to a comment.
+
+        See CHECKS_UNSETTLED_PAGE for why this is owed: the degraded verdict
+        consumes the review request, so the PR silently leaves the poll set with
+        nothing downstream of it. The ledger row lands only AFTER the comment
+        does, as with every ping here -- but note this one may not get a second
+        chance, because the very post that made it necessary is what takes the
+        PR out of the search. So a failure logs at ERROR (with the body, which is
+        then the only place the diagnosis exists) rather than at warning.
+        """
+        kind = checks_unsettled_kind(round_, judged)
+        if self.state.pinged(pr.full_name, pr.number, kind):
+            return
+        body = CHECKS_UNSETTLED_PAGE.format(
+            round=round_,
+            sha=judged[:8],
+            detail=detail,
+            url=url or "no url recorded",
+            verdict=verdict,
+            reviewer=self.github.login,
+        )
+        try:
+            self.github.comment(pr.owner, pr.repo, pr.number, body)
+        except Exception as exc:
+            log.error(
+                "%s round %d: could not post the unsettled-checks page (%s). The "
+                "degraded verdict consumed the review request, so this PR has "
+                "left the poll set and the page may never be retried — it needed "
+                "to say:\n%s",
+                pr.slug, round_, exc, body,
+            )
+            return
+        self.state.record_ping(pr.full_name, pr.number, kind)
+
+    def _note_checks_hold(
+        self, pr: PullRequest, round_: int, judged: str, rollup: CheckRollup
+    ) -> None:
+        """Append ONE activity line for a round held on its checks.
+
+        Ledger row after the append, like every other activity note here, so a
+        transient comment failure retries next poll instead of losing the line.
+        """
+        kind = checks_hold_kind(round_, judged)
+        if self.state.pinged(pr.full_name, pr.number, kind):
+            return
+        if not self._append_activity(
+            pr,
+            f"- {_now()} — round {round_} — verdict held: the CI rollup at "
+            f"`{judged[:8]}` is {rollup.summary}. An approve has to mean "
+            f"reviewed AND green, so the round stays open "
+            f"(bound: {self.config.checks_wait_seconds // 60}m).",
+        ):
+            return
+        self.state.record_ping(pr.full_name, pr.number, kind)
 
     def _judged_head(self, pr: PullRequest, round_: int) -> str:
         """The head round `round_`'s verdict is ABOUT — not the current one.
@@ -1360,6 +1746,29 @@ class ReviewWatcher:
 
         if newest.state == "APPROVED":
             return "last GitHub review state is APPROVED"
+
+        # A native verdict THIS daemon posted at this head that is NOT an
+        # approve is the daemon's own refusal to approve the head, and it
+        # outranks the envelope it was posted from. Today only the CI gate
+        # produces that shape (issue #58): a red or never-concluded rollup turns
+        # an approve envelope into a REQUEST_CHANGES or COMMENT review. Without
+        # this, the very next poll would converge on the envelope, withdraw the
+        # review request, and take the PR out of the loop on a verdict the
+        # daemon deliberately declined to post as an APPROVE -- leaving nothing
+        # to re-enter and no later green round to approve it.
+        #
+        # Deliberately narrowed to the two states the gate can produce.
+        # `SUBMITTED_STATES` also includes DISMISSED, and a daemon-posted review
+        # carries its `verdict_round` forever -- so a broader test would ALSO
+        # change what a dismissed approve does to convergence (today the
+        # envelope still converges it). That may well be wrong, but it is
+        # pre-existing and its own question: TASK-939082213. This change is
+        # exactly the one its rationale claims.
+        if (
+            newest.verdict_round is not None
+            and newest.state in GATED_VERDICT_STATES
+        ):
+            return None
 
         # Only checkable once a review task exists; before that there is
         # nowhere for a verdict to have been recorded.

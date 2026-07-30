@@ -239,6 +239,12 @@ ARG ALISSA_REVIEWER_TOKEN_ENV=""
 # threshold for live reviewer sessions left after a sweep.
 ARG ALISSA_REAP_GRACE_SECONDS=""
 ARG ALISSA_REAP_SESSION_CAP=""
+# How long a round holds its APPROVE while the judged head's CI rollup is still
+# running (or unreadable) before recording the verdict as a comment instead. A
+# RED rollup never waits and never approves, whatever this says. Pass-through,
+# and it REQUIRES REVLOOP_VERSION >= 0.16.7 for the same reason the two keys
+# above it do: an older library rejects the unknown config key at load.
+ARG ALISSA_CHECKS_WAIT_SECONDS=""
 # STRUCTURAL container constants (not pass-through): agent_profile must name a
 # profile the baked agents.yaml ships (`claude`); on_missing_hub must be `add`
 # for the self-contained hub-ify-on-demand model (the library default `skip`
@@ -265,6 +271,7 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
     ALISSA_REAP_GRACE_SECONDS=${ALISSA_REAP_GRACE_SECONDS} \
     ALISSA_REAP_SESSION_CAP=${ALISSA_REAP_SESSION_CAP} \
+    ALISSA_CHECKS_WAIT_SECONDS=${ALISSA_CHECKS_WAIT_SECONDS} \
     ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} \
     ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \

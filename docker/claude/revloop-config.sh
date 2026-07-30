@@ -14,7 +14,9 @@
 #   * PASS-THROUGH (optional tuning knobs) — emitted ONLY when the env var is
 #     set. When unset the key is omitted entirely and the daemon library applies
 #     its own current default. These are pure tuning values where the library is
-#     the authority: poll_interval, round_cap, operators (an EMPTY operator
+#     the authority: poll_interval, round_cap, checks_wait_seconds (how long a
+#     round holds its approve for an unsettled CI rollup -- a property of the
+#     watched repos' CI, not of the image), operators (an EMPTY operator
 #     allowlist is the library's fail-closed default -- emitting `[]` would say
 #     the same thing, but omitting it keeps "unset means the library decides"
 #     true for every optional key without exception).
@@ -71,6 +73,7 @@ render_revloop_config() {
     --arg     cap    "${ALISSA_ROUND_CAP:-}" \
     --arg     grace  "${ALISSA_REAP_GRACE_SECONDS:-}" \
     --arg     scap   "${ALISSA_REAP_SESSION_CAP:-}" \
+    --arg     cwait  "${ALISSA_CHECKS_WAIT_SECONDS:-}" \
     --arg     rlogin "${ALISSA_REVIEWER_LOGIN:-}" \
     --arg     rtoken "${ALISSA_REVIEWER_TOKEN_ENV:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
@@ -78,6 +81,7 @@ render_revloop_config() {
      + (if $cap   == "" then {} else { round_cap:          ($cap   | tonumber) } end)
      + (if $grace == "" then {} else { reap_grace_seconds: ($grace | tonumber) } end)
      + (if $scap  == "" then {} else { reap_session_cap:   ($scap  | tonumber) } end)
+     + (if $cwait == "" then {} else { checks_wait_seconds: ($cwait | tonumber) } end)
      + (if $rlogin == "" then {} else { reviewer_login:     $rlogin } end)
      + (if $rtoken == "" then {} else { reviewer_token_env: $rtoken } end)
      + (if ($operators | length) == 0 then {} else { operators: $operators } end)'
