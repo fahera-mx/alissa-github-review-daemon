@@ -115,6 +115,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `on_missing_hub` | `skip` | `skip` \| `add` — see *Provisioning new repos* |
 | `reap_grace_seconds` | `1800` | how long a reviewer session must be idle **and** quiet before the sweep reaps it (and before a stale round reads it as dead); must be **well under** the 90-minute stale-round window, which the loader enforces |
 | `reap_session_cap` | `6` | more live reviewer sessions than this after a sweep and the daemon logs page-worthy; an alarm threshold, not a capacity limit |
+| `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead; a **red** rollup never waits and never approves — see *Never approve a red head* |
 
 ### Config file discovery
 
@@ -192,6 +193,38 @@ inject the token at runtime like any other secret. The entrypoint resolves the
 login at boot and refuses to start if the variable is empty, the token is
 rejected, or it belongs to someone other than `ALISSA_REVIEWER_LOGIN`.
 
+### Never approve a red head: the CI checks gate
+
+An `APPROVE` from the reviewer identity is the operator's cue to merge, so it
+has to mean **reviewed AND green**. On studio #323 it did not: the head's `test`
+check failed at 15:27Z and the round approved at 18:50Z — 3.4 hours later —
+because nothing consulted the checks. The operator's merge gate received an
+"approved, ready" PR that was unmergeable-red, and the failure sat unaddressed
+until a human noticed.
+
+So before a round concludes with an approve, the daemon reads the rollup **of
+the commit the verdict is pinned to** (`GET /commits/<sha>/check-runs` plus
+`/status` — never "the PR's checks", because approving commit A on commit B's
+rollup is the same error as stamping an old verdict onto a new head):
+
+| rollup at the judged head | what the round does |
+| --- | --- |
+| success — including `skipped`/`neutral` contexts (path-filtered matrix jobs) and commits with no checks at all | approves exactly as before |
+| still running, or unreadable | **holds** the round open, re-checking each poll, up to `checks_wait_seconds`; one log line per poll and **one** note in the activity comment, no comment of its own |
+| still unsettled at that bound | records the verdict as a `COMMENT` saying the checks never concluded — never an approve on an unverified head — and the round stays re-enterable |
+| failure/error | posts `REQUEST_CHANGES` leading with the failing check names and run URLs, and no approve |
+
+Two consequences worth stating:
+
+- a non-approve verdict the daemon posted at the current head **outranks the
+  approve envelope behind it** for convergence, so a gated round does not
+  converge the loop: re-request review and a later round approves the same code
+  once CI is green (no new commit required);
+- the gate only ever shapes revloop's **own verdict**. It adds and removes no
+  labels — `alissa:maintain` and every other cross-daemon trigger stays an
+  operator/devloop concern — and `REQUEST_CHANGES` verdicts are not gated at
+  all, since they are already a "not ready" signal.
+
 > **Version floor.** `ALISSA_REVIEWER_LOGIN` and `ALISSA_REVIEWER_TOKEN_ENV`
 > need `REVLOOP_VERSION >= 0.16.3` in the image. The entrypoint renders them
 > into `revloop.config.json` and the daemon rejects unknown config keys, so
@@ -230,6 +263,8 @@ Leave it on `skip` unless you want unattended clones.
 | a round's verdict envelope exists but no reviewer-identity review does | the daemon submits it natively after a short grace; the round is **not** closed until it lands |
 | that post keeps failing | retried with a growing backoff, paged after 5 attempts — the round stays open |
 | the head that round judged is gone (force-push) | the post is abandoned and the round released — a fresh round is owed against the new head |
+| an approve verdict, but the judged head's CI rollup is red | `REQUEST_CHANGES` leading with the failing checks — never an approve on a red head |
+| an approve verdict, but the checks are still running | the round is held open (bounded by `checks_wait_seconds`), then recorded as a `COMMENT` if they never conclude |
 | approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | converged, and the daemon's own review request is *still* pending | that request is withdrawn, so the closed round leaves the poll set — see below |

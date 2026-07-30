@@ -129,6 +129,7 @@ CONFIG_KEYS = (
     "on_missing_hub",
     "reap_grace_seconds",
     "reap_session_cap",
+    "checks_wait_seconds",
     "dry_run",
 )
 
@@ -168,6 +169,20 @@ DEFAULT_REAP_GRACE_SECONDS = 30 * 60
 # loop runs a couple of concurrent rounds, so the default is a threshold no
 # healthy deployment reaches, not a capacity limit.
 DEFAULT_REAP_SESSION_CAP = 6
+
+# How long a round holds its APPROVE while the head's CI rollup is still
+# running (or unreadable) before it gives up and records the verdict as a
+# COMMENT instead. An approve from the reviewer identity is the operator's cue
+# to merge, so it must never claim a head whose checks this loop did not see
+# conclude -- but the round cannot hold open forever either, or a CI system that
+# never reports strands the PR outside the loop.
+#
+# 30 minutes is the trade: longer than any check suite in this fleet (the studio
+# runs finish in single-digit minutes), short enough that a stuck rollup
+# surfaces as a comment within the same working hour instead of the following
+# day. Configurable because the right value is a property of a deployment's CI,
+# not of the daemon.
+DEFAULT_CHECKS_WAIT_SECONDS = 30 * 60
 
 
 def default_state_path(workspace_root: Path) -> Path:
@@ -217,6 +232,12 @@ class Config:
     # buys and why it is tunable rather than pinned.
     reap_grace_seconds: int = DEFAULT_REAP_GRACE_SECONDS
     reap_session_cap: int = DEFAULT_REAP_SESSION_CAP
+
+    # The bound on holding a round's approve for a rollup that has not settled;
+    # see DEFAULT_CHECKS_WAIT_SECONDS. 0 is legal and means "never hold": a
+    # rollup that is not already green degrades the verdict to a comment on the
+    # first poll that would have posted it.
+    checks_wait_seconds: int = DEFAULT_CHECKS_WAIT_SECONDS
 
     dry_run: bool = False
 
@@ -336,6 +357,12 @@ class Config:
             # state of a working loop -- an alarm that always fires is noise.
             raise ValueError(f"reap_session_cap must be >= 1, got {session_cap}")
 
+        checks_wait = int(raw.get("checks_wait_seconds", cls.checks_wait_seconds))
+        if checks_wait < 0:
+            raise ValueError(
+                f"checks_wait_seconds must be >= 0, got {checks_wait}"
+            )
+
         token_env = raw.get("reviewer_token_env")
         if token_env is not None:
             token_env = str(token_env).strip()
@@ -379,6 +406,7 @@ class Config:
             on_missing_hub=hub_mode,
             reap_grace_seconds=grace,
             reap_session_cap=session_cap,
+            checks_wait_seconds=checks_wait,
             dry_run=bool(raw.get("dry_run", False)),
         )
 

@@ -62,11 +62,61 @@ GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 # throttling from an authorization failure -- these can. See `_api`.
 RATE_LIMIT_MARKERS = ("rate limit", "abuse detection", "429")
 
-# The review events the daemon may submit. COMMENT is deliberately absent: a
-# comment-mode review cannot express approval, which is the whole reason the
-# GitHub state was useless as a convergence signal in the first place.
+# The review events the daemon may submit.
 EVENT_APPROVE = "APPROVE"
 EVENT_REQUEST_CHANGES = "REQUEST_CHANGES"
+# COMMENT cannot express approval, which is exactly why it exists here: it is
+# the DEGRADED form of an approve the CI gate refused to post (a rollup that
+# never concluded). It is never a verdict the loop chooses on its own -- see
+# loop._gate_on_checks -- and `submit_review` still refuses anything else.
+EVENT_COMMENT = "COMMENT"
+
+# -- CI check rollup ------------------------------------------------------
+#
+# An APPROVE by the reviewer identity is the operator's cue to merge, so it has
+# to mean "reviewed AND green". These read one commit's rollup so the verdict
+# path can hold that promise; see loop._gate_on_checks for what each state does
+# to a round.
+
+CHECKS_GREEN = "green"
+CHECKS_PENDING = "pending"
+CHECKS_RED = "red"
+# The rollup could not be read at all (an API failure, or more check runs than
+# the page bound). Deliberately its own state rather than folded into either
+# neighbour: unreadable must never approve, and must never post a red verdict
+# naming checks nobody has seen fail.
+CHECKS_UNKNOWN = "unknown"
+
+# Conclusions that do NOT block an approve. `skipped` and `neutral` are the
+# normal answer for a path-filtered matrix job (studio #323's api/cli/mcp/plugin
+# jobs), so treating them as red would block every approve on every repo that
+# filters by path. Every OTHER completed conclusion blocks -- including ones
+# GitHub may add later, which is the conservative direction for a gate whose
+# whole job is to not approve a head it cannot vouch for.
+CHECKS_PASSING_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+
+# Legacy commit-status states, mapped into the check-run conclusion vocabulary
+# so both kinds of context classify through one rule. `pending` becomes the
+# empty conclusion -- "still running" -- and an unrecognised state stays itself,
+# which lands it on the blocking side above.
+_STATUS_CONCLUSIONS = {
+    "success": "success",
+    "failure": "failure",
+    "error": "error",
+    "pending": "",
+}
+
+# How many pages of check runs a rollup read will walk. A matrix job set can be
+# large; it cannot plausibly be 500 runs on one commit, and a bound is what
+# keeps a pathological commit from stalling a poll pass. Past it the rollup is
+# UNKNOWN rather than green -- a partial read cannot support an approve.
+CHECK_RUN_PAGE_LIMIT = 5
+
+# `gh` stderr that says the commit itself is not there. The gate then steps
+# aside: a verdict pinned to a commit the repo no longer serves is the
+# force-push case, and it already has handling (loop._abandon_verdict) that
+# runs off the review POST's own rejection.
+_COMMIT_GONE_MARKERS = ("404", "not found")
 
 # The hidden marker the daemon stamps into every native verdict review it
 # submits, carrying the round it closes. Two jobs, both load-bearing:
@@ -157,6 +207,90 @@ class Review:
         """
         match = _VERDICT_MARKER_RE.search(self.body)
         return int(match.group(1)) if match else None
+
+
+@dataclass(frozen=True)
+class CheckContext:
+    """One check on a commit -- a check run or a legacy commit status.
+
+    `conclusion` is normalised lowercase and EMPTY while the check is still
+    running, which is the whole discriminator the rollup needs: a context with
+    no conclusion yet cannot vouch for the commit, and one with a conclusion
+    outside CHECKS_PASSING_CONCLUSIONS votes against it.
+    """
+
+    name: str
+    conclusion: str = ""
+    url: str = ""
+
+    @property
+    def running(self) -> bool:
+        return not self.conclusion
+
+    @property
+    def passing(self) -> bool:
+        return self.conclusion in CHECKS_PASSING_CONCLUSIONS
+
+
+@dataclass(frozen=True)
+class CheckRollup:
+    """One commit's CI rollup, reduced to the question the verdict path asks:
+    may an APPROVE claim this head?
+
+    `failing` and `running` carry the contexts behind the answer, because a
+    verdict that declines to approve has to say WHICH check it is declining on
+    (with its run URL) or the operator is left to go find it.
+    """
+
+    state: str
+    failing: tuple[CheckContext, ...] = ()
+    running: tuple[CheckContext, ...] = ()
+    total: int = 0
+    # Why `state` is CHECKS_UNKNOWN -- an API error, or the page bound.
+    unreadable: str = ""
+    # The commit is not in the repo at all. Reported instead of guessing at a
+    # rollup: the caller steps aside for the force-push handling it already has.
+    commit_missing: bool = False
+
+    @property
+    def summary(self) -> str:
+        """One log-line description of the rollup."""
+        if self.state == CHECKS_RED:
+            return f"red — failing: {check_names(self.failing)}"
+        if self.state == CHECKS_PENDING:
+            return f"pending — still running: {check_names(self.running)}"
+        if self.state == CHECKS_UNKNOWN:
+            return f"unreadable — {self.unreadable or 'no reason recorded'}"
+        return f"green — {self.total} context(s), none failing or running"
+
+
+def check_names(contexts: "tuple[CheckContext, ...]") -> str:
+    """The contexts' names for a log line, or "none"."""
+    return ", ".join(c.name for c in contexts) or "none"
+
+
+def rollup_of(contexts: "list[CheckContext]") -> CheckRollup:
+    """Reduce read contexts to a rollup state.
+
+    Precedence is failure over running, deliberately: a commit with one job
+    already red and three still going is not "wait and see" -- it cannot be
+    approved at all, and saying so now beats saying it half an hour later.
+
+    NO contexts is GREEN, not pending. A repo (or a commit) with no CI is the
+    pre-gate behaviour and must approve exactly as it always did; the pending
+    hold is for checks that exist and have not finished.
+    """
+    failing = tuple(c for c in contexts if not c.running and not c.passing)
+    running = tuple(c for c in contexts if c.running)
+    if failing:
+        state = CHECKS_RED
+    elif running:
+        state = CHECKS_PENDING
+    else:
+        state = CHECKS_GREEN
+    return CheckRollup(
+        state=state, failing=failing, running=running, total=len(contexts)
+    )
 
 
 def countable_rounds(reviews: list["Review"]) -> int:
@@ -504,6 +638,115 @@ class GitHub:
                 return out
             page += 1
 
+    # -- CI check rollup ---------------------------------------------------
+
+    def check_rollup(self, owner: str, repo: str, sha: str) -> CheckRollup:
+        """The CI rollup for ONE commit -- never for "the PR".
+
+        Pinned to a SHA on purpose, and the SHA the caller passes is the one its
+        verdict is recorded against: `gh pr checks` (and the GraphQL
+        `statusCheckRollup` behind it) answers for whatever the PR's head is at
+        the moment of the call, which is a different commit as soon as the
+        implementer pushes mid-round. Approving commit A on commit B's rollup is
+        the failure this whole path exists to prevent, so the commit endpoints
+        are read instead: they answer about the commit named in the URL and
+        nothing else.
+
+        BOTH kinds of context are read. Check runs are what GitHub Actions
+        produces; legacy commit statuses are what external CI still posts, and a
+        repo can have either or both. The combined-status endpoint answers
+        `state: pending` for a commit with NO statuses at all, so an empty list
+        is dropped rather than read as "something is running" -- otherwise every
+        approve on every Actions-only repo would hold until the wait bound.
+
+        Never raises except RateLimited (which run_forever's backoff owns): an
+        unreadable rollup is a CHECKS_UNKNOWN answer the caller can hold on, not
+        a reason to abort a poll pass that has other PRs to decide.
+        """
+        contexts: list[CheckContext] = []
+        try:
+            contexts.extend(self._check_runs(owner, repo, sha))
+            contexts.extend(self._commit_statuses(owner, repo, sha))
+        except RateLimited:
+            raise
+        except TruncatedListing as exc:
+            return CheckRollup(CHECKS_UNKNOWN, unreadable=str(exc)[:300])
+        except Exception as exc:
+            blob = str(exc).lower()
+            gone = any(marker in blob for marker in _COMMIT_GONE_MARKERS)
+            return CheckRollup(
+                CHECKS_UNKNOWN,
+                unreadable=f"{type(exc).__name__}: {exc}"[:300],
+                commit_missing=gone,
+            )
+        return rollup_of(contexts)
+
+    def _check_runs(self, owner: str, repo: str, sha: str) -> list[CheckContext]:
+        """The commit's check runs, paged to CHECK_RUN_PAGE_LIMIT.
+
+        A run that is not `completed` carries no conclusion here whatever its
+        payload says, so "queued", "in_progress" and "waiting" all read as
+        running -- the states GitHub can add to that list are exactly the ones a
+        gate must not mistake for a verdict.
+        """
+        out: list[CheckContext] = []
+        for page in range(1, CHECK_RUN_PAGE_LIMIT + 1):
+            data = (
+                self._api(
+                    "-X",
+                    "GET",
+                    f"repos/{owner}/{repo}/commits/{sha}/check-runs",
+                    "-f",
+                    f"per_page={PER_PAGE}",
+                    "-f",
+                    f"page={page}",
+                )
+                or {}
+            )
+            runs = data.get("check_runs") or []
+            for run_ in runs:
+                completed = str(run_.get("status") or "").lower() == "completed"
+                out.append(
+                    CheckContext(
+                        name=str(run_.get("name") or "unnamed check"),
+                        conclusion=(
+                            str(run_.get("conclusion") or "").lower()
+                            if completed
+                            else ""
+                        ),
+                        url=str(run_.get("html_url") or run_.get("details_url") or ""),
+                    )
+                )
+            if len(runs) < PER_PAGE:
+                return out
+        raise TruncatedListing(
+            f"{owner}/{repo}@{sha[:8]} has more than "
+            f"{CHECK_RUN_PAGE_LIMIT * PER_PAGE} check runs; the rollup cannot be "
+            f"read completely, so it cannot be called green"
+        )
+
+    def _commit_statuses(self, owner: str, repo: str, sha: str) -> list[CheckContext]:
+        """The commit's legacy statuses, one context each.
+
+        `total_count == 0` means the repo posts no commit statuses at all, and
+        the endpoint's own `state` for that case is `pending` -- which is why
+        only the `statuses` array is read and the combined state is ignored.
+        """
+        data = (
+            self._api("-X", "GET", f"repos/{owner}/{repo}/commits/{sha}/status") or {}
+        )
+        out: list[CheckContext] = []
+        for status in data.get("statuses") or []:
+            state = str(status.get("state") or "").lower()
+            out.append(
+                CheckContext(
+                    name=str(status.get("context") or "unnamed status"),
+                    conclusion=_STATUS_CONCLUSIONS.get(state, state),
+                    url=str(status.get("target_url") or ""),
+                )
+            )
+        return out
+
     def my_reviews(self, owner: str, repo: str, number: int) -> list[Review]:
         """My substantive submitted reviews, oldest first -- one per round.
 
@@ -551,11 +794,16 @@ class GitHub:
         under any other login (see assert_review_identity). `commit_id` pins
         the review to the head it judged, so a later push cannot make an old
         verdict look current.
+
+        COMMENT is accepted, narrowly: it is what an approve DEGRADES to when
+        the head's CI rollup never concluded (loop._gate_on_checks). It still
+        cannot express approval -- that is why the gate reaches for it -- so a
+        round closed by one converges nothing.
         """
-        if event not in (EVENT_APPROVE, EVENT_REQUEST_CHANGES):
+        if event not in (EVENT_APPROVE, EVENT_REQUEST_CHANGES, EVENT_COMMENT):
             raise ValueError(
-                f"event must be {EVENT_APPROVE} or {EVENT_REQUEST_CHANGES}, "
-                f"got {event!r} — a COMMENT review cannot close a round"
+                f"event must be one of {EVENT_APPROVE}, {EVENT_REQUEST_CHANGES}, "
+                f"{EVENT_COMMENT}, got {event!r}"
             )
         login = self.assert_review_identity()
         log.info(

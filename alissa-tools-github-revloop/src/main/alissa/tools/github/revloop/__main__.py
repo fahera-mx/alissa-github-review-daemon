@@ -122,6 +122,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="page-worthy threshold: more live reviewer sessions than this "
         "after a sweep and the daemon logs loudly",
     )
+    over.add_argument(
+        "--checks-wait-seconds",
+        type=int,
+        metavar="SECONDS",
+        help="how long a round holds its approve while the judged head's CI "
+        "rollup is still running (or unreadable) before recording the verdict "
+        "as a comment instead; a red rollup never waits and never approves",
+    )
 
     dry = over.add_mutually_exclusive_group()
     dry.add_argument(
@@ -157,6 +165,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "on_missing_hub": args.on_missing_hub,
         "reap_grace_seconds": args.reap_grace_seconds,
         "reap_session_cap": args.reap_session_cap,
+        "checks_wait_seconds": args.checks_wait_seconds,
         "dry_run": args.dry_run,
     }
 

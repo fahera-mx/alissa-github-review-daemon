@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     -- no longer a commit of the PR (a force-push landed under it). The round is
     -- then released rather than held open forever; see loop._abandon_verdict.
     abandoned_at  INTEGER,
+    -- When this round's APPROVE was FIRST held back because the judged head's
+    -- CI rollup had not settled. The wait bound is measured from here, so a
+    -- rollup that never concludes degrades the verdict to a comment at a fixed
+    -- distance from the first observation rather than from whenever the last
+    -- poll happened to land. NULL means the gate never held this round.
+    checks_held_at INTEGER,
     review_url    TEXT,
     last_error    TEXT,
     PRIMARY KEY (repo, number, round)
@@ -133,16 +139,21 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
 );
 """
 
-# Columns added to `poll_snapshots` after it first shipped. CREATE TABLE IF NOT
-# EXISTS is not a migration: an existing database keeps the ORIGINAL table, so
-# these are ALTERed in on open. Each carries a NOT NULL default, which is what
-# lets an ALTER backfill every historical row without a rewrite -- an old pass
-# genuinely posted no verdicts, so 0 is the true value, not a placeholder.
-_SNAPSHOT_ADDED_COLUMNS = (
-    ("posted", "INTEGER NOT NULL DEFAULT 0"),
-    ("awaiting_post", "INTEGER NOT NULL DEFAULT 0"),
-    ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
-)
+# Columns added to a table after it first shipped. CREATE TABLE IF NOT EXISTS is
+# not a migration: an existing database keeps the ORIGINAL table, so these are
+# ALTERed in on open. A NOT NULL default is what lets an ALTER backfill every
+# historical row without a rewrite -- an old pass genuinely posted no verdicts,
+# so 0 is the true value, not a placeholder. Where "never happened" has no
+# numeric truth (`checks_held_at`), the column is nullable instead and NULL
+# means exactly that.
+_ADDED_COLUMNS = {
+    "poll_snapshots": (
+        ("posted", "INTEGER NOT NULL DEFAULT 0"),
+        ("awaiting_post", "INTEGER NOT NULL DEFAULT 0"),
+        ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+    "verdict_posts": (("checks_held_at", "INTEGER"),),
+}
 
 
 class State:
@@ -181,27 +192,26 @@ class State:
         if self._spawns_keyed_by_round():
             self._migrate_spawns()
         self._db.executescript(SCHEMA)
-        self._migrate_snapshot_columns()
+        self._migrate_added_columns()
         self._db.commit()
 
-    def _migrate_snapshot_columns(self) -> None:
-        """Add any `poll_snapshots` column a pre-existing database predates.
+    def _migrate_added_columns(self) -> None:
+        """Add any column a pre-existing database predates.
 
-        Runs after the schema script (which creates the table with the full
+        Runs after the schema script (which creates every table with its full
         column list on a fresh database, making this a no-op there) and is
         idempotent: the existing columns are read first, so a restart never
         re-ALTERs. Read-only openers never reach it -- the console must not
         migrate a database the daemon owns.
         """
-        existing = {
-            row["name"]
-            for row in self._db.execute("PRAGMA table_info(poll_snapshots)").fetchall()
-        }
-        for name, decl in _SNAPSHOT_ADDED_COLUMNS:
-            if name not in existing:
-                self._db.execute(
-                    f"ALTER TABLE poll_snapshots ADD COLUMN {name} {decl}"
-                )
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {
+                row["name"]
+                for row in self._db.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns:
+                if name not in existing:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def _migrate_spawns(self) -> None:
         """Re-key an old round-keyed `spawns` by session, in ONE transaction.
@@ -488,6 +498,31 @@ class State:
         row = self.get_verdict_post(repo, number, round_)
         return int(row["attempts"]) if row else 0
 
+    def note_checks_hold(self, repo: str, number: int, round_: int) -> int:
+        """Stamp (once) when this round's approve was first held on CI, and
+        return that first-observation timestamp.
+
+        The wait bound is measured from the FIRST hold, so the UPDATE is
+        conditional on the column still being NULL: a timestamp refreshed on
+        every poll would push the bound out forever, which is the same bug the
+        `first_seen_at` comment above warns about one column over.
+
+        Returns `now` when there is no row to stamp -- unreachable through the
+        verdict path, which notes the owed post before it ever gates, and a
+        conservative answer anyway: the caller reads it as "the hold starts now"
+        and holds rather than degrading a verdict on missing bookkeeping.
+        """
+        self._db.execute(
+            "UPDATE verdict_posts SET checks_held_at = ? "
+            "WHERE repo=? AND number=? AND round=? AND checks_held_at IS NULL",
+            (int(time.time()), repo, number, round_),
+        )
+        self._db.commit()
+        row = self.get_verdict_post(repo, number, round_)
+        if row is None or not row["checks_held_at"]:
+            return int(time.time())
+        return int(row["checks_held_at"])
+
     def record_verdict_post_abandoned(
         self, repo: str, number: int, round_: int, why: str
     ) -> None:
@@ -546,7 +581,8 @@ class State:
         """Verdict-post rows, newest observation first."""
         return self._read_rows(
             "SELECT repo, number, round, first_seen_at, head_sha, attempts, "
-            "last_attempt_at, posted_at, abandoned_at, review_url, last_error "
+            "last_attempt_at, posted_at, abandoned_at, checks_held_at, "
+            "review_url, last_error "
             "FROM verdict_posts "
             "ORDER BY first_seen_at DESC, number DESC",
             limit,
