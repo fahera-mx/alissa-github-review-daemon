@@ -130,16 +130,172 @@ gh auth setup-git 2>/dev/null \
   && log "git credential helper configured (gh)" \
   || log "WARN: gh auth setup-git failed — private-repo clone/fetch may not authenticate"
 
+# -----------------------------------------------------------------------------
 # 2c. alissa — tasks, session queue, verdicts. The CLI reads ALISSA_API_TOKEN,
 #     but `auth login` also stores + verifies it, which is the real preflight.
+#
+# TRIAGE BEFORE INTERPRETING (issue #62). On 2026-07-29 this gate crash-looped a
+# Railway deploy through two multi-hour outages while reporting
+# "ALISSA_API_TOKEN rejected" — twice, and the token was valid both times. The
+# CLI binary (an image-layer file at ~/.local/bin/alissa) had vanished mid-run,
+# so `auth login` never reached a server at all; the old line muted stderr and
+# called every non-zero exit a rejection. A wrong diagnosis that also exits
+# FATAL is the worst of both: it needs a human, and it points the human at the
+# wrong thing.
+#
+# Four classes, only ONE of which a human can fix:
+#
+#   1. CLI missing / not executable  -> re-bootstrap from the official installer
+#                                       and retry (covers the image-layer loss)
+#   2. config dir unwritable         -> retry with capped backoff, forever
+#   3. API unreachable (transport)   -> retry with capped backoff, forever
+#   4. server-side rejection (401/403, login RAN and got an answer)
+#                                    -> FATAL, fast, naming token rotation
+#
+# The default for an UNRECOGNISED failure is retry, not FATAL: every outage this
+# gate has actually caused was a platform blip mislabelled as a rejection, and a
+# blip must self-heal with zero human action. An unrecognised failure that never
+# heals is not silent either — the retry log escalates once it outlasts
+# AUTH_ESCALATE_SECONDS and names token rotation as the thing to check.
+#
+# POSIX shell, no new dependencies: `command -v`, `curl` (already required to
+# install the CLI), and the CLI itself.
+# -----------------------------------------------------------------------------
 [ -n "${ALISSA_API_TOKEN:-}" ] \
   || die "no ALISSA_API_TOKEN — cannot reach tasks / session queue"
-if ! command -v alissa >/dev/null 2>&1; then
-  die "alissa CLI missing from PATH (image-layer loss?) — cannot preflight ALISSA_API_TOKEN"
-fi
-LOGIN_ERR="$(alissa auth login --token "${ALISSA_API_TOKEN}" 2>&1 >/dev/null)" \
-  || die "alissa auth login failed: ${LOGIN_ERR:-<no output>}"
-log "alissa authenticated"
+
+# The official installer, and the CLI's own two location knobs, with the same
+# defaults the CLI itself applies.
+#
+# ALISSA_INSTALL_URL is overridable for tests-entrypoint-auth.sh ONLY. It is
+# NOT a supported production lever: pointing it elsewhere makes this entrypoint
+# execute remote code from wherever it points. A deploy leaves it unset. (No
+# checksum is pinned against the default deliberately — a pin in this repo goes
+# stale on every installer release, and a stale pin turns the self-healing
+# re-bootstrap into a hard failure during exactly the incident it exists for.)
+ALISSA_INSTALL_URL="${ALISSA_INSTALL_URL:-https://share.alissa.app/install}"
+ALISSA_CONFIG_DIR="${ALISSA_CONFIG_DIR:-${HOME}/.config/alissa}"
+ALISSA_API_BASE="${ALISSA_API_BASE:-https://api.alissa.app}"
+# Capped exponential backoff for the self-healing classes: 30s doubling to a
+# 10m ceiling, per issue #62. Overridable so the entrypoint test suite can
+# exercise the retry loop without waiting out real minutes; production sets
+# neither.
+AUTH_RETRY_SECONDS="${ALISSA_AUTH_RETRY_SECONDS:-30}"
+AUTH_RETRY_CAP_SECONDS="${ALISSA_AUTH_RETRY_CAP_SECONDS:-600}"
+# How long the retry loop stays quiet-ish before every further attempt also
+# names the one thing a human could act on. Retrying forever is the contract;
+# retrying forever without ever saying so is how a silent outage happens.
+AUTH_ESCALATE_SECONDS="${ALISSA_AUTH_ESCALATE_SECONDS:-600}"
+
+# Strip the token out of anything captured from a child before it is logged.
+# The entrypoint hands the token on the command line (`--token "${…}"`), so
+# whether it comes back in an error string is the CLI's choice, not ours — and
+# the retry loop below logs its capture on EVERY iteration, forever, so a token
+# echoed once would be echoed into the platform's log retention indefinitely.
+# Redacting at capture covers every consumer (the retry line and the `die`) by
+# construction. Bash pattern replacement: no subprocess, no new dependency.
+redact_token() {
+  printf '%s' "${1//"${ALISSA_API_TOKEN}"/***REDACTED***}"
+}
+
+# A genuine server-side rejection: `auth login` RAN, reached the API and was
+# told no. Matched on the CLI's own error text, which carries the HTTP status.
+# Deliberately narrow — this is the only class that pages a human, so anything
+# it does not recognise falls through to the retry path.
+auth_rejected() {
+  printf '%s' "$1" | grep -qiE '\b(401|403)\b|unauthori[sz]ed|forbidden|invalid token|token (is )?(invalid|rejected|expired)'
+}
+
+# Reachability at TRANSPORT level only. curl exit 22 means the server answered
+# with an HTTP error — that is a REACHABLE API (the base URL 404s on plenty of
+# healthy deployments), and treating it as unreachable would retry forever
+# against a server that is up. Only a DNS/connect/TLS/timeout failure counts.
+# The probe's own stderr is kept (API_PROBE_ERR) so the retry line can say what
+# curl actually reported, not just that "something" was unreachable.
+API_PROBE_ERR=""
+api_reachable() {
+  API_PROBE_RC=0
+  API_PROBE_ERR="$(curl -fsS -o /dev/null --max-time 10 "${ALISSA_API_BASE}" 2>&1)" \
+    || API_PROBE_RC=$?
+  [ "${API_PROBE_RC}" = "0" ] || [ "${API_PROBE_RC}" = "22" ]
+}
+
+# The CLI stores the verified token in its config dir, so an unwritable dir
+# fails the login with an error that looks nothing like a token problem.
+config_dir_writable() {
+  mkdir -p "${ALISSA_CONFIG_DIR}" 2>/dev/null || return 1
+  ( : > "${ALISSA_CONFIG_DIR}/.write-probe" ) 2>/dev/null || return 1
+  rm -f "${ALISSA_CONFIG_DIR}/.write-probe" 2>/dev/null || true
+}
+
+AUTH_WAITED=0
+AUTH_DELAY="${AUTH_RETRY_SECONDS}"
+# Sleep out one backoff step and double it, capped. Also the single place the
+# "this is not healing" escalation is emitted, so every retry class gets it.
+auth_backoff() {
+  log "retrying alissa auth in ${AUTH_DELAY}s (waited ${AUTH_WAITED}s so far; retrying forever — this class of failure needs no human)"
+  if [ "${AUTH_WAITED}" -ge "${AUTH_ESCALATE_SECONDS}" ]; then
+    log "ERROR: alissa preflight has been retrying for ${AUTH_WAITED}s without succeeding. The daemon is NOT up. If the platform is healthy, check that ALISSA_API_TOKEN in the Railway env is current."
+  fi
+  sleep "${AUTH_DELAY}"
+  AUTH_WAITED=$((AUTH_WAITED + AUTH_DELAY))
+  AUTH_DELAY=$((AUTH_DELAY * 2))
+  [ "${AUTH_DELAY}" -le "${AUTH_RETRY_CAP_SECONDS}" ] || AUTH_DELAY="${AUTH_RETRY_CAP_SECONDS}"
+}
+
+while :; do
+  # (1) CLI present and executable? An image-layer file that disappeared
+  #     mid-run is not a credential problem — reinstall it and carry on.
+  if ! command -v alissa >/dev/null 2>&1; then
+    log "alissa CLI missing from PATH (image-layer loss) — re-bootstrapping from ${ALISSA_INSTALL_URL}"
+    # Both halves' stderr is captured (nothing muted): a proxy blocking the
+    # download and an installer that ran and failed are different problems.
+    if BOOTSTRAP_ERR="$({ curl -fsSL "${ALISSA_INSTALL_URL}" | bash; } 2>&1 >/dev/null)"; then
+      log "alissa CLI re-bootstrapped"
+    else
+      # Redacted like the login capture: the token is not passed to the
+      # installer, but this is an unconstrained shell pipeline's output and the
+      # boundary is the only part of that we control.
+      log "WARN: alissa CLI re-bootstrap failed: $(redact_token "${BOOTSTRAP_ERR:-<no output>}")"
+    fi
+    # The installer drops the launcher into a directory already on PATH, but
+    # bash caches lookups — clear it before deciding whether this worked.
+    hash -r 2>/dev/null || true
+    if ! command -v alissa >/dev/null 2>&1; then
+      log "WARN: alissa CLI still missing after re-bootstrap"
+      auth_backoff
+      continue
+    fi
+  fi
+
+  # (2) Can the CLI store the login it is about to verify?
+  if ! config_dir_writable; then
+    log "WARN: alissa config dir ${ALISSA_CONFIG_DIR} is not writable — the verified token cannot be stored (volume not yet mounted / wrong ownership?)"
+    auth_backoff
+    continue
+  fi
+
+  # (3) Is the API reachable at all? Asked BEFORE the login so a network blip
+  #     can never be read as a credential verdict.
+  if ! api_reachable; then
+    log "WARN: ${ALISSA_API_BASE} is unreachable at transport level (DNS/connect/TLS, curl exit ${API_PROBE_RC}) — not a token problem. curl said: ${API_PROBE_ERR:-<no output>}"
+    auth_backoff
+    continue
+  fi
+
+  # (4) The real preflight. stderr is CAPTURED, never muted: two multi-hour
+  #     false diagnoses on 2026-07-29 were bought by `2>&1` into /dev/null.
+  if LOGIN_ERR="$(alissa auth login --token "${ALISSA_API_TOKEN}" 2>&1 >/dev/null)"; then
+    log "alissa authenticated"
+    break
+  fi
+  LOGIN_ERR="$(redact_token "${LOGIN_ERR:-<no output>}")"
+  if auth_rejected "${LOGIN_ERR}"; then
+    die "ALISSA_API_TOKEN rejected by ${ALISSA_API_BASE} — the API answered and refused this token. Rotate ALISSA_API_TOKEN in the Railway service env (Variables -> ALISSA_API_TOKEN) and redeploy; retrying cannot fix a credential. alissa auth login said: ${LOGIN_ERR}"
+  fi
+  log "WARN: alissa auth login failed, and the error is NOT a server-side rejection — treating it as transient. alissa auth login said: ${LOGIN_ERR}"
+  auth_backoff
+done
 
 # -----------------------------------------------------------------------------
 # 2d. Reviewer console (sidecar) gate — preflighted HERE, launched at step 4b.
