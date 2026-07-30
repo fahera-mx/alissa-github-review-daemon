@@ -26,11 +26,14 @@ it, alongside the untouched legacy ledgers.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Poll-snapshot retention: the newest N rows are kept, older ones pruned on
 # every write. Fixed, not a config key -- `poll_snapshots` is an observation
@@ -38,6 +41,13 @@ from pathlib import Path
 # reads the recent tail). A change to this constant is a change to the
 # observable buffer size, so it is pinned by a test.
 SNAPSHOT_RETENTION = 1000
+
+# Streak limiting for the best-effort telemetry writer's WARN (issue #62), on
+# the same rule the poll firewall uses: the first few failures in full, then
+# one in ten. A ledger that has gone read-only fails on every single poll, and
+# the warning is worth nothing if it drowns the decisions around it.
+TELEMETRY_LOG_HEAD = 3
+TELEMETRY_LOG_EVERY = 10
 
 # Shared between SCHEMA and the migration so the two can never drift.
 _SPAWNS_TABLE = """
@@ -231,6 +241,16 @@ class State:
         for any path an operator can type.
         """
         path = Path(path).expanduser()
+        # Kept so a best-effort telemetry write can RECONNECT after a failure
+        # (see _reconnect): the daemon's ledger lives on a platform volume, and
+        # a remount leaves the open handle pointing at a file descriptor that
+        # is gone while the path is perfectly good again.
+        self._path = path
+        self._read_only = read_only
+        # Consecutive failures of the best-effort writer, for streak-limited
+        # logging and for firing the one reconnect attempt on the FIRST failure
+        # of a streak rather than on every write.
+        self._telemetry_failures = 0
         if read_only:
             uri = Path(path).absolute().as_uri() + "?mode=ro"
             self._db = sqlite3.connect(uri, uri=True)
@@ -303,6 +323,119 @@ class State:
         if not info:
             return False  # fresh database, nothing to migrate
         return [r["name"] for r in info if r["pk"]] != ["session"]
+
+    # -- best-effort writes (issue #62) ------------------------------------
+    #
+    # CLASSIFICATION. Every write in this class is one of two kinds, and only
+    # one of them may ever be swallowed:
+    #
+    # * TELEMETRY -- `record_snapshot`, and nothing else. `poll_snapshots` is an
+    #   observation buffer: the daemon never reads it back to make a decision
+    #   (only `read_snapshots`, for the console, does), so a row lost to a
+    #   read-only volume costs one missing datapoint on a dashboard. On
+    #   2026-07-29 it cost the whole daemon instead -- the sqlite exception
+    #   escaped `poll_once` and killed the process mid-poll.
+    #
+    # * CORRECTNESS -- every other write here (`record_spawn`, `record_reap`,
+    #   `record_ping`, `record_escalation`, `record_grant`, the `verdict_posts`
+    #   writes, `age_out_spawn`). Each is a dedupe key or an in-flight marker
+    #   for an action the daemon TAKES: swallowing one does not lose a
+    #   datapoint, it re-spawns a reviewer round, re-pages an operator, or
+    #   re-grants a cap. Those stay strict and raise -- and the poll-loop
+    #   firewall in `loop.run_forever` is what keeps them from ending the
+    #   daemon now, which is the right place for that decision because it can
+    #   also back off and escalate.
+
+    def _reconnect(self) -> bool:
+        """Swap in a fresh connection, but ONLY if the fresh one is better.
+        True when the swap happened.
+
+        Deliberately raw: it re-establishes the connection and NOTHING else --
+        no schema script, no migration. The reconnect exists for the
+        stale-handle-after-remount case, where the database on disk is the one
+        this process already migrated; re-running DDL through a path that only
+        a failed telemetry write reaches would be a far larger act than the
+        failure justifies.
+
+        The candidate is WRITE-PROBED before it is adopted, and the old
+        connection is kept when the probe fails, because a blind reconnect
+        makes the read-only case permanently worse rather than better: sqlite
+        decides read-only-ness when it OPENS the file, so a handle opened while
+        the volume was read-only stays read-only for the rest of its life even
+        after the volume comes back -- while the handle opened before the fault
+        heals by itself the moment writes are possible again. Replacing the
+        healable handle with a poisoned one would trade a transient outage for
+        a permanent one.
+        """
+        candidate: sqlite3.Connection | None = None
+        try:
+            if self._read_only:
+                uri = Path(self._path).absolute().as_uri() + "?mode=ro"
+                candidate = sqlite3.connect(uri, uri=True)
+            else:
+                candidate = sqlite3.connect(str(self._path))
+            candidate.row_factory = sqlite3.Row
+            if not self._read_only:
+                # A no-op header write: it exercises exactly the path the real
+                # write needs, changes nothing, and costs one page.
+                version = candidate.execute("PRAGMA user_version").fetchone()[0]
+                candidate.execute(f"PRAGMA user_version = {int(version)}")
+                candidate.commit()
+        except sqlite3.Error as exc:
+            log.debug("state: reconnect to %s declined: %s", self._path, exc)
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except sqlite3.Error:
+                    pass
+            return False
+        try:
+            self._db.close()
+        except sqlite3.Error:
+            pass  # already broken; the point was to replace it
+        self._db = candidate
+        return True
+
+    def _write_telemetry(self, write: "Callable[[], None]", what: str) -> bool:
+        """Run a TELEMETRY write, absorbing any database error. True on success.
+
+        One reconnect attempt on the FIRST failure of a streak (not on every
+        one: a database that is read-only stays read-only, and reconnecting per
+        poll would add a file open to every pass for nothing), then a
+        streak-limited WARN and back to polling.
+        """
+        try:
+            write()
+        except sqlite3.DatabaseError as exc:
+            first = self._telemetry_failures == 0
+            if first and self._reconnect():
+                try:
+                    write()
+                except sqlite3.DatabaseError as retry_exc:
+                    exc = retry_exc
+                else:
+                    log.info(
+                        "state: %s succeeded after reconnecting to %s",
+                        what, self._path,
+                    )
+                    return True
+            self._telemetry_failures += 1
+            n = self._telemetry_failures
+            if n <= TELEMETRY_LOG_HEAD or n % TELEMETRY_LOG_EVERY == 0:
+                log.warning(
+                    "state: %s failed (%s: %s) — failure %d of this streak; "
+                    "telemetry is best-effort, the loop keeps polling",
+                    what, type(exc).__name__, exc, n,
+                )
+            return False
+        if self._telemetry_failures:
+            log.info(
+                "state: %s succeeded after %d failed attempt(s) — telemetry "
+                "is persisting again",
+                what, self._telemetry_failures,
+            )
+            self._telemetry_failures = 0
+        return True
 
     def close(self) -> None:
         self._db.close()
@@ -689,7 +822,7 @@ class State:
         awaiting_post: int = 0,
         abandoned: int = 0,
         stages: list[dict],
-    ) -> None:
+    ) -> bool:
         """Append one poll-pass observation, then prune to the newest
         SNAPSHOT_RETENTION rows. `ts` is stamped here (wall-clock seconds,
         like every other row in this ledger); `stages` is the compact
@@ -698,7 +831,56 @@ class State:
         dry-run included -- and pruned on write, so the table is
         self-bounding. The count kwargs default to 0 so a caller need only
         pass the ones a given pass produced.
+
+        BEST-EFFORT, and the only write in this class that is (issue #62): a
+        snapshot observes the pass, it is not something the daemon has to
+        remember, so a database error here is absorbed, reported once per
+        streak-limited window, and the loop keeps polling. Returns whether the
+        row landed, for a caller that wants to say so; nothing in the daemon
+        depends on it.
         """
+        return self._write_telemetry(
+            lambda: self._insert_snapshot(
+                duration_ms=duration_ms,
+                candidates=candidates,
+                spawned=spawned,
+                stale_reenqueued=stale_reenqueued,
+                in_flight=in_flight,
+                deferred=deferred,
+                converged=converged,
+                capped=capped,
+                escalated=escalated,
+                skipped=skipped,
+                reaped=reaped,
+                posted=posted,
+                awaiting_post=awaiting_post,
+                abandoned=abandoned,
+                stages=stages,
+            ),
+            "poll snapshot",
+        )
+
+    def _insert_snapshot(
+        self,
+        *,
+        duration_ms: int,
+        candidates: int,
+        spawned: int,
+        stale_reenqueued: int,
+        in_flight: int,
+        deferred: int,
+        converged: int,
+        capped: int,
+        escalated: int,
+        skipped: int,
+        reaped: int,
+        posted: int,
+        awaiting_post: int,
+        abandoned: int,
+        stages: list[dict],
+    ) -> None:
+        """The snapshot INSERT + prune itself, strict. Split out so the
+        best-effort wrapper can RETRY it verbatim after a reconnect."""
         self._db.execute(
             "INSERT INTO poll_snapshots "
             "(ts, duration_ms, candidates, spawned, stale_reenqueued, "

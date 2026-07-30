@@ -10,7 +10,10 @@ on: [pull_request]
 #     with the real sidecar — docker/claude/tests-entrypoint-ui.sh;
 #   * the reviewer-identity preflight (ALISSA_REVIEWER_TOKEN_ENV /
 #     ALISSA_REVIEWER_LOGIN), likewise by booting the real entrypoint —
-#     docker/claude/tests-entrypoint-identity.sh.
+#     docker/claude/tests-entrypoint-identity.sh;
+#   * the `alissa auth login` failure triage (missing CLI -> re-bootstrap,
+#     unreachable API / unwritable config -> capped backoff, genuine 401 ->
+#     fast FATAL), same way — docker/claude/tests-entrypoint-auth.sh.
 jobs:
   entrypoint-config-check:
     name: Entrypoint config renderer + console wiring
@@ -57,6 +60,14 @@ jobs:
         # which is the container condition behind issue #51.
         timeout-minutes: 3
         run: bash docker/claude/tests-entrypoint-identity.sh
+      - name: Execute Entrypoint Auth-Triage Tests
+        # Boots the entrypoint four times against a scriptable `curl` stub (the
+        # API reachability probe AND the official installer) and an `alissa`
+        # stub that can answer a login with a real 401. Three of the four
+        # classes must SELF-HEAL with no restart, which is the contract issue
+        # #62 exists for; only the genuine rejection may exit.
+        timeout-minutes: 5
+        run: bash docker/claude/tests-entrypoint-auth.sh
       - name: Execute Entrypoint Console Wiring Tests
         # Boots the entrypoint four times (console off / enabled-without-passcode
         # / enabled / sidecar killed under it). No docker needed: the CLIs the

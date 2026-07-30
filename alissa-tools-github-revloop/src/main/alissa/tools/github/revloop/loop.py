@@ -99,6 +99,96 @@ MAX_VERDICT_POST_ATTEMPTS = 5
 # day, per stuck PR, with the operator paged exactly once.
 MAX_VERDICT_POST_BACKOFF_SECONDS = 60 * 60
 
+# -- the poll-failure firewall (issue #62) ------------------------------------
+#
+# 2026-07-29 killed the Railway daemon three times in one day: a subprocess
+# ENOENT on the `alissa` CLI (an image-layer file that vanished mid-run) and a
+# readonly-sqlite snapshot write both escaped `poll_once`, and __main__'s
+# startup-shaped handlers turned each into `exit 2`. One bad poll must never end
+# the daemon: the steady state's contract is degraded-but-alive with a loud
+# signal, never a silent exit. Startup config errors keep the fast exit -- those
+# a restart genuinely cannot fix.
+
+# Ceiling on the doubling backoff a failing poll applies. Matches the
+# rate-limit branch's cap: a daemon that has been failing for a quarter of an
+# hour gains nothing from polling more often than every 15 minutes, and a
+# recovered substrate is picked up within one window.
+POLL_BACKOFF_CAP_SECONDS = 900
+
+# How long one exception CLASS must fire on every consecutive poll before the
+# firewall stops calling it transient and escalates to a page-worthy ERROR.
+# Half an hour is several backoff windows -- long past anything a container
+# blip explains -- and still inside the window an operator can act on the same
+# day. A different class arriving resets the streak: that is a different
+# condition, not a continuation of this one.
+POLL_ESCALATE_SECONDS = 30 * 60
+
+# Streak limiting for the firewall's log line: the first few failures of a
+# streak are logged in full, then one in every POLL_FAILURE_LOG_EVERY, so a
+# substrate outage costs a handful of lines an hour instead of one per poll.
+# The escalation crossing and the recovery line are logged unconditionally --
+# both are state changes, and suppressing either would hide the very transition
+# the log exists to show.
+POLL_FAILURE_LOG_HEAD = 3
+POLL_FAILURE_LOG_EVERY = 10
+
+# Poll failures whose message is the whole diagnosis: CommandError already
+# carries the command and its stderr, so a traceback adds noise. Anything else
+# reaching the firewall is by definition unanticipated -- log where it came
+# from.
+EXPECTED_POLL_FAILURES = (CommandError,)
+
+
+@dataclass
+class PollFailures:
+    """The firewall's memory of the current run of consecutive poll failures.
+
+    Deliberately a value object taking `now` from its caller rather than
+    reading the clock: the escalation rule is "the same class, every poll, for
+    POLL_ESCALATE_SECONDS", which is a statement about elapsed time that has to
+    be testable without sleeping through it.
+
+    A streak is identified by the exception CLASS. A different class arriving
+    mid-outage starts a new streak (and re-arms escalation) because it is a
+    different fault -- reporting "ENOENT has been failing for 40 minutes" when
+    the last 30 were sqlite errors would be a lie the operator acts on.
+    """
+
+    kind: str | None = None
+    count: int = 0
+    first_at: float = 0.0
+    escalated: bool = False
+
+    def record(self, exc: BaseException, now: float) -> tuple[bool, bool]:
+        """Fold one failure in. Returns (log_this_one, escalated_just_now)."""
+        kind = type(exc).__name__
+        if kind != self.kind:
+            self.kind, self.count, self.first_at, self.escalated = kind, 0, now, False
+        self.count += 1
+        crossing = not self.escalated and now - self.first_at >= POLL_ESCALATE_SECONDS
+        if crossing:
+            self.escalated = True
+        should_log = (
+            crossing
+            or self.count <= POLL_FAILURE_LOG_HEAD
+            or self.count % POLL_FAILURE_LOG_EVERY == 0
+        )
+        return should_log, crossing
+
+    def resolve(self, now: float) -> tuple[int, float] | None:
+        """Clear the streak on a successful poll.
+
+        Returns (failures, seconds) of the streak that just ended, or None if
+        there was none -- the caller logs the recovery, which is the only
+        evidence in the log that a degraded daemon came back on its own.
+        """
+        if self.kind is None:
+            return None
+        ended = (self.count, now - self.first_at)
+        self.kind, self.count, self.first_at, self.escalated = None, 0, 0.0, False
+        return ended
+
+
 # The GitHub review states the CI gate can produce for a round it refused to
 # approve: a red head lands as CHANGES_REQUESTED, a rollup that never concluded
 # as COMMENTED. Read by _convergence_reason, which must not converge on an
@@ -2884,7 +2974,16 @@ class ReviewWatcher:
     def run_forever(self) -> None:
         # preflight() is the caller's responsibility -- the CLI runs it once for
         # every mode, so calling it here too would double every check.
+        #
+        # Every exception a poll can raise is caught HERE (issue #62). The
+        # daemon's steady state has no fatal errors: a transient subprocess
+        # ENOENT, a parse error, a readonly ledger -- any of them is one bad
+        # poll, and poll N+1 may well succeed. Only KeyboardInterrupt and
+        # SystemExit pass through (neither is an `Exception`), and only startup
+        # -- resolve_config, before this loop is ever entered -- still exits
+        # fast.
         backoff = self.config.poll_interval
+        failures = PollFailures()
         while True:
             # The sleep lives INSIDE the KeyboardInterrupt guard: with a 60s
             # poll interval (up to 900s backing off) the loop spends nearly
@@ -2894,13 +2993,73 @@ class ReviewWatcher:
                 try:
                     self.poll_once()
                     backoff = self.config.poll_interval
+                    self._note_poll_recovered(failures)
                 except RateLimited as exc:
-                    backoff = min(backoff * 2, 900)
+                    # Not a failure of the daemon: GitHub is telling it to slow
+                    # down, and it does. Kept out of the firewall's streak so a
+                    # busy hour never reads as a substrate fault.
+                    backoff = min(backoff * 2, POLL_BACKOFF_CAP_SECONDS)
                     log.warning("rate limited (%s) — backing off %ds", exc, backoff)
-                except CommandError as exc:
-                    backoff = min(backoff * 2, 900)
-                    log.error("poll failed: %s — retrying in %ds", exc, backoff)
+                    failures.resolve(time.monotonic())
+                except Exception as exc:
+                    backoff = min(backoff * 2, POLL_BACKOFF_CAP_SECONDS)
+                    self._note_poll_failure(failures, exc, backoff)
                 time.sleep(backoff)
             except KeyboardInterrupt:
                 log.info("stopping")
                 return
+
+    def _note_poll_failure(
+        self, failures: PollFailures, exc: Exception, backoff: int
+    ) -> None:
+        """Log one firewalled poll failure, streak-limited and escalating.
+
+        WARNING while the fault still looks transient, ERROR once the same
+        class has fired on every poll for POLL_ESCALATE_SECONDS -- the daemon
+        is alive either way, so the log level is the only thing that can tell
+        an operator "this one is not healing".
+        """
+        should_log, crossing = failures.record(exc, time.monotonic())
+        if not should_log:
+            return
+        # A class the firewall did not anticipate gets its traceback; the ones
+        # that carry their own diagnosis do not (see EXPECTED_POLL_FAILURES).
+        traced = not isinstance(exc, EXPECTED_POLL_FAILURES)
+        if crossing:
+            log.error(
+                "poll has failed with %s on every attempt for %.0f min "
+                "(%d consecutive failures, latest: %s) — the daemon is alive and "
+                "still retrying every %ds, but this is no longer transient",
+                failures.kind,
+                (time.monotonic() - failures.first_at) / 60,
+                failures.count,
+                exc,
+                backoff,
+                exc_info=traced,
+            )
+            return
+        log.log(
+            logging.ERROR if failures.escalated else logging.WARNING,
+            "poll failed (%s: %s) — failure %d of this streak; retrying in %ds",
+            failures.kind,
+            exc,
+            failures.count,
+            backoff,
+            exc_info=traced,
+        )
+
+    @staticmethod
+    def _note_poll_recovered(failures: PollFailures) -> None:
+        """Announce that a failing streak ended. Unconditional: the recovery is
+        the counterpart of the escalation, and a streak that healed silently
+        leaves an operator reading the last ERROR as the current state."""
+        ended = failures.resolve(time.monotonic())
+        if ended is None:
+            return
+        count, seconds = ended
+        log.info(
+            "poll recovered after %d consecutive failure(s) over %.0fs — "
+            "resuming normal polling",
+            count,
+            seconds,
+        )

@@ -189,6 +189,15 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
 
+    # STARTUP and STEADY STATE are separated on purpose (issue #62). The
+    # handlers below label a FileNotFoundError / ValueError "config error" and
+    # exit 2, which is right for the startup phase -- a missing config file or
+    # an unparseable value cannot be fixed by trying again. It was fatally
+    # wrong for the poll loop, where the same classes mean a transient
+    # subprocess ENOENT or a bad response: `run_forever` now firewalls those
+    # per iteration and never lets them reach here at all. The one-shot modes
+    # (`--pr`, `--once`) still surface a failure to their caller, as a
+    # one-shot must.
     try:
         config = resolve_config(args)
         log.info("workspace: %s", config.workspace_root)

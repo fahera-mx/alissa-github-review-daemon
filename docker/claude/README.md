@@ -57,7 +57,7 @@ onboarding automatically, so you only supply tokens:
 | env var | identity | required? | what the entrypoint does |
 | --- | --- | --- | --- |
 | `GH_TOKEN` | `gh` (the `alissa-app` GitHub user) | **yes** — fatal if missing | validates via `gh api user`; the image rewrites GitHub SSH URLs to HTTPS + wires gh as the git credential helper, so hub-ify's `git clone` authenticates with the token (no SSH key needed) |
-| `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | **yes** — fatal if missing | `alissa auth login --token` (stores + verifies) |
+| `ALISSA_API_TOKEN` (`alissa_…`) | Alissa by Fahera | **yes** — fatal only when the *API rejects it* | `alissa auth login --token` (stores + verifies), after [triaging what a failure actually is](#alissa-auth-failures-are-triaged-not-guessed) |
 | a persisted `claude /login` *(recommended)*, or `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` in env | claude | no — warns, continues | credential persists on the volume via `CLAUDE_CONFIG_DIR`; the baked [`agents.yaml`](./agents.yaml) launches claude headless and the first-run config is pre-seeded (see below) |
 
 `GH_TOKEN` and `ALISSA_API_TOKEN` are hard requirements — the daemon can't poll
@@ -66,6 +66,43 @@ daemon never calls claude directly (only the worker-spawned reviewer does), and
 claude can authenticate by other means — a mounted `~/.claude` credential or
 Bedrock/Vertex env. If none is present the entrypoint just warns, and a reviewer
 that genuinely has no credential fails on its own later.
+
+### `alissa auth` failures are triaged, not guessed
+
+A failing `alissa auth login` used to mean one thing to the entrypoint —
+"`ALISSA_API_TOKEN` rejected" — and it exited FATAL, so the platform restarted
+the container and it failed again, forever. On 2026-07-29 that crash-looped the
+Railway service through two multi-hour outages **with a perfectly valid token**:
+the `alissa` CLI binary (an image-layer file at `~/.local/bin/alissa`) had
+vanished mid-run, so the login never reached a server at all, and its stderr was
+muted so nothing said so.
+
+The gate now triages before it interprets, and **logs the command's real
+stderr** in every case:
+
+| what actually happened | how it is detected | what the entrypoint does |
+| --- | --- | --- |
+| CLI missing / not executable | `command -v alissa` fails | re-bootstraps from the official installer (`ALISSA_INSTALL_URL`), then retries — no human needed |
+| config dir unwritable | write probe in `ALISSA_CONFIG_DIR` | retries with capped backoff, **forever** (a volume that mounts late self-heals) |
+| API unreachable | `curl` transport failure against `ALISSA_API_BASE` — an HTTP error response counts as *reachable* | retries with capped backoff, **forever** |
+| token genuinely refused | the login ran, reached the server, and got `401`/`403` | **FATAL, fast**, naming `ALISSA_API_TOKEN` rotation — the only class a human can fix |
+
+An unrecognised failure retries rather than dying: every outage this gate has
+actually caused was a platform blip mislabelled as a rejection. It is not silent
+about it either — once the retries outlast `ALISSA_AUTH_ESCALATE_SECONDS` every
+further attempt also logs an `ERROR` naming token rotation as the thing to check.
+
+| runtime env var | default | meaning |
+| --- | --- | --- |
+| `ALISSA_AUTH_RETRY_SECONDS` | `30` | first backoff step for the self-healing classes |
+| `ALISSA_AUTH_RETRY_CAP_SECONDS` | `600` | ceiling the doubling stops at |
+| `ALISSA_AUTH_ESCALATE_SECONDS` | `600` | after this much total waiting, each retry also logs page-worthy `ERROR` |
+| `ALISSA_INSTALL_URL` | `https://share.alissa.app/install` | installer used to re-bootstrap a missing CLI |
+
+The defaults are the intended production values; the knobs exist so
+`tests-entrypoint-auth.sh` can exercise the retry loop without waiting out real
+minutes. The daemon itself has the matching property in-process — see
+[Crash resilience](#crash-resilience-the-daemon-survives-its-substrate).
 
 ### claude auth: log in once, persisted on the volume (recommended)
 
@@ -419,8 +456,11 @@ volumes:
    egress firewall, then drop to `alissa` via `gosu`. Everything below runs
    unprivileged.
 1. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
-   `gh auth setup-git`; `alissa auth login` (fatal if missing); check the claude
-   credential (warn-only — the baked `agents.yaml` handles headless launch).
+   `gh auth setup-git`; `alissa auth login` — fatal only when the API **rejects**
+   the token, otherwise triaged and retried (see
+   [`alissa auth` failures are triaged](#alissa-auth-failures-are-triaged-not-guessed));
+   check the claude credential (warn-only — the baked `agents.yaml` handles
+   headless launch).
    Also resolve the `ALISSA_UI_ENABLED` console gate and, when enabled, **die
    here** if `ALISSA_UI_PASSCODE` is empty (fail-closed, fail-fast); then resolve
    `ALISSA_AGENT_MODEL` into `agents.yaml` and log the effective command.
@@ -441,3 +481,32 @@ volumes:
 
 `tini` is PID 1 to reap the tmux/node/claude child fan-out (the console sidecar
 included).
+
+## Crash resilience: the daemon survives its substrate
+
+Three outages on 2026-07-29 all had the same shape — the container's filesystem
+misbehaved for a moment, and the daemon died of it instead of reporting it. The
+container is not assumed to be well-behaved any more:
+
+* **One bad poll is one bad poll.** `run_forever` firewalls every exception a
+  poll pass can raise (a subprocess `ENOENT`, a parse error, an `OSError`, an
+  sqlite error, anything). It logs with streak limiting, backs off by doubling
+  the poll interval up to 15 minutes, and keeps polling. `Ctrl-C` and
+  `SystemExit` still stop it, and a **startup** config error still exits `2`
+  fast — a bad config file is not something retrying fixes.
+* **A stuck daemon is loud, not silent.** If the *same* exception class fires on
+  every poll for 30 minutes, the log level escalates to page-worthy `ERROR`
+  ("the daemon is alive and still retrying… but this is no longer transient").
+  When it heals, that is logged too, so the last line about a recovered daemon
+  is not its failure.
+* **Telemetry never outranks the loop.** The `poll_snapshots` write — pure
+  observability for the console — is best-effort: a database error is absorbed,
+  retried once through a reconnect, and reported as a streak-limited `WARN`.
+  Every *other* ledger write (spawn records, escalations, pings, grants, verdict
+  posts) stays strict, because each is a dedupe key for an action the daemon
+  takes and losing one silently re-spawns a round or re-pages an operator.
+
+What this means operationally: a substrate fault degrades the daemon instead of
+killing it, and the log tells you which. A container that is up but logging
+`ERROR: poll has failed with … on every attempt` needs a look; one logging
+`WARN: poll failed … retrying in 120s` is riding out a blip.
