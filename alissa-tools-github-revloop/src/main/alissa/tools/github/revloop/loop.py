@@ -181,8 +181,9 @@ CHECKS_UNSETTLED_LEAD = (
     "concluded.**\n\n"
     "{detail}\n\n"
     "This round's verdict was held for {waited} min waiting for the head's "
-    "checks to settle ({bound} min bound) and they did not, so it is recorded "
-    "as a comment: an approve would claim a head this loop never saw go green. "
+    "checks to settle ({bound} min bound){total_note} and they did not, so it is "
+    "recorded as a comment: an approve would claim a head this loop never saw go "
+    "green. "
     "Nothing about the review itself changed — the verdict below is the round's "
     "own.\n\n"
     "Submitting this review consumes the pending review request, so the daemon "
@@ -220,6 +221,13 @@ CHECKS_UNSETTLED_PAGE = (
     "rather than known-red.\n\n"
     "No label was touched and no further round is queued."
 )
+
+# Appended to `{bound}` above only when the hold was PROMOTED -- an unreadable
+# wait that became a genuine pending one restarts the clock, so the bound the
+# operator configured applies per condition and the round can be held up to
+# twice it. Saying "held 30 min (30 min bound)" after 60 real minutes is the
+# report being wrong about the one number an operator tunes.
+CHECKS_TOTAL_HELD = ", {total} min in total across both waits,"
 
 # The `{detail}` above, per reason the rollup did not settle.
 CHECKS_STILL_RUNNING = "Still running at the bound: {names}."
@@ -1165,22 +1173,29 @@ class ReviewWatcher:
         # never "restart whenever the state changes" -- a reader flapping between
         # the two would then push the bound out forever, which is precisely the
         # unbounded hold this bound exists to prevent.
-        held_at, held_state = self.state.checks_hold(pr.full_name, pr.number, round_)
-        promoted = held_state == CHECKS_UNKNOWN and rollup.state == CHECKS_PENDING
-        if held_at is None or promoted:
-            held_at = self.state.record_checks_hold(
+        hold = self.state.checks_hold(pr.full_name, pr.number, round_)
+        promoted = hold.condition == CHECKS_UNKNOWN and rollup.state == CHECKS_PENDING
+        if hold.since is None or promoted:
+            self.state.record_checks_hold(
                 pr.full_name, pr.number, round_, rollup.state
             )
-        waited = max(time.time() - held_at, 0)
+            hold = self.state.checks_hold(pr.full_name, pr.number, round_)
+        # Two numbers, both reported: `waited` is the wait THIS condition has had
+        # and is what the bound applies to; `held` is how long the round has been
+        # held at all. They differ by up to a full bound once a hold has been
+        # promoted, so a report that shows only the first tells an operator who
+        # set 30 minutes that a 60-minute hold waited 30.
+        waited = max(time.time() - (hold.since or time.time()), 0)
+        held = max(time.time() - (hold.first_at or time.time()), 0)
         bound = self.config.checks_wait_seconds
         if waited < bound:
             # One line per poll, one activity note per held round; see
             # checks_hold_kind.
             log.info(
-                "%s round %d: holding its %s — CI rollup at %s is %s (%dm of the "
-                "%dm bound waited)",
+                "%s round %d: holding its %s — CI rollup at %s is %s (%dm on this "
+                "condition of the %dm bound; %dm held in total)",
                 pr.slug, round_, VERDICT_APPROVE, judged[:8], rollup.summary,
-                waited // 60, bound // 60,
+                waited // 60, bound // 60, held // 60,
             )
             self._note_checks_hold(pr, round_, judged, rollup)
             return ChecksGate(
@@ -1188,7 +1203,8 @@ class ReviewWatcher:
                     Action.AWAITING_POST,
                     f"round {round_} holds its {VERDICT_APPROVE} — the CI rollup "
                     f"at {judged[:8]} is {rollup.summary}; "
-                    f"{int((bound - waited) // 60)}m of the wait bound left",
+                    f"{int((bound - waited) // 60)}m of the wait bound left "
+                    f"({int(held // 60)}m held in total)",
                     round_,
                     task_ref=task.ref,
                 ),
@@ -1196,10 +1212,10 @@ class ReviewWatcher:
             )
 
         log.warning(
-            "%s round %d: the CI rollup at %s is still %s after %dm — recording "
-            "the %s envelope as a %s review, never an APPROVE on an unverified "
-            "head",
-            pr.slug, round_, judged[:8], rollup.summary, waited // 60,
+            "%s round %d: the CI rollup at %s is still %s after %dm on this "
+            "condition (%dm held in total) — recording the %s envelope as a %s "
+            "review, never an APPROVE on an unverified head",
+            pr.slug, round_, judged[:8], rollup.summary, waited // 60, held // 60,
             VERDICT_APPROVE, EVENT_COMMENT,
         )
         detail = (
@@ -1216,6 +1232,11 @@ class ReviewWatcher:
                 detail=detail,
                 waited=int(waited // 60),
                 bound=int(bound // 60),
+                total_note=(
+                    CHECKS_TOTAL_HELD.format(total=int(held // 60))
+                    if hold.promoted
+                    else ""
+                ),
             ),
             state=rollup.state,
             detail=detail,

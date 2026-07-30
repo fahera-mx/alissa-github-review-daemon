@@ -15,8 +15,9 @@
 #     set. When unset the key is omitted entirely and the daemon library applies
 #     its own current default. These are pure tuning values where the library is
 #     the authority: poll_interval, round_cap, checks_wait_seconds (how long a
-#     round holds its approve for an unsettled CI rollup -- a property of the
-#     watched repos' CI, not of the image), operators (an EMPTY operator
+#     round holds its approve for an unsettled CI rollup, per condition waited on
+#     -- so up to 2x it if an unreadable hold becomes a pending one; a property
+#     of the watched repos' CI, not of the image), operators (an EMPTY operator
 #     allowlist is the library's fail-closed default -- emitting `[]` would say
 #     the same thing, but omitting it keeps "unset means the library decides"
 #     true for every optional key without exception).

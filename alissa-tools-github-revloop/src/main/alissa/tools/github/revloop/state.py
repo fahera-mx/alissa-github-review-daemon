@@ -29,6 +29,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 # Poll-snapshot retention: the newest N rows are kept, older ones pruned on
@@ -108,10 +109,9 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     -- then released rather than held open forever; see loop._abandon_verdict.
     abandoned_at  INTEGER,
     -- When this round's APPROVE was FIRST held back because the judged head's
-    -- CI rollup had not settled. The wait bound is measured from here, so a
-    -- rollup that never concludes degrades the verdict to a comment at a fixed
-    -- distance from the first observation rather than from whenever the last
-    -- poll happened to land. NULL means the gate never held this round.
+    -- CI rollup had not settled -- and it is never overwritten afterwards, so
+    -- "how long has this round really been held?" always has an answer. NULL
+    -- means the gate never held this round.
     checks_held_at INTEGER,
     -- WHICH unsettled condition that stamp belongs to ('pending' -- checks are
     -- genuinely running -- or 'unknown' -- the rollup could not be read). The
@@ -121,6 +121,13 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     -- 'pending' one. The policy lives in loop._gate_on_checks; this column is
     -- what lets it be decided from the ledger instead of from memory.
     checks_held_state TEXT,
+    -- When that promotion happened: the stamp the bound is measured from once
+    -- the wait is on checks that are genuinely running. Separate from
+    -- `checks_held_at` rather than replacing it, because the two answer
+    -- different questions and a report that conflates them says a promoted hold
+    -- waited one bound when it waited two. NULL until (and unless) the promotion
+    -- happens; the bound then reads `checks_pending_at or checks_held_at`.
+    checks_pending_at INTEGER,
     review_url    TEXT,
     last_error    TEXT,
     PRIMARY KEY (repo, number, round)
@@ -163,8 +170,40 @@ _ADDED_COLUMNS = {
     "verdict_posts": (
         ("checks_held_at", "INTEGER"),
         ("checks_held_state", "TEXT"),
+        ("checks_pending_at", "INTEGER"),
     ),
 }
+
+
+@dataclass(frozen=True)
+class ChecksHold:
+    """One round's CI hold, as the ledger remembers it.
+
+    Two stamps, because the gate has two honest numbers to report and they can
+    differ by a whole wait bound:
+
+    * `first_at` -- when the round was first held at all, on whatever condition;
+    * `pending_at` -- when an unreadable hold was promoted to a genuinely
+      pending one, which restarts the clock the bound is measured from (see
+      loop._gate_on_checks for why exactly once).
+
+    `since` is the one the bound uses. `first_at` is the one an operator means by
+    "how long has this been held?", and reporting only `since` after a promotion
+    understates it by up to the full bound.
+    """
+
+    first_at: int | None = None
+    condition: str | None = None
+    pending_at: int | None = None
+
+    @property
+    def since(self) -> int | None:
+        """The stamp the wait bound is measured from."""
+        return self.pending_at or self.first_at
+
+    @property
+    def promoted(self) -> bool:
+        return self.pending_at is not None
 
 
 class State:
@@ -509,38 +548,59 @@ class State:
         row = self.get_verdict_post(repo, number, round_)
         return int(row["attempts"]) if row else 0
 
-    def checks_hold(
-        self, repo: str, number: int, round_: int
-    ) -> "tuple[int | None, str | None]":
-        """When this round's approve was first held on CI, and on WHICH
-        condition -- (None, None) if it has never been held.
+    def checks_hold(self, repo: str, number: int, round_: int) -> "ChecksHold":
+        """This round's CI hold: when it began, what it is waiting on, and when
+        that became a genuine `pending` -- an all-None ChecksHold if it has never
+        been held.
 
         A read, deliberately: whether an existing stamp still applies is a
         policy question about CI (see loop._gate_on_checks), and this table's job
-        is to remember the answer, not to make it.
+        is to remember the answer, not to make it. It remembers BOTH stamps
+        because the two answer different questions -- `since` bounds the wait,
+        `first_at` is how long the round has really been held -- and a report
+        that conflates them tells an operator a promoted hold waited 30 minutes
+        when it waited 60.
         """
         row = self.get_verdict_post(repo, number, round_)
         if row is None or not row["checks_held_at"]:
-            return None, None
-        return int(row["checks_held_at"]), (row["checks_held_state"] or None)
+            return ChecksHold()
+        pending_at = row["checks_pending_at"]
+        return ChecksHold(
+            first_at=int(row["checks_held_at"]),
+            condition=(row["checks_held_state"] or None),
+            pending_at=int(pending_at) if pending_at else None,
+        )
 
     def record_checks_hold(
         self, repo: str, number: int, round_: int, condition: str
     ) -> int:
-        """Start (or restart) the hold clock for this round; return the stamp.
+        """Record that this round is held on `condition`; return the stamp the
+        bound is measured from.
 
         The caller decides WHEN to call this -- once when the hold begins, and at
         most once more when an unreadable hold is promoted to a genuinely pending
         one, because the bound is defined against the first observation of the
-        condition actually being waited on. Unconditional here so that policy
-        stays in one place instead of being half-expressed as a WHERE clause.
+        condition actually being waited on (loop._gate_on_checks owns that rule).
+
+        The promotion NO LONGER overwrites `checks_held_at`: it fills
+        `checks_pending_at` instead, so the ledger keeps when the round was first
+        held as well as when its current wait started. Nothing about the bound
+        changes; what changes is that the daemon can now say both numbers out
+        loud, which the operator-facing report needs.
         """
         now = int(time.time())
-        self._db.execute(
-            "UPDATE verdict_posts SET checks_held_at = ?, checks_held_state = ? "
-            "WHERE repo=? AND number=? AND round=?",
-            (now, condition, repo, number, round_),
-        )
+        if self.checks_hold(repo, number, round_).first_at is None:
+            self._db.execute(
+                "UPDATE verdict_posts SET checks_held_at = ?, checks_held_state = ? "
+                "WHERE repo=? AND number=? AND round=?",
+                (now, condition, repo, number, round_),
+            )
+        else:
+            self._db.execute(
+                "UPDATE verdict_posts SET checks_pending_at = ?, "
+                "checks_held_state = ? WHERE repo=? AND number=? AND round=?",
+                (now, condition, repo, number, round_),
+            )
         self._db.commit()
         return now
 
@@ -603,7 +663,7 @@ class State:
         return self._read_rows(
             "SELECT repo, number, round, first_seen_at, head_sha, attempts, "
             "last_attempt_at, posted_at, abandoned_at, checks_held_at, "
-            "checks_held_state, review_url, last_error "
+            "checks_held_state, checks_pending_at, review_url, last_error "
             "FROM verdict_posts "
             "ORDER BY first_seen_at DESC, number DESC",
             limit,
