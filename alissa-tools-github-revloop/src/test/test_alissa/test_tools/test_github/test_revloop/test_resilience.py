@@ -28,11 +28,11 @@ from alissa.tools.github.revloop import state as state_module
 from alissa.tools.github.revloop.__main__ import main
 from alissa.tools.github.revloop.config import Config
 from alissa.tools.github.revloop.loop import (
-    LedgerUnwritable,
     POLL_BACKOFF_CAP_SECONDS,
     POLL_ESCALATE_SECONDS,
     POLL_FAILURE_LOG_EVERY,
     POLL_FAILURE_LOG_HEAD,
+    LedgerUnwritable,
     PollFailures,
     ReviewWatcher,
     Streak,
