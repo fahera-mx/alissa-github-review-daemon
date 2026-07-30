@@ -644,6 +644,13 @@ class ReviewWatcher:
         # The surviving-session set the cap alarm last paged on, so a standing
         # over-cap condition pages once per episode -- see _check_session_cap.
         self._paged_cap: frozenset[str] | None = None
+        # (repo slug, number, drift kind) already announced by THIS process in
+        # dry-run. Deliberately in-memory: a dry-run pass must never be
+        # suppressed by anything durable (a production pass writing the ledger
+        # would silence the operator's diagnostic), but a daemon left in
+        # dry-run should not re-announce the same drift every poll either --
+        # see _warn_identity_drift.
+        self._dry_run_drift: set[tuple[str, int, str]] = set()
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -1420,11 +1427,12 @@ class ReviewWatcher:
             )
             return
 
-        # Above the dry-run guard: the drift check reads, records a ledger row
-        # and logs, but takes nothing on GitHub -- it OBSERVES the pass rather
-        # than acting in it, the same reasoning that writes poll snapshots in
-        # dry-run. Dry-run is also the mode an operator reaches for to diagnose
-        # exactly this, so staying silent about it there is the worst place.
+        # Above the dry-run guard: the drift check reads and logs but takes
+        # nothing on GitHub, and in dry-run it records nothing either -- it
+        # OBSERVES the pass rather than acting in it. Dry-run is the mode an
+        # operator reaches for to diagnose exactly this, so staying silent
+        # about it there is the worst place. See _warn_identity_drift for why
+        # the ledger is untouched in BOTH directions there.
         self._warn_identity_drift(pr)
 
         if self.config.dry_run:
@@ -1479,6 +1487,23 @@ class ReviewWatcher:
             pr.slug, mine, why, verdict.url, pr.head_sha[:8], left,
         )
 
+    def _drift_gated(self, pr: PullRequest, kind: str, record: bool) -> bool:
+        """Whether this drift-check gate is already closed for `pr`.
+
+        The two backing stores are not interchangeable and the split is the
+        whole point: durable in production, process-lifetime in dry-run, so
+        neither mode can ever silence the other. See _warn_identity_drift.
+        """
+        if record:
+            return self.state.pinged(pr.full_name, pr.number, kind)
+        return (pr.full_name, pr.number, kind) in self._dry_run_drift
+
+    def _note_drift_gate(self, pr: PullRequest, kind: str, record: bool) -> None:
+        if record:
+            self.state.record_ping(pr.full_name, pr.number, kind)
+        else:
+            self._dry_run_drift.add((pr.full_name, pr.number, kind))
+
     def _warn_identity_drift(self, pr: PullRequest) -> None:
         """Page once when the round's write-up landed under a login GitHub does
         not hold the request against.
@@ -1492,25 +1517,26 @@ class ReviewWatcher:
         Diagnostic only -- it never gates the removal, and an unreadable review
         list just means no warning, not a stalled close-out.
 
-        The extra read it needs is bounded to once per (PR, head); see
-        drift_probe_kind for why that bound exists at all.
+        Two gates, both of them once-per-condition: the extra read runs once per
+        (PR, head) and the warning once per (PR, login pair). See
+        drift_probe_kind and identity_drift_kind.
 
-        In `--dry-run` this touches the ping ledger in NEITHER direction: it
-        always probes, always warns, and records nothing. Both halves matter.
+        In `--dry-run` the SAME two gates apply, held in memory instead of in
+        the ping ledger -- which the run must not touch in either direction.
         Writing would let a diagnostic pass durably silence the daemon it was
-        run to diagnose -- `state_db` has no dry-run branch, so the rows land in
-        the same `state.db` production reads, and the alarm is once-per-PR. And
-        reading would silence the DIAGNOSTIC instead: a production pass that
+        run to diagnose (`state_db` has no dry-run branch, so the rows land in
+        the same `state.db` production reads, and the alarm is once-per-PR).
+        Reading would silence the DIAGNOSTIC instead: a production pass that
         already probed this head would make the operator's dry-run print
-        nothing. The cost is one review read per dry-run poll, which is the
-        right trade -- dry-run withdraws nothing, so the PR stays in the poll
-        set regardless, and the probe bound exists to protect the production
-        failure loop, not a run an operator is watching.
+        nothing. Process-lifetime scope gives both -- a fresh dry-run always
+        announces, and a daemon left running in dry-run does not re-emit the
+        same block every poll. Same reasoning as `_ignored_acks`: a statement
+        about one process belongs in the process, not in the ledger.
         """
         record = not self.config.dry_run
 
         probe = drift_probe_kind(pr.head_sha)
-        if record and self.state.pinged(pr.full_name, pr.number, probe):
+        if self._drift_gated(pr, probe, record):
             return
 
         try:
@@ -1519,8 +1545,7 @@ class ReviewWatcher:
             # Deliberately not recorded: a read that failed settles nothing.
             log.debug("%s: could not read reviews for the drift check: %s", pr.slug, exc)
             return
-        if record:
-            self.state.record_ping(pr.full_name, pr.number, probe)
+        self._note_drift_gate(pr, probe, record)
 
         substantive = [r for r in reviews if r.is_substantive]
         if not substantive:
@@ -1530,10 +1555,9 @@ class ReviewWatcher:
             return
 
         kind = identity_drift_kind(self.github.login, newest.author)
-        if record:
-            if self.state.pinged(pr.full_name, pr.number, kind):
-                return
-            self.state.record_ping(pr.full_name, pr.number, kind)
+        if self._drift_gated(pr, kind, record):
+            return
+        self._note_drift_gate(pr, kind, record)
         log.warning(
             "IDENTITY DRIFT on %s: the review request is held against %r but "
             "the round's newest review was submitted by %r (%s). GitHub only "
