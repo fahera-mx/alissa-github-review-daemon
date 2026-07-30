@@ -33,7 +33,7 @@ FROM python:3.12-slim-bookworm
 # below 0.15.0, the first version shipping the `alissa-revloop-ui` console
 # script the entrypoint starts. Naming the two apart keeps the next release a
 # one-line edit.
-ARG REVLOOP_VERSION=0.16.12
+ARG REVLOOP_VERSION=0.16.14
 # Node major version (must be >= 18 for the alissa CLI and claude-code).
 ARG NODE_MAJOR=22
 
