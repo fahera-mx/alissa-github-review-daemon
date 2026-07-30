@@ -883,8 +883,9 @@ class ResolvedTask:
     * the CACHED path fetches the task by ref to check the mapping still holds,
       so the whole evidence array comes with it and both the round count and the
       newest verdict are free;
-    * the SEARCH path matches TITLES out of the task corpus and never opens the
-      evidence, so it pays a separate `count_verdicts` and knows no verdict.
+    * the SEARCH path matches TITLES out of the task corpus, so it reads the
+      matched task afterwards to learn both -- and only when THAT read fails
+      does it fall back to a bare `count_verdicts` and know no verdict.
 
     Hence `verdict_read`, rather than letting `verdict=None` stand for both "no
     envelope parses" and "nobody looked". Convergence treats a None verdict as
@@ -896,6 +897,21 @@ class ResolvedTask:
     verdicts: int = 0
     verdict: "str | None" = None
     verdict_read: bool = False
+
+    @classmethod
+    def from_detail(cls, detail: TaskDetail) -> "ResolvedTask":
+        """One `alissa task get` payload answered all three questions.
+
+        The `verdict_read=True` invariant lives here rather than at the call
+        sites: it is a property of having read a task detail, and every path
+        that reads one gets it the same way.
+        """
+        return cls(
+            task=detail.task,
+            verdicts=detail.verdicts,
+            verdict=detail.verdict,
+            verdict_read=True,
+        )
 
     def newest_verdict(self, alissa: Alissa) -> "str | None":
         """The newest CR6 verdict envelope, fetching it only if this resolution
@@ -1012,15 +1028,6 @@ class ReviewWatcher:
 
     # -- the PR -> review-task mapping ---------------------------------------
 
-    def _resolved(self, detail: TaskDetail) -> "ResolvedTask":
-        """A cached hit: one payload answered all three questions."""
-        return ResolvedTask(
-            task=detail.task,
-            verdicts=detail.verdicts,
-            verdict=detail.verdict,
-            verdict_read=True,
-        )
-
     def _pass_task_list(self) -> list[Task]:
         """The actor's task corpus, fetched AT MOST ONCE per poll pass.
 
@@ -1087,7 +1094,7 @@ class ReviewWatcher:
             detail = self.alissa.get_task(cached)
             if detail is not None:
                 if is_review_task_for(pr.owner, pr.repo, pr.number, detail.task):
-                    return self._resolved(detail)
+                    return ResolvedTask.from_detail(detail)
                 log.info(
                     "%s: cached review task %s no longer matches (title=%r "
                     "status=%s) — re-resolving",
@@ -1113,9 +1120,20 @@ class ReviewWatcher:
             return ResolvedTask(task=None)
 
         self.state.record_review_task(pr.full_name, pr.number, task.ref)
-        # The search read TITLES, not evidence, so the newest verdict is
-        # genuinely unknown here -- left unread rather than defaulted to None,
-        # which convergence would read as "no approve" and lose a closed round.
+        # The search matched a TITLE out of the corpus; the round count and the
+        # verdict both live in the task's evidence, and ONE read returns both.
+        # Reading it here rather than paying `count_verdicts` now and
+        # `latest_verdict` again from convergence is the same saving the cached
+        # path makes -- and it matters most in the degraded state this whole
+        # change serves: an unreadable ledger sends EVERY PR down this path on
+        # EVERY pass (PR #69 round 1).
+        detail = self.alissa.get_task(task.ref)
+        if detail is not None:
+            return ResolvedTask.from_detail(detail)
+        # That read failed, so the verdict is genuinely unknown -- left UNREAD
+        # rather than defaulted to None, which convergence would take as "no
+        # approve" and lose a closed round. Falls back to exactly the two-read
+        # behaviour this path had before.
         return ResolvedTask(task=task, verdicts=self.alissa.count_verdicts(task.ref))
 
     # -- per-PR decision ---------------------------------------------------

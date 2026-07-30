@@ -10,6 +10,7 @@ import dataclasses
 import json
 import logging
 import time
+from datetime import datetime
 
 import pytest
 
@@ -266,6 +267,11 @@ class FakeAlissa:
         # that already holds the verdict must not ask again, and a fake that
         # answered silently would hide exactly that regression.
         self.verdict_calls: list[str] = []
+        # Refs `count_verdicts` was asked for. EVERY task read this fake serves
+        # is observable, not just the ones a finding happened to name: a silent
+        # double is how the search path's second fetch survived PR #68 (PR #69
+        # round 1).
+        self.count_calls: list[str] = []
         # When True, `get_task` cannot read the task at all (the CLI failed, or
         # it is gone) -- the case a cached mapping must survive, not be
         # invalidated by.
@@ -291,7 +297,7 @@ class FakeAlissa:
         self.get_calls.append(ref)
         if self.task_unreadable:
             return None
-        found = next((t for t in self.corpus if t.ref == ref), None)
+        found = next((t for t in self.known if t.ref == ref), None)
         if found is None:
             return None
         return TaskDetail(
@@ -299,20 +305,33 @@ class FakeAlissa:
         )
 
     @property
-    def corpus(self):
-        """Every task this actor owns, as `alissa task list` would report it.
+    def known(self):
+        """Every task this actor owns, listable or not.
 
         `task` is the PR's review task; `others` holds anything else a test
-        needs to exist -- a task the search must NOT match, or one that is
-        readable by ref while absent from the (non-terminal) list.
+        needs to exist -- a task the search must not match, or a terminal one.
         """
         return ([self.task] if self.task is not None else []) + list(self.others)
+
+    @property
+    def corpus(self):
+        """What `alissa task list` reports: NON-TERMINAL tasks only.
+
+        The CLI runs without `--include-terminal`, so a validated task is
+        absent from the list outright rather than merely filtered out of the
+        answer -- while `alissa task get` still reads it perfectly well by ref.
+        That asymmetry is the fake's one meaningful divergence from the real
+        client, so it is modelled here instead of being described backwards in
+        a docstring (PR #69 round 1).
+        """
+        return [t for t in self.known if t.is_open]
 
     def latest_verdict(self, task_ref):
         self.verdict_calls.append(task_ref)
         return self.verdict
 
     def count_verdicts(self, task_ref):
+        self.count_calls.append(task_ref)
         return self.verdict_count
 
     def enqueue_reviewer(self, **kwargs):
@@ -1214,6 +1233,17 @@ def test_task_ref_uses_task_number_not_seq(monkeypatch):
 # -- CR6 verdict envelopes -------------------------------------------------
 
 
+def epoch_ms(at):
+    """An ISO-8601 test date in the shape `alissa task get --json` really emits.
+
+    The CLI dates evidence with epoch MILLISECONDS as an int, not an ISO string
+    — confirmed against live data. Fixtures kept writing ISO strings, which fed
+    `_newest_verdict` a shape whose sort key happened to work and production's
+    shape never reached a test (PR #69 round 1). Call sites keep their readable
+    dates; only the value that reaches the parser changes."""
+    return int(datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp() * 1000)
+
+
 def envelope(verdict, round_, at, extra=""):
     """A real-shaped envelope. Note the em-dash and the hyphenated org name."""
     slug = "fahera-mx/studio.alissa.app#210"
@@ -1222,7 +1252,7 @@ def envelope(verdict, round_, at, extra=""):
         "markdownContent": (
             f"# Review verdict: {slug} — {verdict}\n\nRound {round_} findings.\n"
         ),
-        "createdAt": at,
+        "createdAt": epoch_ms(at) if isinstance(at, str) and at else at,
     }
 
 
@@ -5407,14 +5437,15 @@ def test_the_first_sighting_searches_and_the_next_pass_does_not(config):
 
     w.evaluate(OWNER, REPO, NUMBER)
     assert al.list_calls == 1, "first sighting has nothing cached; it searches"
-    assert al.get_calls == [], "and nothing to read back by ref"
+    assert al.get_calls == [FakeTask.ref], "then reads the task it matched"
     assert state.review_task(SLUG, NUMBER) == FakeTask.ref
 
     w._pass_tasks = None  # a fresh pass
     w.evaluate(OWNER, REPO, NUMBER)
 
     assert al.list_calls == 1, "the persisted mapping short-circuits the search"
-    assert al.get_calls == [FakeTask.ref], "resolved by ref, one small read"
+    assert al.get_calls == [FakeTask.ref] * 2, "resolved by ref, one small read"
+    assert al.count_calls == [], "and never a second read for the round count"
 
 
 def test_the_mapping_outlives_the_process(config):
@@ -5501,7 +5532,10 @@ def test_a_disproved_mapping_is_replaced_by_what_the_search_finds(config):
     w._pass_tasks = None
     resolved = w._review_task(make_pr())
 
-    assert al.get_calls == [FakeTask.ref], "the stale ref is read, and disproved"
+    assert al.get_calls == [FakeTask.ref, FakeTask.ref, "TASK-501"], (
+        "the first sighting's read, then the stale ref (disproved), then the "
+        "replacement the search found"
+    )
     assert resolved.task is al.task, "the search's answer is what the pass uses"
     assert state.review_task(SLUG, NUMBER) == "TASK-501", "and it is persisted"
 
@@ -5579,7 +5613,7 @@ def test_state_loss_degrades_to_the_old_lookup_and_skips_no_review(config):
     assert decision.round == 1
     assert decision.task_ref == FakeTask.ref
     assert al.list_calls == 1, "and resolved the way it always was: by search"
-    assert al.get_calls == [], "with no cached ref to read back"
+    assert al.get_calls == [FakeTask.ref], "no cached ref to read back — just the match"
 
 
 def test_the_cached_round_count_comes_from_the_same_read(config):
@@ -5590,6 +5624,7 @@ def test_the_cached_round_count_comes_from_the_same_read(config):
     w.evaluate(OWNER, REPO, NUMBER)
 
     w._pass_tasks = None
+    al.get_calls.clear()  # the first sighting's read is not what is under test
     al.verdict_count = 2  # a round landed between the passes
     al.verdict = VERDICT_APPROVE
     resolved = w._review_task(make_pr())
@@ -5726,6 +5761,7 @@ def test_the_cached_path_reads_the_task_exactly_once_per_pass(config):
     # claim under test is about the CACHED pass that follows.
     al.get_calls.clear()
     al.verdict_calls.clear()
+    al.count_calls.clear()
     w._pass_tasks = None
     decision = w.evaluate(OWNER, REPO, NUMBER)
 
@@ -5736,12 +5772,16 @@ def test_the_cached_path_reads_the_task_exactly_once_per_pass(config):
     assert al.verdict_calls == [], (
         "and convergence re-read nothing: the verdict came off that same payload"
     )
+    assert al.count_calls == [], "nor did the round count cost a read"
 
 
-def test_the_search_path_still_fetches_the_verdict_it_never_read(config):
-    """The miss path matches TITLES and never opens the evidence, so its
-    verdict is UNREAD, not None. Treating unread as 'no approve' would refuse
-    to close a round that had approved."""
+def test_the_search_path_also_reads_its_task_exactly_once(config):
+    """The miss path matched a TITLE; the round count and the verdict both live
+    in the matched task's evidence, so ONE read returns both there too.
+
+    This is the degraded-ledger state's cost: when the cache cannot be read,
+    every PR takes this path every pass, and it used to pay a corpus fetch plus
+    TWO task reads (PR #69 round 1)."""
     state = State(config.state_db)
     w, _, al = watcher(config, make_pr(), [review()], state=state, verdict_count=1)
     al.verdict = VERDICT_APPROVE
@@ -5749,9 +5789,29 @@ def test_the_search_path_still_fetches_the_verdict_it_never_read(config):
     decision = w.evaluate(OWNER, REPO, NUMBER)  # first sighting: resolved by search
 
     assert al.list_calls == 1, "this pass genuinely took the search path"
-    assert al.verdict_calls == [FakeTask.ref], "so it had to fetch the verdict"
+    assert al.get_calls == [FakeTask.ref], "and read the matched task once"
+    assert al.count_calls == [], "not a separate round-count fetch"
+    assert al.verdict_calls == [], "not a separate verdict fetch either"
+    assert decision.action is Action.CONVERGED, "and it still saw the approve"
+
+
+def test_an_unreadable_match_falls_back_to_the_two_reads(config):
+    """FAIL OPEN. When the matched task cannot be read, the verdict is UNREAD
+    rather than None -- treating unread as 'no approve' would refuse to close a
+    round that had approved -- and the path degrades to exactly the pair of
+    fetches it made before."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [review()], state=state, verdict_count=1)
+    al.verdict = VERDICT_APPROVE
+    al.task_unreadable = True
+
+    decision = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert al.get_calls == [FakeTask.ref], "the one read that failed"
+    assert al.count_calls == [FakeTask.ref], "so the round count is fetched"
+    assert al.verdict_calls == [FakeTask.ref], "and so is the verdict"
     assert decision.action is Action.CONVERGED, (
-        "and still saw the approve, rather than reading unread as 'no approve'"
+        "the approve is still seen: an unread verdict is fetched, not assumed"
     )
 
 
@@ -5834,3 +5894,119 @@ def test_get_task_reports_no_verdict_when_no_envelope_parses(monkeypatch):
     assert detail is not None
     assert detail.verdicts == 0
     assert detail.verdict is None
+
+
+# -- evidence ordering across both createdAt shapes (PR #69 round 1) --------
+#
+# `alissa task get --json` dates evidence with epoch MILLISECONDS as an int.
+# The old sort key kept only `str` stamps, so every real item collapsed to ""
+# and `max` returned the FIRST of an all-equal set -- and evidence comes back
+# oldest-first, so the OLDEST verdict won. TASK-194837655; fixed here because
+# this release is what promotes the verdict to convergence's input.
+
+
+def _verdicts(*items):
+    from alissa.tools.github.revloop.alissa import Alissa
+
+    return Alissa._newest_verdict({"evidence": list(items)})
+
+
+def test_the_newest_verdict_wins_on_the_shape_the_cli_actually_emits():
+    """The regression, stated in production's own units."""
+    assert _verdicts(
+        envelope(VERDICT_REQUEST_CHANGES, 1, "2026-07-18T10:00:00Z"),
+        envelope(VERDICT_APPROVE, 2, "2026-07-18T12:00:00Z"),
+    ) == VERDICT_APPROVE
+
+    # ...and it is an ordering, not a position: reverse the array and the same
+    # envelope still wins.
+    assert _verdicts(
+        envelope(VERDICT_APPROVE, 2, "2026-07-18T12:00:00Z"),
+        envelope(VERDICT_REQUEST_CHANGES, 1, "2026-07-18T10:00:00Z"),
+    ) == VERDICT_APPROVE
+
+
+def test_iso_and_epoch_stamps_order_against_each_other():
+    """Both shapes normalise to one scale, so a task carrying a mixture still
+    orders correctly -- and comparing them cannot raise, which widening the
+    isinstance in place would have done."""
+    older = dict(envelope(VERDICT_REQUEST_CHANGES, 1, "2026-07-18T10:00:00Z"))
+    older["createdAt"] = "2026-07-18T10:00:00Z"  # the ISO shape, unconverted
+
+    assert _verdicts(older, envelope(VERDICT_APPROVE, 2, "2026-07-18T12:00:00Z")) == (
+        VERDICT_APPROVE
+    )
+    assert _verdicts(
+        envelope(VERDICT_APPROVE, 1, "2026-07-18T08:00:00Z"), older
+    ) == VERDICT_REQUEST_CHANGES
+
+
+def test_seconds_and_milliseconds_are_the_same_instant():
+    from alissa.tools.github.revloop.alissa import Alissa
+
+    ms = Alissa._created_key(1785427358482)
+    sec = Alissa._created_key(1785427358.482)
+
+    assert ms == sec, "a stamp's unit must not decide which envelope is newest"
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "not a date", {}, [], True, False], ids=repr
+)
+def test_an_unusable_stamp_sorts_first(value):
+    """Undated evidence must never outrank a dated envelope -- the rule the
+    empty-string key used to encode. `True` is included on purpose: bool is an
+    int, and treating it as epoch 1ms would rank it above a real timestamp."""
+    from alissa.tools.github.revloop.alissa import Alissa
+
+    assert Alissa._created_key(value) == (0, 0.0)
+    assert Alissa._created_key(value) < Alissa._created_key(1785427358482)
+
+
+def test_equal_stamps_resolve_to_the_LAST_envelope():
+    """Two envelopes recorded in the same millisecond. Evidence arrives
+    oldest-first, so the later-appended one is the newer verdict; the old key
+    kept the first."""
+    at = "2026-07-18T10:00:00Z"
+
+    assert _verdicts(
+        envelope(VERDICT_REQUEST_CHANGES, 1, at), envelope(VERDICT_APPROVE, 2, at)
+    ) == VERDICT_APPROVE
+    assert _verdicts(
+        envelope(VERDICT_APPROVE, 1, at), envelope(VERDICT_REQUEST_CHANGES, 2, at)
+    ) == VERDICT_REQUEST_CHANGES
+
+
+def test_a_dated_envelope_beats_an_undated_one_either_way_round():
+    undated = envelope(VERDICT_REQUEST_CHANGES, 1, None)
+    dated = envelope(VERDICT_APPROVE, 2, "2026-07-18T10:00:00Z")
+
+    assert _verdicts(undated, dated) == VERDICT_APPROVE
+    assert _verdicts(dated, undated) == VERDICT_APPROVE
+
+
+def test_convergence_sees_the_newest_verdict_on_real_evidence(config, monkeypatch):
+    """End to end, through the path this release created: a round-1
+    request_changes followed by a round-2 approve, dated the way the CLI dates
+    them, must converge. Before the fix this PR is the reason for, it read
+    request_changes and ran to the round cap."""
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    payload = {
+        "taskNumber": 500,
+        "title": f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-499)",
+        "status": "in_progress",
+        "evidence": [
+            envelope(VERDICT_REQUEST_CHANGES, 1, "2026-07-18T10:00:00Z"),
+            envelope(VERDICT_APPROVE, 2, "2026-07-18T12:00:00Z"),
+        ],
+    }
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: payload)
+
+    detail = alissa_mod.Alissa().get_task("TASK-500")
+
+    assert detail is not None
+    assert detail.verdicts == 2
+    assert detail.verdict == VERDICT_APPROVE, (
+        "the value convergence now reads must be the NEWEST round's"
+    )
