@@ -74,6 +74,7 @@ render_revloop_config() {
     --arg     cap    "${ALISSA_ROUND_CAP:-}" \
     --arg     grace  "${ALISSA_REAP_GRACE_SECONDS:-}" \
     --arg     scap   "${ALISSA_REAP_SESSION_CAP:-}" \
+    --arg     maxses "${ALISSA_MAX_CONCURRENT_SESSIONS:-}" \
     --arg     cwait  "${ALISSA_CHECKS_WAIT_SECONDS:-}" \
     --arg     rlogin "${ALISSA_REVIEWER_LOGIN:-}" \
     --arg     rtoken "${ALISSA_REVIEWER_TOKEN_ENV:-}" \
@@ -82,6 +83,7 @@ render_revloop_config() {
      + (if $cap   == "" then {} else { round_cap:          ($cap   | tonumber) } end)
      + (if $grace == "" then {} else { reap_grace_seconds: ($grace | tonumber) } end)
      + (if $scap  == "" then {} else { reap_session_cap:   ($scap  | tonumber) } end)
+     + (if $maxses == "" then {} else { max_concurrent_sessions: ($maxses | tonumber) } end)
      + (if $cwait == "" then {} else { checks_wait_seconds: ($cwait | tonumber) } end)
      + (if $rlogin == "" then {} else { reviewer_login:     $rlogin } end)
      + (if $rtoken == "" then {} else { reviewer_token_env: $rtoken } end)

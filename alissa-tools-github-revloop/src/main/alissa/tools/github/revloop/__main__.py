@@ -123,6 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
         "after a sweep and the daemon logs loudly",
     )
     over.add_argument(
+        "--max-concurrent-sessions",
+        type=int,
+        metavar="N",
+        help="spawn gate: at this many live reviewer sessions an owed round "
+        "waits for a slot instead of spawning (must be <= --reap-session-cap)",
+    )
+    over.add_argument(
         "--checks-wait-seconds",
         type=int,
         metavar="SECONDS",
@@ -165,6 +172,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "on_missing_hub": args.on_missing_hub,
         "reap_grace_seconds": args.reap_grace_seconds,
         "reap_session_cap": args.reap_session_cap,
+        "max_concurrent_sessions": args.max_concurrent_sessions,
         "checks_wait_seconds": args.checks_wait_seconds,
         "dry_run": args.dry_run,
     }

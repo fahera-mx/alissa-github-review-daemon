@@ -239,6 +239,16 @@ ARG ALISSA_REVIEWER_TOKEN_ENV=""
 # threshold for live reviewer sessions left after a sweep.
 ARG ALISSA_REAP_GRACE_SECONDS=""
 ARG ALISSA_REAP_SESSION_CAP=""
+# Spawn back-pressure: how many of THIS daemon's reviewer sessions may be live
+# before an owed round waits for a slot instead of spawning. A reviewer session
+# is a full interactive agent, and nothing bounded how many ran at once --
+# `round_cap` is per PR and the reap cap only alarms -- so a merge wave pegged
+# the container's vCPU ceiling (2026-07-29, 18:45-19:00Z). Deferral costs the
+# round nothing: no round number, no attempt, no escalation. Must be <=
+# ALISSA_REAP_SESSION_CAP, which the daemon enforces at config load. Pass-through,
+# and it REQUIRES REVLOOP_VERSION >= 0.16.13 for the same reason the keys above
+# do: an older library rejects the unknown config key at load.
+ARG ALISSA_MAX_CONCURRENT_SESSIONS=""
 # How long a round holds its APPROVE while the judged head's CI rollup is still
 # running (or unreadable) before recording the verdict as a comment instead --
 # PER CONDITION waited on, so an unreadable hold promoted to a pending one
@@ -273,6 +283,7 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
     ALISSA_REAP_GRACE_SECONDS=${ALISSA_REAP_GRACE_SECONDS} \
     ALISSA_REAP_SESSION_CAP=${ALISSA_REAP_SESSION_CAP} \
+    ALISSA_MAX_CONCURRENT_SESSIONS=${ALISSA_MAX_CONCURRENT_SESSIONS} \
     ALISSA_CHECKS_WAIT_SECONDS=${ALISSA_CHECKS_WAIT_SECONDS} \
     ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} \
     ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} \

@@ -204,7 +204,7 @@ section.panel {
   border-color: var(--status-in-progress); background: var(--status-in-progress-bg); }
 .pill.in-flight { color: var(--status-committed);
   border-color: var(--status-committed); background: var(--status-committed-bg); }
-.pill.deferred { color: var(--status-pending);
+.pill.deferred, .pill.queued { color: var(--status-pending);
   border-color: var(--status-pending); background: var(--status-pending-bg); }
 .pill.converged, .pill.posted { color: var(--status-in-progress);
   border-color: var(--status-in-progress); background: var(--status-in-progress-bg); }

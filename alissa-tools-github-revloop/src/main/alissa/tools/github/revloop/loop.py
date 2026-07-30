@@ -141,6 +141,53 @@ POLL_FAILURE_LOG_EVERY = 10
 EXPECTED_POLL_FAILURES = (CommandError,)
 
 
+# -- the spawn gate (issue #70) -----------------------------------------------
+#
+# The one INFO line a poll pass emits about deferrals, summarizing them all.
+# Per PASS, never per round: a wave of eight PRs behind a gate of four is one
+# fact about the container, not eight facts about PRs, and the deployed daemon
+# polls every 30s. Streak-limited on the same rule as the poll firewall (the
+# first few in full, then one in ten) so a long queue costs a handful of lines
+# an hour.
+DEFERRAL_SUMMARY = (
+    "spawn gate: %d round(s) deferred — %d/%d reviewer sessions live. "
+    "%s Nothing is lost: a deferred round burns no round number and no "
+    "attempt, and the oldest waiter takes the next free slot."
+)
+
+# The recovery line, logged once when a deferral streak ends -- the operator's
+# only evidence in the log that a queue drained on its own.
+DEFERRAL_CLEARED = (
+    "spawn gate: clear after %d pass(es) over %.0f min — every owed round "
+    "spawned"
+)
+
+
+@dataclass(frozen=True)
+class Waiting:
+    """One round's place in the spawn queue, from its FIRST deferral.
+
+    `seq` is the ordering key and it is a COUNTER, not a clock: two rounds
+    deferred in the same pass are microseconds apart, and a wall-clock tie
+    would be broken by whatever `sorted` felt like -- which is the search's own
+    order, i.e. the starvation this exists to prevent. `since` is monotonic and
+    only ever reported, never compared.
+    """
+
+    seq: int
+    since: float
+
+
+def _slug_key(slug: str) -> tuple[str, int]:
+    """`acme/widgets#7` -> the `_waiting` key `("acme/widgets", 7)`.
+
+    The poll walk carries decisions keyed by slug and the gate keys by
+    (repo, number); this is the one place the two spellings meet.
+    """
+    repo, _, number = slug.partition("#")
+    return repo, int(number)
+
+
 class LedgerUnwritable(RuntimeError):
     """Raised by `poll_once` when the ledger gate refuses the pass.
 
@@ -851,6 +898,17 @@ class Action(str, Enum):
     # this one has given up, and the poll snapshot and console aggregate the
     # action rather than the reason.
     ABANDONED = "abandoned"
+    # The round is owed and nothing about the PR blocks it -- the SPAWN GATE
+    # does: `max_concurrent_sessions` reviewer sessions are already live, so it
+    # waits for a slot and is retried on a later poll (issue #70).
+    #
+    # NOT folded into the liveness deferral's IN_FLIGHT/`deferred` pair, which
+    # it superficially resembles: that one names a live session still working
+    # its round, and the console counts it as an ACTIVE SESSION
+    # (webui.sources: in_flight + deferred). A gated round has no session at
+    # all -- counting it as one would inflate exactly the number this gate
+    # exists to hold down.
+    QUEUED = "queued"
 
 
 @dataclass(frozen=True)
@@ -1017,6 +1075,28 @@ class ReviewWatcher:
         # de-duplication, and a corpus that outlived its pass would answer the
         # next one from titles and statuses that have since moved.
         self._pass_tasks: list[Task] | None = None
+        # -- the spawn gate's per-pass and cross-pass state (issue #70) ------
+        # How many own-grammar reviewer sessions are live THIS pass, and
+        # whether anyone has looked. The sweep seeds both (it lists the
+        # sessions anyway); a count of None with `_census_probed` True means
+        # the list could not be read, which the gate treats as "unknown" and
+        # fails OPEN -- see _live_session_count.
+        self._session_census: int | None = None
+        self._census_probed = False
+        self._census_warned = False
+        # (repo full name, PR number) -> where that round sits in the spawn
+        # queue, from the first pass that deferred it. Cross-pass and
+        # in-memory: it is a FAIRNESS ORDER, not a decision the daemon must
+        # remember -- a restart costs the queue its order for one pass (every
+        # waiter is re-stamped on its next deferral) and nothing else, which
+        # does not justify a ledger table on the poll path. Pruned every pass
+        # against the live candidate set, so a merged or converged PR cannot
+        # hold a place forever.
+        self._waiting: dict[tuple[str, int], Waiting] = {}
+        self._wait_seq = 0
+        # Consecutive passes that deferred at least one round -- the summary
+        # line's streak limiter.
+        self._gate_streak = Streak()
         # Consecutive passes refused by the ledger gate in poll_once, and when
         # the refusal began -- the same streak-limit-then-escalate shape the
         # poll firewall uses, for the same reason: a read-only volume refuses
@@ -1240,6 +1320,22 @@ class ReviewWatcher:
             deferred = self._defer_stale_round(pr, round_, age, cap)
             if deferred is not None:
                 return deferred
+
+        # THE SPAWN GATE, and it sits here -- past every branch that decides
+        # WHETHER a round is owed, immediately before the one that acts.
+        # Upstream of it the loop is only reading; downstream it starts an
+        # interactive agent. So a gated round has passed convergence, the cap
+        # and CR9 re-entry identically to one that spawns: re-entry-granted
+        # rounds queue through the gate like any other, delayed and never
+        # denied. A stale-round respawn is gated too -- it is a spawn, and the
+        # dead session it replaces is exactly as absent next poll.
+        held = self._gate_spawn(pr, round_)
+        if held is not None:
+            return held
+
+        if age is not None:
+            # Logged only once the gate has let the respawn through, so the
+            # line cannot claim a re-enqueue that back-pressure then deferred.
             log.warning(
                 "%s round %d has been in flight %.0f min with no submitted review "
                 "and its session is gone or finished — re-enqueuing (reviewer "
@@ -1250,6 +1346,168 @@ class ReviewWatcher:
             )
 
         return self._spawn(pr, round_, task, cap, reenqueued=age is not None)
+
+    # -- the spawn gate ----------------------------------------------------
+
+    def _gate_spawn(self, pr: PullRequest, round_: int) -> Decision | None:
+        """Hold an owed round back when the container is already full.
+
+        Returns a QUEUED Decision when the round must wait, or None to spawn.
+
+        DEFERRAL IS NOT FAILURE, and every part of that is load-bearing:
+
+        * it writes NO spawn-ledger row, so the round number is untouched (the
+          next poll computes the same `completed + 1`) and no attempt is spent;
+        * with no row there is no `spawn_age`, so the stale-round probe and its
+          respawn branch cannot see the round at all -- a round can sit gated
+          for hours without ever being "in flight 90 minutes";
+        * it posts nothing: no PR comment, no operator page, no escalation.
+          The only trace is one summary line per pass (see _note_deferrals).
+
+        The count is of sessions matching THIS package's grammar and no other
+        (`Alissa.list_review_sessions` filters on `parse_session_name`), which
+        is the same ownership boundary the reaper draws: other lanes share the
+        container and are invisible here in both directions. Hand-spawned
+        `review-pr-<n>` sessions are ours by that grammar and DO count -- they
+        consume the same CPU, and a gate that ignored them would let a
+        hand-driven round and a daemon round each think it had the last slot.
+
+        Sessions this pass has already enqueued count too (`_spawn` increments
+        the census): the census is read once per pass, so without that a single
+        pass would hand the same free slot to every PR in the wave.
+        """
+        limit = self.config.max_concurrent_sessions
+        live = self._live_session_count()
+        key = (pr.full_name, pr.number)
+        if live is None or live < limit:
+            # Spawning: this round is no longer waiting on anything. Dropped
+            # here rather than in `_spawn`, which can still bail on a missing
+            # hub or review task -- a round that never reaches the enqueue is
+            # not holding a queue place either.
+            self._waiting.pop(key, None)
+            return None
+
+        wait = self._waiting.get(key)
+        if wait is None:
+            self._wait_seq += 1
+            wait = Waiting(seq=self._wait_seq, since=time.monotonic())
+            self._waiting[key] = wait
+        return Decision(
+            Action.QUEUED,
+            f"round {round_} deferred — {live}/{limit} reviewer sessions live "
+            f"(waiting {int(time.monotonic() - wait.since)}s)",
+            round_,
+        )
+
+    def _live_session_count(self) -> int | None:
+        """Own-grammar reviewer sessions live this pass, or None if unknown.
+
+        Seeded by the reap sweep, which lists them anyway, so the gate costs no
+        extra `alissa tmux ls` in the daemon. A caller that reaches the gate
+        without a sweep (a direct `evaluate`, or a pass whose sweep bailed
+        early) probes once and memoizes for the pass.
+
+        None -- the list could not be read -- FAILS OPEN: the spawn proceeds.
+        The alternative was tried on paper and rejected: `alissa tmux ls` is
+        also the reaper's only input, so a CLI that cannot answer it means
+        nothing is being reaped either, and refusing every spawn would turn one
+        broken subprocess into a fleet-wide review outage while the container
+        sat idle. Failing open restores exactly the pre-gate behaviour for as
+        long as the outage lasts, and it is loud (once per pass) about doing
+        so.
+        """
+        if not self._census_probed:
+            self._census_probed = True
+            try:
+                self._session_census = len(self.alissa.list_review_sessions())
+            except CommandError as exc:
+                self._session_census = None
+                log.warning(
+                    "spawn gate: could not count live reviewer sessions (%s) — "
+                    "allowing spawns this pass rather than stalling the loop on "
+                    "a session list the reaper cannot read either",
+                    exc,
+                )
+                self._census_warned = True
+        if self._session_census is None and not self._census_warned:
+            self._census_warned = True
+            log.warning(
+                "spawn gate: the live reviewer-session count is unknown this "
+                "pass — allowing spawns (the gate is back-pressure, not a "
+                "safety interlock)"
+            )
+        return self._session_census
+
+    def _gate_order(
+        self, requests: list[tuple[str, str, int]]
+    ) -> list[tuple[str, str, int]]:
+        """This pass's candidates, oldest waiter first.
+
+        FIFO fairness, and it needs its own order because the walk order it
+        replaces is NOT fair: `review_requests` is a `search/issues` query, and
+        that API sorts by best match by default -- a relevance ranking with no
+        relation to how long a round has been waiting, and not even stable
+        between calls. Under a gate that hands out one slot per freed session,
+        an unstable order starves whichever PR keeps losing the coin toss.
+
+        So: everything that has already been deferred goes first, in the order
+        it was FIRST deferred (`Waiting.seq`), then everything else in the
+        search's own order. A round that has waited two passes therefore takes
+        the next free slot ahead of one that has waited none -- which is the
+        whole anti-starvation guarantee -- and a pass with no deferrals is
+        byte-for-byte the old walk.
+        """
+        if not self._waiting:
+            return requests
+        return sorted(
+            requests,
+            key=lambda item: (
+                self._waiting[(f"{item[0]}/{item[1]}", item[2])].seq
+                if (f"{item[0]}/{item[1]}", item[2]) in self._waiting
+                else self._wait_seq + 1
+            ),
+        )
+
+    def _note_deferrals(self, results: list[tuple[str, Decision]]) -> None:
+        """One streak-limited INFO line per pass summarizing the gate.
+
+        INFO, never WARNING, and it never escalates however long the streak
+        runs: a full container is the gate WORKING. The condition an operator
+        must be paged about is the one the reap alarm already owns (sessions
+        that will not go away), and duplicating it here would make normal load
+        indistinguishable from a leak.
+        """
+        held = [(slug, d) for slug, d in results if d.action is Action.QUEUED]
+        if not held:
+            ended = self._gate_streak.resolve(time.monotonic())
+            if ended is not None:
+                passes, seconds = ended
+                log.info(DEFERRAL_CLEARED, passes, seconds / 60)
+            return
+
+        should_log, _ = self._gate_streak.record(time.monotonic())
+        if not should_log:
+            return
+        # A round is only ever deferred against a census the gate could read,
+        # so this is never the fallback -- an unreadable count fails open and
+        # produces no deferrals at all.
+        live = self._session_census or 0
+        log.info(
+            DEFERRAL_SUMMARY,
+            len(held),
+            live,
+            self.config.max_concurrent_sessions,
+            "Waiting, oldest first: "
+            + ", ".join(
+                slug for slug, _ in sorted(
+                    held,
+                    key=lambda item: self._waiting.get(
+                        _slug_key(item[0]), Waiting(seq=0, since=0.0)
+                    ).seq,
+                )
+            )
+            + ".",
+        )
 
     # -- native verdict post -----------------------------------------------
 
@@ -2402,6 +2660,10 @@ class ReviewWatcher:
             sessions = self.alissa.list_review_sessions()
         except CommandError as exc:
             log.warning("reap sweep skipped: could not list sessions: %s", exc)
+            # Probed and unanswerable. The spawn gate reads the same list, so
+            # it is told the count is unknown rather than left to pay for a
+            # second failing subprocess per candidate PR.
+            self._census_probed, self._session_census = True, None
             return 0
 
         # Drop cached resolutions for sessions that are gone. Names are unique
@@ -2673,6 +2935,11 @@ class ReviewWatcher:
         """
         killed = set(reaped)
         remaining = sorted(s.name for s in sessions if s.name not in killed)
+        # The spawn gate's census for this pass, taken from the same post-sweep
+        # list the alarm counts: what the sweep could not free is exactly what
+        # is still holding CPU when the gate decides. Seeded here so the gate
+        # never runs its own `alissa tmux ls`.
+        self._census_probed, self._session_census = True, len(remaining)
         if len(remaining) <= self.config.reap_session_cap:
             self._paged_cap = None
             return
@@ -2803,6 +3070,16 @@ class ReviewWatcher:
             task_ref=task.ref if task else None,
             dry_run=self.config.dry_run,
         )
+
+        # This pass's own spawns count against the gate immediately (issue
+        # #70). The census is read once per pass and a just-enqueued session
+        # takes a moment to appear in `alissa tmux ls`, so without this a
+        # merge wave would hand one free slot to every PR in it -- the
+        # unbounded burst the gate exists to prevent, reintroduced by a
+        # caching detail. Incremented in dry-run too: the diagnostic's job is
+        # to report the decisions production would take.
+        if self._session_census is not None:
+            self._session_census += 1
 
         if not self.config.dry_run:
             self.state.record_spawn(
@@ -3104,6 +3381,14 @@ class ReviewWatcher:
         # to this one's title searches as if it were current, and it is the one
         # piece of per-pass state whose staleness would be invisible.
         self._pass_tasks = None
+        # ...and so does the spawn gate's session census: a count carried over
+        # from the previous pass would gate this one on sessions that have
+        # since been reaped (or miss ones that have since spawned). Cleared
+        # with `_pass_tasks` and for the same reason. The `_waiting` queue is
+        # deliberately NOT cleared -- it is what remembers who has waited
+        # longest ACROSS passes.
+        self._session_census = None
+        self._census_probed = self._census_warned = False
 
         # THE LEDGER GATE (issue #62, PR #63 round-1 blocker). Nothing below
         # may run when the ledger cannot record what it does.
@@ -3162,8 +3447,17 @@ class ReviewWatcher:
         requests = self.github.review_requests(self.config.repos)
         log.info("%d PR(s) with a review pending from %s", len(requests), self.github.login)
 
+        # Forget queue places belonging to PRs this pass cannot act on at all
+        # (merged, converged, withdrawn): they are gone from the search, so
+        # nothing would ever clear them and the oldest-first order would be
+        # anchored to a PR that is never coming back.
+        live_keys = {(f"{owner}/{repo}", number) for owner, repo, number in requests}
+        self._waiting = {
+            key: wait for key, wait in self._waiting.items() if key in live_keys
+        }
+
         results = []
-        for owner, repo, number in requests:
+        for owner, repo, number in self._gate_order(requests):
             slug = f"{owner}/{repo}#{number}"
             if not self.config.watches(f"{owner}/{repo}"):
                 continue
@@ -3178,6 +3472,8 @@ class ReviewWatcher:
             level = logging.INFO if decision.action != Action.SKIPPED else logging.DEBUG
             log.log(level, "%s → %s (%s)", slug, decision.action.value, decision.reason)
             results.append((slug, decision))
+
+        self._note_deferrals(results)
 
         # Persist one poll_snapshots row per pass, built entirely from the
         # Decision list already in hand plus the reap count -- no new GitHub
@@ -3289,6 +3585,7 @@ class ReviewWatcher:
             if d.action is Action.IN_FLIGHT and d.deferred
         )
         self.state.record_snapshot(
+            queued=counts[Action.QUEUED],
             duration_ms=duration_ms,
             candidates=len(results),
             spawned=spawned,

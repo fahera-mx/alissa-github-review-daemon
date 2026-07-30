@@ -188,6 +188,12 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
     posted            INTEGER NOT NULL DEFAULT 0,
     awaiting_post     INTEGER NOT NULL DEFAULT 0,
     abandoned         INTEGER NOT NULL DEFAULT 0,
+    -- Rounds the spawn gate held back this pass because the container was
+    -- already at max_concurrent_sessions (issue #70). Its own column rather
+    -- than a share of `deferred`: that one counts rounds whose LIVE session is
+    -- still working, and the console reads the two together as active
+    -- sessions -- a gated round has no session at all.
+    queued            INTEGER NOT NULL DEFAULT 0,
     stages_json       TEXT    NOT NULL
 );
 """
@@ -204,6 +210,7 @@ _ADDED_COLUMNS = {
         ("posted", "INTEGER NOT NULL DEFAULT 0"),
         ("awaiting_post", "INTEGER NOT NULL DEFAULT 0"),
         ("abandoned", "INTEGER NOT NULL DEFAULT 0"),
+        ("queued", "INTEGER NOT NULL DEFAULT 0"),
     ),
     "verdict_posts": (
         ("checks_held_at", "INTEGER"),
@@ -970,6 +977,7 @@ class State:
         posted: int = 0,
         awaiting_post: int = 0,
         abandoned: int = 0,
+        queued: int = 0,
         stages: list[dict],
     ) -> bool:
         """Append one poll-pass observation, then prune to the newest
@@ -1004,6 +1012,7 @@ class State:
                 posted=posted,
                 awaiting_post=awaiting_post,
                 abandoned=abandoned,
+                queued=queued,
                 stages=stages,
             ),
             "poll snapshot",
@@ -1026,6 +1035,7 @@ class State:
         posted: int,
         awaiting_post: int,
         abandoned: int,
+        queued: int,
         stages: list[dict],
     ) -> None:
         """The snapshot INSERT + prune itself, strict. Split out so the
@@ -1034,8 +1044,8 @@ class State:
             "INSERT INTO poll_snapshots "
             "(ts, duration_ms, candidates, spawned, stale_reenqueued, "
             "in_flight, deferred, converged, capped, escalated, skipped, "
-            "reaped, posted, awaiting_post, abandoned, stages_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "reaped, posted, awaiting_post, abandoned, queued, stages_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 int(time.time()),
                 duration_ms,
@@ -1052,6 +1062,7 @@ class State:
                 posted,
                 awaiting_post,
                 abandoned,
+                queued,
                 json.dumps(stages, separators=(",", ":")),
             ),
         )
