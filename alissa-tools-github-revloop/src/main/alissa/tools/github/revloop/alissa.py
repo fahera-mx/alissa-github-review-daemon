@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .proc import CommandError, run, run_json
@@ -190,17 +191,25 @@ def _task_from_row(row: object) -> "Task | None":
 
 @dataclass(frozen=True)
 class TaskDetail:
-    """One task as `alissa task get` sees it: the task itself, plus the CR6
-    verdict envelopes already on it.
+    """One task as `alissa task get` sees it: the task itself, plus everything
+    the decide path reads off its CR6 verdict evidence.
 
-    The two travel together because they come out of ONE payload. The decide
-    path needs both (is this still the PR's open review task? how many rounds
-    has it recorded?), and reading them separately would cost two task fetches
-    per PR per poll where the CLI already returns everything in one.
+    All three travel together because they come out of ONE payload. The decide
+    path needs every one of them (is this still the PR's open review task? how
+    many rounds has it recorded? what did the newest round decide?), and
+    `_count_verdicts` and `_newest_verdict` are deliberately written as mirrors
+    over the same evidence array -- so reading them apart would mean fetching
+    and re-parsing the same task two and three times per PR per poll, which is
+    the exact cost this whole path exists to stop paying.
+
+    `verdict` is None when no envelope on the task parses -- the normal round-1
+    case, indistinguishable here from "no verdict of record yet", which is what
+    the caller wants it to mean anyway.
     """
 
     task: Task
     verdicts: int
+    verdict: "str | None"
 
 
 class Alissa:
@@ -251,7 +260,11 @@ class Alissa:
             task = _task_from_row(data)
             if task is None:
                 return None
-            return TaskDetail(task=task, verdicts=self._count_verdicts(data))
+            return TaskDetail(
+                task=task,
+                verdicts=self._count_verdicts(data),
+                verdict=self._newest_verdict(data),
+            )
         except Exception:  # pragma: no cover - defence in depth
             log.exception("could not parse task payload for %s", ref)
             return None
@@ -317,6 +330,44 @@ class Alissa:
             return None
 
     @staticmethod
+    def _created_key(value: object) -> tuple[int, float]:
+        """One evidence item's `createdAt`, as a sortable stamp.
+
+        `alissa task get --json` dates evidence with epoch MILLISECONDS as an
+        int; the API's other surfaces (and hand-written fixtures) use an ISO-8601
+        string. Both are normalised here to one float, because the previous key
+        -- `created if isinstance(created, str) else ""` -- collapsed every real
+        item to the empty string, leaving `max` to keep the FIRST element of an
+        all-equal set. Evidence comes back oldest-first, so on live data the
+        OLDEST verdict won: a PR whose round 1 was request_changes and round 2
+        approve never converged through the envelope branch (TASK-194837655).
+
+        Normalising rather than widening the isinstance is deliberate: a task
+        carrying both shapes would produce `(str, ...)` and `(int, ...)` keys
+        that raise TypeError the moment sorting compared them.
+
+        Returns `(has_stamp, seconds)`. An absent or unparseable stamp is
+        `(0, 0.0)` and sorts FIRST, preserving the old rule that a dated
+        envelope always beats one that lost its timestamp.
+        """
+        if isinstance(value, bool):  # bool is an int; never a timestamp
+            return (0, 0.0)
+        if isinstance(value, (int, float)):
+            seconds = float(value)
+            # Milliseconds, by magnitude: 1e11 seconds is the year 5138, while
+            # 1e11 milliseconds is 1973 -- so anything above it is ms, and a
+            # task holding both units still orders correctly.
+            if abs(seconds) > 1e11:
+                seconds /= 1000.0
+            return (1, seconds)
+        if isinstance(value, str) and value:
+            try:
+                return (1, datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+            except ValueError:
+                return (0, 0.0)
+        return (0, 0.0)
+
+    @staticmethod
     def _newest_verdict(payload: object) -> str | None:
         """Pick the newest parseable verdict out of a task's evidence array.
 
@@ -329,8 +380,8 @@ class Alissa:
         if not isinstance(evidence, list):
             return None
 
-        found: list[tuple[str, str]] = []
-        for item in evidence:
+        found: list[tuple[tuple[int, float], int, str]] = []
+        for index, item in enumerate(evidence):
             if not isinstance(item, dict):
                 continue
             title = item.get("title")
@@ -340,18 +391,21 @@ class Alissa:
                     continue
                 match = _VERDICT_RE.search(blob)
                 if match:
-                    created = item.get("createdAt")
                     found.append(
-                        (created if isinstance(created, str) else "", match.group(1).lower())
+                        (Alissa._created_key(item.get("createdAt")),
+                         index,
+                         match.group(1).lower())
                     )
                     break
 
         if not found:
             return None
-        # ISO-8601 timestamps sort lexicographically. Undated evidence sorts
-        # first (empty string), so a dated envelope always wins over one that
-        # lost its timestamp.
-        return max(found, key=lambda pair: pair[0])[1]
+        # Newest stamp wins; undated evidence sorts first, so a dated envelope
+        # always beats one that lost its timestamp (see _created_key). The
+        # append INDEX breaks ties: evidence comes back oldest-first, so two
+        # envelopes sharing a stamp resolve to the later-recorded one rather
+        # than to whichever `max` happened to reach first.
+        return max(found, key=lambda item: (item[0], item[1]))[2]
 
     def count_verdicts(self, task_ref: str) -> int:
         """How many CR6 verdict envelopes are on the review task.
