@@ -27,6 +27,7 @@ from .alissa import (
     ManagedSession,
     SessionRef,
     Task,
+    TaskDetail,
     is_review_task_for,
     session_repo_slug,
 )
@@ -873,6 +874,40 @@ class Decision:
 
 
 @dataclass(frozen=True)
+class ResolvedTask:
+    """One PR's review task as the decide path resolved it THIS pass.
+
+    Carries what the resolution happened to learn, and -- the part that matters
+    -- whether it learned it. The two resolution paths read different things:
+
+    * the CACHED path fetches the task by ref to check the mapping still holds,
+      so the whole evidence array comes with it and both the round count and the
+      newest verdict are free;
+    * the SEARCH path matches TITLES out of the task corpus and never opens the
+      evidence, so it pays a separate `count_verdicts` and knows no verdict.
+
+    Hence `verdict_read`, rather than letting `verdict=None` stand for both "no
+    envelope parses" and "nobody looked". Convergence treats a None verdict as
+    "not approved"; conflating the two would silently refuse to close a round
+    that had in fact approved, every time the mapping was resolved by search.
+    """
+
+    task: "Task | None"
+    verdicts: int = 0
+    verdict: "str | None" = None
+    verdict_read: bool = False
+
+    def newest_verdict(self, alissa: Alissa) -> "str | None":
+        """The newest CR6 verdict envelope, fetching it only if this resolution
+        did not already have it in hand."""
+        if self.task is None:
+            return None
+        if self.verdict_read:
+            return self.verdict
+        return alissa.latest_verdict(self.task.ref)
+
+
+@dataclass(frozen=True)
 class ChecksGate:
     """What the head's CI rollup does to a round's APPROVE verdict.
 
@@ -977,6 +1012,15 @@ class ReviewWatcher:
 
     # -- the PR -> review-task mapping ---------------------------------------
 
+    def _resolved(self, detail: TaskDetail) -> "ResolvedTask":
+        """A cached hit: one payload answered all three questions."""
+        return ResolvedTask(
+            task=detail.task,
+            verdicts=detail.verdicts,
+            verdict=detail.verdict,
+            verdict_read=True,
+        )
+
     def _pass_task_list(self) -> list[Task]:
         """The actor's task corpus, fetched AT MOST ONCE per poll pass.
 
@@ -994,8 +1038,8 @@ class ReviewWatcher:
             self._pass_tasks = self.alissa.list_tasks()
         return self._pass_tasks
 
-    def _review_task(self, pr: PullRequest) -> tuple["Task | None", int]:
-        """This PR's open CR2 review task and its verdict count, cheaply.
+    def _review_task(self, pr: PullRequest) -> "ResolvedTask":
+        """This PR's open CR2 review task and what its evidence says, cheaply.
 
         The decide path needs the review task on every pass of every open
         round, and the only way to FIND one is to search the actor's whole
@@ -1019,13 +1063,31 @@ class ReviewWatcher:
         Fail-open is the whole contract: every degradation here lands on "do
         what the daemon did before the cache existed", and none of them can
         answer "no review task" unless a successful search actually said so.
+
+        TWO consequences of resolving from cache, both accepted rather than
+        overlooked (PR #68 round 1):
+
+        * A cached hit does NOT re-check CR2 uniqueness. The duplicate-task
+          alarm lives in `find_review_task`, which only runs on a miss, so a
+          second open review task created for this PR AFTER the mapping was
+          cached goes unreported and the daemon keeps counting envelopes on the
+          one it pinned. Detecting it needs the corpus, and not fetching the
+          corpus is the point -- relocating the check is TASK-317167904.
+        * VALIDATING the review task drops the mapping, because
+          `is_review_task_for` requires an open task and the search cannot find
+          a terminal one either, so `evaluate` falls back to the GitHub review
+          count -- the fallback `_completed_rounds` deliberately avoids. That is
+          pre-existing and unchanged, but this path now HAS a durable ref that
+          could survive validation; it is not used because a terminal task can
+          never become open again, so a retained ref would have no disproof and
+          its row would be immortal. Settling that is TASK-1897198077.
         """
         cached = self.state.review_task(pr.full_name, pr.number)
         if cached is not None:
             detail = self.alissa.get_task(cached)
             if detail is not None:
                 if is_review_task_for(pr.owner, pr.repo, pr.number, detail.task):
-                    return detail.task, detail.verdicts
+                    return self._resolved(detail)
                 log.info(
                     "%s: cached review task %s no longer matches (title=%r "
                     "status=%s) — re-resolving",
@@ -1048,10 +1110,13 @@ class ReviewWatcher:
             # no open review task for this PR, whatever the cache said.
             if cached is not None:
                 self.state.forget_review_task(pr.full_name, pr.number)
-            return None, 0
+            return ResolvedTask(task=None)
 
         self.state.record_review_task(pr.full_name, pr.number, task.ref)
-        return task, self.alissa.count_verdicts(task.ref)
+        # The search read TITLES, not evidence, so the newest verdict is
+        # genuinely unknown here -- left unread rather than defaulted to None,
+        # which convergence would read as "no approve" and lose a closed round.
+        return ResolvedTask(task=task, verdicts=self.alissa.count_verdicts(task.ref))
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -1082,9 +1147,10 @@ class ReviewWatcher:
         # Fall back to the substantive-review count only before the review task
         # exists (round 1). Looked up here (not in _spawn) because both the count
         # and convergence need it.
-        task, verdicts = self._review_task(pr)
+        resolved = self._review_task(pr)
+        task = resolved.task
         native = countable_rounds(my_reviews)
-        completed = verdicts if task is not None else native
+        completed = resolved.verdicts if task is not None else native
 
         # A round is not over until its verdict exists as a native review by
         # the reviewer identity (issue #51). An envelope ahead of the native
@@ -1114,7 +1180,7 @@ class ReviewWatcher:
             # anything else the round is still open and nothing may follow it.
             return self._close_round_natively(pr, task, round_=completed)
 
-        converged = self._convergence_reason(my_reviews, task, pr.head_sha)
+        converged = self._convergence_reason(my_reviews, resolved, pr.head_sha)
         if converged is not None:
             # THE terminal branch: a verdict of record exists at the current
             # head, so no round k+1 can be owed from here -- every path that
@@ -1972,7 +2038,7 @@ class ReviewWatcher:
         )
 
     def _convergence_reason(
-        self, my_reviews: list[Review], task: Task | None, head_sha: str
+        self, my_reviews: list[Review], resolved: "ResolvedTask", head_sha: str
     ) -> str | None:
         """Why the loop is done, or None if it is not.
 
@@ -2033,9 +2099,14 @@ class ReviewWatcher:
             return None
 
         # Only checkable once a review task exists; before that there is
-        # nowhere for a verdict to have been recorded.
-        if task is not None and self.alissa.latest_verdict(task.ref) == VERDICT_APPROVE:
-            return f"newest verdict envelope on {task.ref} reads approve"
+        # nowhere for a verdict to have been recorded. On the cached path the
+        # envelope was already read back with the task, so this costs nothing;
+        # on the search path it is the one fetch that still has to happen.
+        if (
+            resolved.task is not None
+            and resolved.newest_verdict(self.alissa) == VERDICT_APPROVE
+        ):
+            return f"newest verdict envelope on {resolved.task.ref} reads approve"
 
         return None
 
@@ -3041,9 +3112,18 @@ class ReviewWatcher:
         # DRY-RUN IS EXEMPT, and vacuously so: it already suppresses every side
         # effect AND every correctness write (`_spawn` skips record_spawn, the
         # reaper logs instead of killing, the drift/cap-out/deferral paths
-        # return before both their comment and their record). Its only ledger
-        # write is the snapshot, which this module classifies as best-effort
-        # telemetry and which _write_snapshot writes in dry-run deliberately.
+        # return before both their comment and their record). The ledger writes
+        # it may still take are the snapshot and the review-task cache
+        # (`_review_task` runs in dry-run and both records and forgets
+        # mappings) -- both classified by this module as best-effort telemetry,
+        # both absorbed by _write_telemetry, and neither a decision the daemon
+        # has to remember. Writing the cache in dry-run is deliberate: a
+        # dry-run pass that learns a mapping hands it to the next production
+        # pass, and suppressing it would make the two disagree about ledger
+        # contents for no correctness reason. The cost on a read-only volume is
+        # a reconnect attempt on the first failure of the streak plus
+        # streak-limited warnings, which is the same best-effort behaviour the
+        # snapshot has always had there.
         # So the gate would protect nothing there and cost the operator the one
         # tool that answers "what would you do right now" -- asked, precisely,
         # during the substrate incident this whole change is about.

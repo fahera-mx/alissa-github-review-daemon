@@ -157,6 +157,12 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
 -- losing the whole table only costs one title search per PR (see
 -- loop._review_task). That is why this is best-effort like the snapshots
 -- above, not a correctness write.
+--
+-- Rows are never pruned, unlike poll_snapshots and like grants: one row per PR
+-- ever sighted (a few hundred, for this daemon's repo set, forever), and a
+-- stale row costs exactly one disproved read the first time that PR is seen
+-- again. `resolved_at` is retained for inspection -- when was this mapping last
+-- confirmed by a search -- and nothing in the daemon reads it.
 CREATE TABLE IF NOT EXISTS review_tasks (
     repo        TEXT    NOT NULL,
     number      INTEGER NOT NULL,
@@ -905,8 +911,10 @@ class State:
         """Remember which review task a PR resolved to. Best-effort.
 
         REPLACE, not IGNORE: re-resolving is how a mapping is corrected, so the
-        newest answer has to win. `resolved_at` is when the mapping was last
-        confirmed by a search, which is the audit question worth answering.
+        newest answer has to win. `resolved_at` records when the mapping was
+        last confirmed by a search; it is kept for inspection (the age of a
+        mapping is the first thing worth knowing if one is ever suspected) and
+        no query, log line or console view reads it.
 
         A database error here is absorbed exactly like a snapshot's: the cache
         is an optimization, and a pass that cannot persist it still decides the

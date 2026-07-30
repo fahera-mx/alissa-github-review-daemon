@@ -262,29 +262,54 @@ class FakeAlissa:
         self.list_calls = 0
         # Refs read back one at a time via `alissa task get`, in order.
         self.get_calls: list[str] = []
+        # Refs `latest_verdict` was asked for. Recorded because a resolution
+        # that already holds the verdict must not ask again, and a fake that
+        # answered silently would hide exactly that regression.
+        self.verdict_calls: list[str] = []
         # When True, `get_task` cannot read the task at all (the CLI failed, or
         # it is gone) -- the case a cached mapping must survive, not be
         # invalidated by.
         self.task_unreadable = False
+        # Tasks this actor owns besides the PR's review task; see `corpus`.
+        self.others: list = []
 
     def list_tasks(self):
         self.list_calls += 1
-        return [self.task] if self.task is not None else []
+        return self.corpus
 
     def find_review_task(self, owner, repo, number, *, tasks=None):
-        # Mirrors the real client's contract: a caller that supplies the pass's
-        # corpus does not pay for another fetch; one that does not, does.
-        if tasks is None:
-            self.list_tasks()
-        return self.task
+        # Mirrors the real client's contract on BOTH counts: a caller that
+        # supplies the pass's corpus does not pay for another fetch, and the
+        # corpus is filtered through the same predicate production uses. A fake
+        # that returned its task unconditionally would let these tests pass
+        # with the search's predicate deleted (PR #68 round 1).
+        pool = self.list_tasks() if tasks is None else tasks
+        matches = [t for t in pool if is_review_task_for(owner, repo, number, t)]
+        return matches[0] if matches else None
 
     def get_task(self, ref):
         self.get_calls.append(ref)
-        if self.task_unreadable or self.task is None or ref != self.task.ref:
+        if self.task_unreadable:
             return None
-        return TaskDetail(task=self.task, verdicts=self.verdict_count)
+        found = next((t for t in self.corpus if t.ref == ref), None)
+        if found is None:
+            return None
+        return TaskDetail(
+            task=found, verdicts=self.verdict_count, verdict=self.verdict
+        )
+
+    @property
+    def corpus(self):
+        """Every task this actor owns, as `alissa task list` would report it.
+
+        `task` is the PR's review task; `others` holds anything else a test
+        needs to exist -- a task the search must NOT match, or one that is
+        readable by ref while absent from the (non-terminal) list.
+        """
+        return ([self.task] if self.task is not None else []) + list(self.others)
 
     def latest_verdict(self, task_ref):
+        self.verdict_calls.append(task_ref)
         return self.verdict
 
     def count_verdicts(self, task_ref):
@@ -5430,24 +5455,55 @@ def test_a_pass_never_inherits_the_previous_pass_corpus(config):
     assert al.list_calls == 2, "one fetch per pass, and the memo is reset"
 
 
-def test_a_cached_task_that_no_longer_matches_is_dropped_and_re_resolved(config):
+class Validated(FakeTask):
+    """The PR's review task after a human validated it: still readable by ref,
+    no longer open, and absent from a non-terminal task list."""
+
+    status = "validated"
+    is_open = False
+
+
+def test_a_cached_task_that_no_longer_matches_is_dropped(config):
     """Invalidation on a positive disproof: the ref still reads, but what it
-    reads is not this PR's open review task any more."""
+    reads is not this PR's open review task any more.
+
+    The search cannot rescue this one -- a validated task is not in the corpus
+    either -- so the honest outcome is "no open review task", which is what
+    `evaluate` then answers from the GitHub review count."""
     state = State(config.state_db)
     w, _, al = watcher(config, make_pr(), [], state=state)
     w.evaluate(OWNER, REPO, NUMBER)
     assert al.list_calls == 1
 
-    class Validated(FakeTask):
-        status = "validated"
-        is_open = False
-
     al.task = Validated()
     w._pass_tasks = None
-    task, _ = w._review_task(make_pr())
+    resolved = w._review_task(make_pr())
 
     assert al.list_calls == 2, "a disproved mapping falls back to the search"
-    assert task is al.task, "and the search's answer is what the pass uses"
+    assert resolved.task is None, "and the search does not find a terminal task"
+    assert state.review_task(SLUG, NUMBER) is None, "the mapping is dropped"
+
+
+def test_a_disproved_mapping_is_replaced_by_what_the_search_finds(config):
+    """The re-resolution half: CR2 was violated and re-satisfied (the first
+    review task validated, a second opened), so the search's answer must
+    REPLACE the cached one rather than merely clearing it."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert state.review_task(SLUG, NUMBER) == FakeTask.ref
+
+    class Reopened(FakeTask):
+        ref = "TASK-501"
+
+    al.task = Reopened()          # the open one the search will match
+    al.others = [Validated()]     # TASK-500, still readable by ref
+    w._pass_tasks = None
+    resolved = w._review_task(make_pr())
+
+    assert al.get_calls == [FakeTask.ref], "the stale ref is read, and disproved"
+    assert resolved.task is al.task, "the search's answer is what the pass uses"
+    assert state.review_task(SLUG, NUMBER) == "TASK-501", "and it is persisted"
 
 
 def test_a_cached_task_that_belongs_to_another_pr_is_dropped(config):
@@ -5462,10 +5518,15 @@ def test_a_cached_task_that_belongs_to_another_pr_is_dropped(config):
         title = f"Review PR {OWNER}/{REPO}#999 (TASK-499)"
 
     al.task = OtherPR()
-    w._review_task(make_pr())
+    resolved = w._review_task(make_pr())
 
     assert al.get_calls == ["TASK-999"]
     assert al.list_calls == 1, "the mapping is disproved, so the pass searches"
+    assert resolved.task is None, (
+        "and the search applies the same predicate: a task titled for another "
+        "PR is not this PR's review task however it was reached"
+    )
+    assert state.review_task(SLUG, NUMBER) is None
 
 
 def test_an_unreadable_task_keeps_the_mapping_and_falls_back(config, caplog):
@@ -5478,9 +5539,9 @@ def test_an_unreadable_task_keeps_the_mapping_and_falls_back(config, caplog):
     al.task_unreadable = True
     w._pass_tasks = None
     with caplog.at_level(logging.WARNING):
-        task, _ = w._review_task(make_pr())
+        resolved = w._review_task(make_pr())
 
-    assert task is al.task, "the review is still resolved, never skipped"
+    assert resolved.task is al.task, "the review is still resolved, never skipped"
     assert al.list_calls == 2, "by falling back to the search"
     assert state.review_task(SLUG, NUMBER) == FakeTask.ref, (
         "a transient read failure must not throw away a good mapping"
@@ -5498,9 +5559,9 @@ def test_a_search_that_finds_nothing_drops_the_mapping(config):
 
     al.task = None  # validated and gone: neither readable nor findable
     w._pass_tasks = None
-    task, _ = w._review_task(make_pr())
+    resolved = w._review_task(make_pr())
 
-    assert task is None
+    assert resolved.task is None
     assert state.review_task(SLUG, NUMBER) is None
 
 
@@ -5530,10 +5591,13 @@ def test_the_cached_round_count_comes_from_the_same_read(config):
 
     w._pass_tasks = None
     al.verdict_count = 2  # a round landed between the passes
-    task, verdicts = w._review_task(make_pr())
+    al.verdict = VERDICT_APPROVE
+    resolved = w._review_task(make_pr())
 
-    assert task is al.task
-    assert verdicts == 2, "the count is read back with the task, not separately"
+    assert resolved.task is al.task
+    assert resolved.verdicts == 2, "the count is read back with the task"
+    assert resolved.verdict == VERDICT_APPROVE, "and so is the newest verdict"
+    assert resolved.verdict_read is True
     assert al.get_calls == [FakeTask.ref], "one read on the cached path"
 
 
@@ -5643,3 +5707,130 @@ def test_the_cache_check_and_the_search_share_one_predicate():
     assert not is_review_task_for(
         OWNER, REPO, NUMBER, dataclasses.replace(open_match, title="Review PR x/y#7")
     ), "per repo"
+
+
+# -- one payload, not three (PR #68 round 1) -------------------------------
+
+
+def test_the_cached_path_reads_the_task_exactly_once_per_pass(config):
+    """`_count_verdicts` and `_newest_verdict` are mirrors over one evidence
+    array, so the round count AND the newest verdict come out of the read that
+    validated the mapping. Before this, convergence re-fetched the same task
+    and re-parsed the same array with the same regex, every pass."""
+    state = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [review()], state=state, verdict_count=1)
+    w.evaluate(OWNER, REPO, NUMBER)  # first sighting: search + count_verdicts
+
+    al.verdict = VERDICT_APPROVE
+    # Round 1 resolved by search, so it legitimately fetched a verdict; the
+    # claim under test is about the CACHED pass that follows.
+    al.get_calls.clear()
+    al.verdict_calls.clear()
+    w._pass_tasks = None
+    decision = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert decision.action is Action.CONVERGED, "the approve envelope closed it"
+    assert al.get_calls == [FakeTask.ref], (
+        "ONE task read for the whole pass — validation, round count and verdict"
+    )
+    assert al.verdict_calls == [], (
+        "and convergence re-read nothing: the verdict came off that same payload"
+    )
+
+
+def test_the_search_path_still_fetches_the_verdict_it_never_read(config):
+    """The miss path matches TITLES and never opens the evidence, so its
+    verdict is UNREAD, not None. Treating unread as 'no approve' would refuse
+    to close a round that had approved."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [review()], state=state, verdict_count=1)
+    al.verdict = VERDICT_APPROVE
+
+    decision = w.evaluate(OWNER, REPO, NUMBER)  # first sighting: resolved by search
+
+    assert al.list_calls == 1, "this pass genuinely took the search path"
+    assert al.verdict_calls == [FakeTask.ref], "so it had to fetch the verdict"
+    assert decision.action is Action.CONVERGED, (
+        "and still saw the approve, rather than reading unread as 'no approve'"
+    )
+
+
+def test_an_unread_verdict_is_not_a_missing_one():
+    """The distinction ResolvedTask exists to keep. Same task, same None
+    verdict: one has been read, the other has not, and only the second may
+    fetch."""
+    from alissa.tools.github.revloop.loop import ResolvedTask
+
+    calls = []
+
+    class Probe:
+        def latest_verdict(self, ref):
+            calls.append(ref)
+            return VERDICT_APPROVE
+
+    task = Task(ref="TASK-500", title="Review PR acme/widgets#7", status="committed")
+
+    read = ResolvedTask(task=task, verdict=None, verdict_read=True)
+    assert read.newest_verdict(Probe()) is None
+    assert calls == [], "a read that found nothing must not be re-read"
+
+    unread = ResolvedTask(task=task)
+    assert unread.newest_verdict(Probe()) == VERDICT_APPROVE
+    assert calls == ["TASK-500"], "an unread verdict is fetched"
+
+
+def test_no_review_task_never_fetches_a_verdict():
+    from alissa.tools.github.revloop.loop import ResolvedTask
+
+    class Explodes:
+        def latest_verdict(self, ref):
+            raise AssertionError("there is no task to read a verdict from")
+
+    assert ResolvedTask(task=None).newest_verdict(Explodes()) is None
+
+
+def test_get_task_carries_the_newest_verdict_out_of_the_same_payload(monkeypatch):
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    calls = []
+
+    def fake_run_json(argv, **kwargs):
+        calls.append(argv)
+        return {
+            "taskNumber": 500,
+            "title": f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-499)",
+            "status": "in_progress",
+            "evidence": [
+                envelope("approve", 1, "2026-07-18T10:00:00Z"),
+                envelope("request_changes", 2, "2026-07-18T12:00:00Z"),
+            ],
+        }
+
+    monkeypatch.setattr(alissa_mod, "run_json", fake_run_json)
+    detail = alissa_mod.Alissa().get_task("TASK-500")
+
+    assert len(calls) == 1
+    assert detail is not None
+    assert detail.verdicts == 2
+    assert detail.verdict == VERDICT_REQUEST_CHANGES, "the NEWEST, not the first"
+
+
+def test_get_task_reports_no_verdict_when_no_envelope_parses(monkeypatch):
+    """Round 1: the task exists and has nothing on it yet."""
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    monkeypatch.setattr(
+        alissa_mod,
+        "run_json",
+        lambda *a, **k: {
+            "taskNumber": 500,
+            "title": f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-499)",
+            "status": "committed",
+            "evidence": [],
+        },
+    )
+    detail = alissa_mod.Alissa().get_task("TASK-500")
+
+    assert detail is not None
+    assert detail.verdicts == 0
+    assert detail.verdict is None

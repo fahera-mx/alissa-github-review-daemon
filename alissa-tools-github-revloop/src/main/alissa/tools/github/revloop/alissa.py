@@ -190,17 +190,25 @@ def _task_from_row(row: object) -> "Task | None":
 
 @dataclass(frozen=True)
 class TaskDetail:
-    """One task as `alissa task get` sees it: the task itself, plus the CR6
-    verdict envelopes already on it.
+    """One task as `alissa task get` sees it: the task itself, plus everything
+    the decide path reads off its CR6 verdict evidence.
 
-    The two travel together because they come out of ONE payload. The decide
-    path needs both (is this still the PR's open review task? how many rounds
-    has it recorded?), and reading them separately would cost two task fetches
-    per PR per poll where the CLI already returns everything in one.
+    All three travel together because they come out of ONE payload. The decide
+    path needs every one of them (is this still the PR's open review task? how
+    many rounds has it recorded? what did the newest round decide?), and
+    `_count_verdicts` and `_newest_verdict` are deliberately written as mirrors
+    over the same evidence array -- so reading them apart would mean fetching
+    and re-parsing the same task two and three times per PR per poll, which is
+    the exact cost this whole path exists to stop paying.
+
+    `verdict` is None when no envelope on the task parses -- the normal round-1
+    case, indistinguishable here from "no verdict of record yet", which is what
+    the caller wants it to mean anyway.
     """
 
     task: Task
     verdicts: int
+    verdict: "str | None"
 
 
 class Alissa:
@@ -251,7 +259,11 @@ class Alissa:
             task = _task_from_row(data)
             if task is None:
                 return None
-            return TaskDetail(task=task, verdicts=self._count_verdicts(data))
+            return TaskDetail(
+                task=task,
+                verdicts=self._count_verdicts(data),
+                verdict=self._newest_verdict(data),
+            )
         except Exception:  # pragma: no cover - defence in depth
             log.exception("could not parse task payload for %s", ref)
             return None
