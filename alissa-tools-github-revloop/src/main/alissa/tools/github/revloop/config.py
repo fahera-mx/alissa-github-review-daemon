@@ -129,6 +129,7 @@ CONFIG_KEYS = (
     "on_missing_hub",
     "reap_grace_seconds",
     "reap_session_cap",
+    "max_concurrent_sessions",
     "checks_wait_seconds",
     "dry_run",
 )
@@ -169,6 +170,25 @@ DEFAULT_REAP_GRACE_SECONDS = 30 * 60
 # loop runs a couple of concurrent rounds, so the default is a threshold no
 # healthy deployment reaches, not a capacity limit.
 DEFAULT_REAP_SESSION_CAP = 6
+
+# The spawn gate: how many reviewer sessions of THIS daemon's own grammar may be
+# live before an owed round waits for a slot instead of spawning (issue #70).
+#
+# Distinct from `reap_session_cap` above in kind, not just in number: that one is
+# an ALARM on a condition the loop cannot fix (sessions the sweep could not
+# reap), this one is a LIMIT the loop enforces on itself before it acts. Nothing
+# bounded concurrency before it -- `round_cap` bounds rounds per PR, and the
+# alarm only logs -- so a merge wave spawned one interactive claude session per
+# PR, all at once, against a fixed container budget. On 2026-07-29 the 18:45-19:00Z
+# burst pegged the deployment's 2 vCPU ceiling with 4+ concurrent reviewers plus
+# the poll loop; throttled sessions review slower, hold their round slots longer,
+# and widen the very burst that is starving them.
+#
+# 4 is the deployed shape's honest ceiling: two vCPUs, and a reviewer session is
+# a full interactive agent. It is deliberately BELOW the reap alarm (6) so the
+# steady state never pages -- and `Config.build` refuses a config where the alarm
+# sits under the limit, which would page on healthy load.
+DEFAULT_MAX_CONCURRENT_SESSIONS = 4
 
 # How long a round holds its APPROVE while the head's CI rollup is still
 # running (or unreadable) before it gives up and records the verdict as a
@@ -232,6 +252,11 @@ class Config:
     # buys and why it is tunable rather than pinned.
     reap_grace_seconds: int = DEFAULT_REAP_GRACE_SECONDS
     reap_session_cap: int = DEFAULT_REAP_SESSION_CAP
+
+    # The spawn gate's limit -- see DEFAULT_MAX_CONCURRENT_SESSIONS. At or above
+    # it an owed round defers to a later poll instead of spawning; it burns no
+    # round number and no attempt while it waits.
+    max_concurrent_sessions: int = DEFAULT_MAX_CONCURRENT_SESSIONS
 
     # The bound on holding a round's approve for a rollup that has not settled;
     # see DEFAULT_CHECKS_WAIT_SECONDS. 0 is legal and means "never hold": a
@@ -357,6 +382,28 @@ class Config:
             # state of a working loop -- an alarm that always fires is noise.
             raise ValueError(f"reap_session_cap must be >= 1, got {session_cap}")
 
+        max_sessions = int(
+            raw.get("max_concurrent_sessions", cls.max_concurrent_sessions)
+        )
+        if max_sessions < 1:
+            # 0 would defer every round forever: no session may spawn, so no
+            # slot ever frees. "Review nothing" is not a tuning value.
+            raise ValueError(
+                f"max_concurrent_sessions must be >= 1, got {max_sessions}"
+            )
+        if session_cap < max_sessions:
+            # The alarm would then fire on load the gate considers healthy --
+            # every poll of a fully-loaded, correctly-behaving daemon pages the
+            # operator, and a page that fires in the steady state trains people
+            # to ignore the one that matters. Refused at load rather than
+            # discovered at 3am.
+            raise ValueError(
+                f"reap_session_cap ({session_cap}) must be >= "
+                f"max_concurrent_sessions ({max_sessions}): the cap is the "
+                f"page-worthy alarm and the gate is the spawn limit, so an "
+                f"alarm below the limit pages on healthy load"
+            )
+
         checks_wait = int(raw.get("checks_wait_seconds", cls.checks_wait_seconds))
         if checks_wait < 0:
             raise ValueError(f"checks_wait_seconds must be >= 0, got {checks_wait}")
@@ -404,6 +451,7 @@ class Config:
             on_missing_hub=hub_mode,
             reap_grace_seconds=grace,
             reap_session_cap=session_cap,
+            max_concurrent_sessions=max_sessions,
             checks_wait_seconds=checks_wait,
             dry_run=bool(raw.get("dry_run", False)),
         )

@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -17,6 +18,7 @@ import pytest
 from alissa.tools.github.revloop.config import (
     CONFIG_FILENAME,
     DEFAULT_CHECKS_WAIT_SECONDS,
+    DEFAULT_MAX_CONCURRENT_SESSIONS,
     DEFAULT_REAP_GRACE_SECONDS,
     DEFAULT_REAP_SESSION_CAP,
     HUB_ADD,
@@ -62,6 +64,7 @@ from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     MAX_REENTRY_ROUNDS,
     MAX_VERDICT_POST_ATTEMPTS,
+    POLL_ESCALATE_SECONDS,
     REENTRY_GRAMMAR,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
@@ -1009,12 +1012,16 @@ def test_reap_knobs_default_and_layer_like_every_other_key(tmp_path):
     assert Config.build(tmp_path).reap_grace_seconds == DEFAULT_REAP_GRACE_SECONDS
     assert Config.build(tmp_path).reap_session_cap == DEFAULT_REAP_SESSION_CAP
 
+    # The cap sits at 5 rather than 3 because it is now coupled to the spawn
+    # gate: an alarm below `max_concurrent_sessions` (default 4) is refused
+    # outright, since it would page on load the gate considers healthy. Lowering
+    # it past the gate is a two-key change -- see the alarm-coherence tests.
     cfg = Config.build(
         tmp_path,
-        {"reap_grace_seconds": 900, "reap_session_cap": 3},
+        {"reap_grace_seconds": 900, "reap_session_cap": 5},
         {"reap_grace_seconds": 120},  # CLI wins, the unset override does not
     )
-    assert (cfg.reap_grace_seconds, cfg.reap_session_cap) == (120, 3)
+    assert (cfg.reap_grace_seconds, cfg.reap_session_cap) == (120, 5)
 
 
 # -- config layering -------------------------------------------------------
@@ -6010,3 +6017,581 @@ def test_convergence_sees_the_newest_verdict_on_real_evidence(config, monkeypatc
     assert detail.verdict == VERDICT_APPROVE, (
         "the value convergence now reads must be the NEWEST round's"
     )
+
+
+# =========================================================================
+# The spawn gate: back-pressure on concurrent reviewer sessions (issue #70)
+# =========================================================================
+#
+# What is under test is an EDGE, not a timer: at max_concurrent_sessions live
+# own-grammar sessions an owed round waits instead of spawning, and waiting
+# costs it nothing -- no round number, no attempt, no stale-round respawn, no
+# operator page. The fairness half is that the waiting is ORDERED: the search
+# these candidates come from is a relevance ranking, so without an explicit
+# oldest-first walk a PR can lose the coin toss forever.
+
+
+def _gated(config, limit=1, sessions=()):
+    """A watcher whose gate allows `limit` concurrent sessions, with `sessions`
+    already live. Round 1 is owed on the PR (no reviews yet)."""
+    cfg = dataclasses.replace(config, max_concurrent_sessions=limit)
+    w, gh, al = watcher(cfg, make_pr(), [])
+    for name in sessions:
+        _live(al, name)
+    return w, gh, al
+
+
+def test_gate_defers_the_spawn_at_the_limit(config):
+    w, _, al = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED
+    assert d.round == 1, "the round it is waiting to run, not a consumed one"
+    assert "1/1 reviewer sessions live" in d.reason
+    assert al.enqueued == [], "nothing may be spawned at the limit"
+
+
+def test_a_deferred_round_burns_no_round_number_and_no_ledger_row(config):
+    """Deferral is not an attempt. With no spawn row there is no `spawn_age`,
+    so the stale-round probe cannot see the round at all -- which is what keeps
+    a round that waited two hours from being 'in flight' for two hours."""
+    w, _, al = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    for _ in range(5):
+        assert w.evaluate(OWNER, REPO, NUMBER).round == 1
+
+    assert w.state.spawn_age(SLUG, NUMBER, 1) is None
+    assert w.state.get_spawn(SLUG, NUMBER, 1) is None
+    assert al.enqueued == []
+
+
+def test_a_deferred_round_spawns_when_a_slot_frees(config):
+    w, _, al = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.QUEUED
+
+    al.sessions = []  # the other round finished and was reaped
+    w._session_census, w._census_probed = None, False  # a fresh pass re-counts
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 1, "the same round it was waiting to run"
+    assert len(al.enqueued) == 1
+
+
+def test_deferral_escalates_nothing_and_comments_nothing(config):
+    """'Deferral is not failure': no operator ping, no PR activity line. The
+    only trace is the per-pass summary log."""
+    w, gh, al = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    for _ in range(10):
+        w.poll_once()
+
+    assert operator_comments(gh) == []
+    assert activity_comments(gh) == []
+    assert al.enqueued == []
+
+
+def test_a_gated_pass_logs_one_summary_line_not_one_per_round(config, caplog):
+    w, gh, al = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    with caplog.at_level(logging.INFO):
+        w.poll_once()
+
+    lines = [r.getMessage() for r in caplog.records if "spawn gate:" in r.getMessage()]
+    assert len(lines) == 1
+    assert "1 round(s) deferred — 1/1 reviewer sessions live" in lines[0]
+    assert f"{SLUG}#{NUMBER}" in lines[0], "and it names who is waiting"
+
+
+def test_the_summary_is_streak_limited_then_says_when_it_clears(config, caplog):
+    """The deployed daemon polls every 30s; a queue that lasts an hour must not
+    cost 120 identical lines. First few in full, then one in ten -- and the
+    recovery line is the only evidence in the log that the queue drained."""
+    w, _, al = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(10):
+            w.poll_once()
+        deferrals = [
+            r for r in caplog.records if "round(s) deferred" in r.getMessage()
+        ]
+        assert len(deferrals) == 4, "3 head + the 10th"
+
+        al.sessions = []
+        w.poll_once()
+
+    cleared = [r for r in caplog.records if "spawn gate: clear" in r.getMessage()]
+    assert len(cleared) == 1
+
+
+def _ticking(monkeypatch, step=60.0):
+    """Drive `loop.py`'s monotonic clock forward `step` seconds per call, so a
+    30-minute escalation window passes in the number of polls the deployed
+    daemon would really take -- without sleeping through it."""
+    now = {"t": 1000.0}
+
+    def monotonic():
+        now["t"] += step
+        return now["t"]
+
+    monkeypatch.setattr(loop_module.time, "monotonic", monotonic)
+    return now
+
+
+def test_a_draining_gate_never_escalates_however_long_it_holds(
+    config, caplog, monkeypatch
+):
+    """A full container that keeps handing out freed slots is the gate WORKING,
+    however long the backlog lasts. Paging on it would make normal load look
+    like a leak -- and a wave permanently larger than the limit would page
+    forever on a daemon that is reviewing everything, just serially."""
+    _ticking(monkeypatch)
+    w, _, al = _wave(config, list(range(11, 51)), limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(35):  # 35 min of polls at the deployed cadence
+            al.sessions = []  # exactly one slot frees each pass...
+            results = w.poll_once()
+            assert _spawned_numbers(results), "...so every pass spawns one"
+
+    gate = [r for r in caplog.records if "spawn gate" in r.getMessage()]
+    assert gate, "it did log"
+    assert {r.levelno for r in gate} == {logging.INFO}
+    assert "NOTHING has spawned" not in caplog.text
+
+
+def test_a_gate_that_spawns_nothing_escalates_to_warning(
+    config, caplog, monkeypatch
+):
+    """The condition the INFO line cannot carry: a gate shut for half an hour
+    with nothing started. Three session classes hold it there with the reap
+    alarm silent -- busy sessions are never reaped, a hand-spawned
+    review-pr-<n> on an OPEN PR is outside the reaper's scope, and undecidable
+    sessions are spared every poll -- and the gated rounds write no ledger row,
+    so the stale-round probe cannot see them either."""
+    _ticking(monkeypatch)
+    w, _, _ = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(35):
+            w.poll_once()
+
+    warned = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "spawn gate" in r.getMessage()
+    ]
+    assert warned, "a gate that has started nothing for 30 min is page-worthy"
+    held = re.search(r"NOTHING has spawned for (\d+) min", warned[0].getMessage())
+    assert held, "it says for how long"
+    assert int(held.group(1)) >= POLL_ESCALATE_SECONDS // 60, "and only past the window"
+    assert "never frees a busy session" in warned[0].getMessage(), "and what to look at"
+    # It escalated only AFTER the window: the first lines are still INFO.
+    first = [r for r in caplog.records if "spawn gate" in r.getMessage()][0]
+    assert first.levelno == logging.INFO
+
+
+def test_one_spawn_clears_the_stall_escalation(config, caplog, monkeypatch):
+    """A spawn is the proof the queue is moving. Whatever the backlog, the pass
+    that spawns is not a stall -- and it says so past the streak limit, or the
+    operator's last word on the gate is a WARNING already recovered from."""
+    _ticking(monkeypatch)
+    w, _, al = _wave(config, [11, 12], limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(35):
+            w.poll_once()
+        assert any(
+            r.levelno == logging.WARNING and "spawn gate" in r.getMessage()
+            for r in caplog.records
+        ), "the gate escalated first"
+
+        caplog.clear()
+        al.sessions = []  # a slot frees: the oldest waiter takes it
+        results = w.poll_once()
+
+    assert _spawned_numbers(results) == [11]
+    gate = [r for r in caplog.records if "spawn gate" in r.getMessage()]
+    assert gate and {r.levelno for r in gate} == {logging.INFO}
+    assert any("spawning again after" in r.getMessage() for r in gate)
+    assert any("1 round(s) still waiting" in r.getMessage() for r in gate)
+
+
+def test_the_dry_run_census_counts_the_slots_production_would_free(
+    config, caplog, monkeypatch
+):
+    """`--dry-run` is the tool an operator reaches for during exactly this
+    incident class, so its gate decision must be production's. A dry-run sweep
+    kills nothing, so the census has to discount what it WOULD have reaped or
+    the diagnostic reports rounds queued that production spawns."""
+    pr = make_pr()
+
+    def census_after(dry_run):
+        cfg = dataclasses.replace(
+            config, max_concurrent_sessions=1, dry_run=dry_run
+        )
+        w, _, al = watcher(cfg, pr, [review("APPROVED")])
+        _live(al, _record(w, pr, 1))  # its round converged: reapable
+        w.sweep_sessions()
+        return w._session_census
+
+    assert census_after(dry_run=False) == 0, "production frees the slot"
+    assert census_after(dry_run=True) == 0, "and the diagnostic says so too"
+
+
+# -- what counts: revloop's own grammar, and nothing else -------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "review-widgets-pr9-r1-a1b2c3",  # this daemon's own spawn
+        "review-pr-9",  # the skill's hand-spawned shape
+        "review-pr-9-r2",  # ...with a round
+    ],
+)
+def test_own_grammar_sessions_count_against_the_gate(config, name):
+    """Hand-spawned rounds burn the same CPU in the same container, and a gate
+    blind to them would let a hand-driven round and a daemon round each think
+    it held the last slot."""
+    w, _, al = _gated(config, limit=1, sessions=[name])
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.QUEUED
+    assert al.enqueued == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ali-dev-fahera-mx-widgets-i70-a1",  # the develop daemon's lane
+        "reviewer-pr-9",  # near miss, not the grammar
+        "review-pr-",  # no number
+        "some-operator-shell",
+    ],
+)
+def test_other_lanes_sessions_are_invisible_to_the_gate(config, name):
+    """The same ownership boundary the reaper draws: the container is shared,
+    and this daemon neither kills nor counts what is not its own."""
+    w, _, al = _gated(config, limit=1, sessions=[name])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert len(al.enqueued) == 1
+
+
+# -- fairness: oldest waiter first -----------------------------------------
+
+
+class _MultiPR:
+    """A GitHub fake serving several PRs, all of which owe round 1.
+
+    The search order is a knob because that is the point: `search/issues` sorts
+    by relevance and is not stable, so the walk must not inherit it.
+    """
+
+    login = "alissa-app"
+
+    def __init__(self, numbers):
+        self.numbers = list(numbers)
+        self.comments: list[str] = []
+        self.issue_store: list[IssueComment] = []
+        self.order = list(numbers)
+
+    def review_requests(self, repos=()):
+        return [(OWNER, REPO, n) for n in self.order]
+
+    def pull_request(self, owner, repo, number):
+        return dataclasses.replace(make_pr(), number=number)
+
+    def my_reviews(self, owner, repo, number):
+        return []
+
+    def reviews(self, owner, repo, number):
+        return []
+
+    def issue_comments(self, owner, repo, number):
+        return []
+
+    def comment(self, owner, repo, number, body):
+        self.comments.append(body)
+
+    def update_comment(self, owner, repo, comment_id, body):  # pragma: no cover
+        raise AssertionError("the gate must not touch PR comments")
+
+
+def _wave(config, numbers, limit=1):
+    """`numbers` PRs all owing round 1, behind a gate of `limit`."""
+    cfg = dataclasses.replace(config, max_concurrent_sessions=limit, repos=(SLUG,))
+    gh = _MultiPR(numbers)
+    al = FakeAlissa(None)  # no review task for any of them: spawn_anyway
+    w = ReviewWatcher(cfg, github=gh, alissa=al, state=State(cfg.state_db))
+    return w, gh, al
+
+
+def _spawned_numbers(results):
+    return [
+        int(slug.partition("#")[2])
+        for slug, d in results
+        if d.action is Action.SPAWNED
+    ]
+
+
+def test_the_oldest_waiter_takes_the_next_free_slot(config):
+    """Three queued rounds, one slot at a time: they must come out in the order
+    they first waited, even as the search reshuffles under them."""
+    w, gh, al = _wave(config, [11, 12, 13], limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")  # the one slot is taken
+
+    first = w.poll_once()
+    assert _spawned_numbers(first) == [], "all three wait"
+    assert [d.action for _, d in first] == [Action.QUEUED] * 3
+
+    order = []
+    for _ in range(3):
+        al.sessions = []  # exactly one slot frees each pass
+        gh.order.reverse()  # ...and the search order flips under it
+        order += _spawned_numbers(w.poll_once())
+
+    assert order == [11, 12, 13], "first-deferred, first-spawned"
+
+
+def test_no_round_starves_behind_a_reshuffling_search(config):
+    """The failure this ordering exists to prevent: with the search's own order
+    every pass, the same PR can lose the slot indefinitely."""
+    w, gh, al = _wave(config, [11, 12, 13], limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")
+    w.poll_once()
+
+    spawned = []
+    for _ in range(3):
+        al.sessions = []
+        gh.order = [13, 11, 12]  # the loser of round one keeps winning relevance
+        spawned += _spawned_numbers(w.poll_once())
+
+    assert sorted(spawned) == [11, 12, 13], "every queued round ran"
+    assert spawned[0] == 11, "and the oldest waiter went first"
+
+
+def test_one_pass_hands_out_one_slot_not_one_slot_per_pr(config):
+    """The census is read once per pass and a just-enqueued session takes a
+    moment to appear in `tmux ls`, so a pass that did not count its own spawns
+    would re-open the unbounded burst the gate exists to close."""
+    w, _, al = _wave(config, [11, 12, 13], limit=2)
+
+    results = w.poll_once()
+
+    assert len(_spawned_numbers(results)) == 2, "the gate's whole budget, once"
+    assert len(al.enqueued) == 2
+
+
+def test_a_new_arrival_does_not_jump_the_queue(config):
+    w, gh, al = _wave(config, [11, 12], limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")
+    w.poll_once()  # 11 and 12 are now waiting, in that order
+
+    gh.order = [13, 11, 12]  # a fresh PR arrives at the head of the search
+    al.sessions = []
+    assert _spawned_numbers(w.poll_once()) == [11]
+
+
+def test_a_departed_pr_does_not_hold_its_place_forever(config):
+    """A merged or converged PR leaves the search; its queue place must go with
+    it, or the oldest-first order is anchored to a round that never returns."""
+    w, gh, al = _wave(config, [11, 12], limit=1)
+    _live(al, "review-widgets-pr99-r1-aaaaaa")
+    w.poll_once()
+    assert len(w._waiting) == 2
+
+    gh.order = [12]  # 11 merged
+    w.poll_once()
+
+    assert list(w._waiting) == [(SLUG, 12)]
+
+
+# -- composition with the rest of the state machine ------------------------
+
+
+def test_a_reentry_granted_round_queues_through_the_gate(config):
+    """CR9: re-entry buys a round, not a slot. The granted round is delayed by
+    the gate like any other and never denied by it."""
+    cfg = dataclasses.replace(
+        _watched(config, SLUG), max_concurrent_sessions=1, operators=("RHDZMOTA",)
+    )
+    reviews = [review(at=f"2026-07-18T1{n}:00:00Z") for n in range(3)]
+    w, gh, al = watcher(cfg, make_pr(sha="def456"), reviews)
+    gh.seed_comment("RHDZMOTA", "alissa-review: re-enter +2")
+    _live(al, "review-widgets-pr9-r1-aaaaaa")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED, "delayed"
+    assert d.round == 4, "the round the grant bought — not consumed"
+    assert w.state.granted_rounds(SLUG, NUMBER) == 2, "the grant is still recorded"
+
+    al.sessions = []
+    w._session_census, w._census_probed = None, False
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED, "never denied"
+
+
+def test_a_capped_pr_still_escalates_under_a_full_gate(config):
+    """The gate sits BELOW every branch that decides whether a round is owed,
+    so a cap-out is still reported while the container is full."""
+    cfg = dataclasses.replace(config, max_concurrent_sessions=1, round_cap=3)
+    reviews = [review(at=f"2026-07-18T1{n}:00:00Z") for n in range(3)]
+    w, gh, al = watcher(cfg, make_pr(sha="def456"), reviews)
+    _live(al, "review-widgets-pr9-r1-aaaaaa")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.ESCALATED
+    assert operator_comments(gh), "the cap-out page still fires"
+
+
+def test_a_stale_round_respawn_is_gated_and_claims_nothing(config, caplog):
+    """A respawn is a spawn. Gated, it must also not log the 're-enqueuing'
+    line -- that line would claim a session the gate did not start."""
+    st = State(config.state_db)
+    cfg = dataclasses.replace(config, max_concurrent_sessions=1)
+    w, _, al = watcher(cfg, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)  # round 1 spawns into the free slot
+    _stale_spawn(st, al.enqueued[0]["session"])
+    al.sessions = []  # its session is gone: presumed dead, respawn owed
+    _live(al, "review-widgets-pr99-r1-aaaaaa")  # ...but the slot is taken
+    w._session_census, w._census_probed = None, False
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED
+    assert len(al.enqueued) == 1, "no second session"
+    assert "re-enqueuing" not in caplog.text
+
+
+def test_a_live_sessions_read_that_fails_lets_the_spawn_through(config):
+    """Fail OPEN, loudly: `alissa tmux ls` is also the reaper's only input, so
+    a CLI that cannot answer it means nothing is being reaped either --
+    refusing every spawn would turn one broken subprocess into a review outage
+    with the container sitting idle."""
+    cfg = dataclasses.replace(config, max_concurrent_sessions=1)
+    w, _, al = watcher(cfg, make_pr(), [])
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no such file")
+
+    al.list_review_sessions = boom
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert len(al.enqueued) == 1
+
+
+def test_a_sweep_that_cannot_list_sessions_leaves_the_gate_open(config, caplog):
+    """The same failure reached through a poll pass: the sweep bails, the gate
+    is told the count is unknown rather than paying for a second failing
+    subprocess per PR, and the pass still spawns."""
+    cfg = dataclasses.replace(config, max_concurrent_sessions=1)
+    w, _, al = watcher(cfg, make_pr(), [])
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no such file")
+
+    al.list_review_sessions = boom
+
+    with caplog.at_level(logging.WARNING):
+        results = w.poll_once()
+
+    assert [d.action for _, d in results] == [Action.SPAWNED]
+    assert "the live reviewer-session count is unknown" in caplog.text
+
+
+def test_the_gate_costs_no_extra_session_list_in_a_poll_pass(config, monkeypatch):
+    """The sweep already lists the sessions; the gate reads its count. One
+    `alissa tmux ls` per pass, as before this change."""
+    w, _, al = _gated(config, limit=4)
+    calls = []
+    inner = al.list_review_sessions
+    al.list_review_sessions = lambda: (calls.append(1), inner())[1]
+
+    w.poll_once()
+
+    assert len(calls) == 1
+
+
+# -- the console exhaust ---------------------------------------------------
+
+
+def test_a_gated_pass_is_visible_in_the_poll_snapshot(config):
+    w, _, _ = _gated(config, limit=1, sessions=["review-widgets-pr9-r1-aaaaaa"])
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[0]
+    assert snap["queued"] == 1
+    assert snap["spawned"] == 0
+    assert snap["deferred"] == 0, (
+        "a gated round has no session — it must not read as an active one"
+    )
+    assert snap["stages"][0]["stage"] == "queued"
+    assert snap["stages"][0]["round"] == 1
+
+
+# -- config ----------------------------------------------------------------
+
+
+def test_max_concurrent_sessions_defaults_and_layers(tmp_path):
+    assert (
+        Config.build(tmp_path).max_concurrent_sessions
+        == DEFAULT_MAX_CONCURRENT_SESSIONS
+    )
+    cfg = Config.build(
+        tmp_path,
+        {"max_concurrent_sessions": 3},
+        {"max_concurrent_sessions": 2},  # CLI wins
+    )
+    assert cfg.max_concurrent_sessions == 2
+
+
+def test_max_concurrent_sessions_must_be_at_least_one(tmp_path):
+    """0 would defer every round forever: no session spawns, so no slot ever
+    frees."""
+    with pytest.raises(ValueError, match="max_concurrent_sessions must be >= 1"):
+        Config.build(tmp_path, {"max_concurrent_sessions": 0})
+
+
+def test_an_alarm_below_the_spawn_limit_is_rejected(tmp_path):
+    """reap_session_cap is the page; max_concurrent_sessions is the limit. A
+    page that fires on healthy load trains people to ignore it."""
+    with pytest.raises(ValueError, match="must be >= max_concurrent_sessions"):
+        Config.build(
+            tmp_path, {"reap_session_cap": 3, "max_concurrent_sessions": 4}
+        )
+    # Equal is fine: the gate never lets the count past the alarm on its own.
+    cfg = Config.build(
+        tmp_path, {"reap_session_cap": 4, "max_concurrent_sessions": 4}
+    )
+    assert (cfg.reap_session_cap, cfg.max_concurrent_sessions) == (4, 4)
+
+
+def test_the_shipped_defaults_are_alarm_coherent(tmp_path):
+    cfg = Config.build(tmp_path)
+    assert cfg.reap_session_cap >= cfg.max_concurrent_sessions
+
+
+def test_the_cap_alarm_still_fires_when_hand_spawns_push_past_it(config, caplog):
+    """The gate bounds what the DAEMON starts. Hand-spawned sessions can still
+    push the count past the alarm, and that is exactly when it should fire."""
+    cfg = dataclasses.replace(
+        _watched(config, SLUG), reap_session_cap=2, max_concurrent_sessions=2
+    )
+    w, _, al = watcher(cfg, make_pr(), [review()])
+    for number in (1, 2, 3):
+        _live(al, f"review-pr-{number}")
+
+    with caplog.at_level(logging.ERROR):
+        w.sweep_sessions()
+
+    assert any("CAP EXCEEDED" in r.getMessage() for r in caplog.records)

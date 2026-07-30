@@ -221,6 +221,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_ROUND_CAP` | *daemon default* (currently 10) | CR9 round cap; **pass-through** — unset ⇒ library default |
 | `ALISSA_REAP_GRACE_SECONDS` | *daemon default* (currently 1800) | how long a reviewer session must be idle **and** quiet before the reap sweep kills it; **pass-through** — unset ⇒ library default |
 | `ALISSA_REAP_SESSION_CAP` | *daemon default* (currently 6) | live reviewer sessions after a sweep above which the daemon logs page-worthy; **pass-through** — unset ⇒ library default |
+| `ALISSA_MAX_CONCURRENT_SESSIONS` | *daemon default* (currently 4) | spawn gate: at this many live reviewer sessions of the daemon's own grammar, an owed round waits for a slot instead of spawning (it burns no round number and no attempt, and pages nobody). Must be **≤ `ALISSA_REAP_SESSION_CAP`** — the daemon refuses a config whose alarm sits below its spawn limit. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.16.13` |
 | `ALISSA_CHECKS_WAIT_SECONDS` | *daemon default* (currently 1800) | how long a round holds its approve while the judged head's CI rollup is still running before recording the verdict as a comment, **per condition waited on** (an unreadable hold promoted to a pending one restarts the clock once, so the worst case is 2×); a **red** rollup never waits and never approves; **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.16.7` |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
 | `ALISSA_AGENT_MODEL` | `opus` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
@@ -233,7 +234,8 @@ automatically; locally pass `--build-arg`):
 
 The optional tuning knobs `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`,
 `ALISSA_REAP_GRACE_SECONDS`, `ALISSA_REAP_SESSION_CAP`,
-`ALISSA_CHECKS_WAIT_SECONDS` and `ALISSA_REVIEW_OPERATORS` are
+`ALISSA_MAX_CONCURRENT_SESSIONS`, `ALISSA_CHECKS_WAIT_SECONDS` and
+`ALISSA_REVIEW_OPERATORS` are
 **pass-through**: their build `ARG` default is empty, and when they are unset the
 entrypoint **omits the key entirely** from the generated `revloop.config.json`
 so the daemon library applies its own current default. There is no hidden

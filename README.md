@@ -115,6 +115,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `on_missing_hub` | `skip` | `skip` \| `add` — see *Provisioning new repos* |
 | `reap_grace_seconds` | `1800` | how long a reviewer session must be idle **and** quiet before the sweep reaps it (and before a stale round reads it as dead); must be **well under** the 90-minute stale-round window, which the loader enforces |
 | `reap_session_cap` | `6` | more live reviewer sessions than this after a sweep and the daemon logs page-worthy; an alarm threshold, not a capacity limit |
+| `max_concurrent_sessions` | `4` | **spawn gate**: at this many live reviewer sessions of this daemon's own grammar, an owed round *waits* instead of spawning and is retried next poll. Deferral burns no round number and no attempt, trips no stale-round respawn, and pages nobody. Must be **≤ `reap_session_cap`**, which the loader enforces — the cap is the alarm, this is the limit |
 | `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead. Applies **per condition waited on**: an unreadable hold that becomes a genuine *pending* one restarts the clock once, so the worst-case hold is **twice** this. A **red** rollup never waits and never approves — see *Never approve a red head* |
 
 ### Config file discovery
@@ -279,6 +280,7 @@ Leave it on `skip` unless you want unattended clones.
 | pending request, no prior review | spawn round 1 |
 | pending request, k−1 reviews submitted | spawn round k (round-k directive: verify triage, verify fixes, sweep delta) |
 | round already enqueued | in-flight, no-op |
+| a round is owed but `max_concurrent_sessions` reviewer sessions are live | **deferred** — the round waits for a slot and is retried next poll; it burns no round number and no attempt — see *Spawn back-pressure* |
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
 | a round's review has landed | its reviewer session is reaped (freed) — see below |
 | a round's verdict envelope exists but no reviewer-identity review does | the daemon submits it natively after a short grace; the round is **not** closed until it lands |
@@ -479,6 +481,67 @@ back inside the cap. Each idle agent session holds hundreds of MB forever; the 2
 incident was this drift, past 10 GB, with every review session idle and its PR
 long merged.
 
+### Spawn back-pressure: `max_concurrent_sessions`
+
+Nothing used to bound how many reviewer sessions ran at once. `round_cap` bounds
+*rounds per PR*; `reap_session_cap` is an alarm the daemon logs and cannot act
+on. So a merge wave spawned one interactive agent per PR, simultaneously, against
+a fixed container: on 2026-07-29 the 18:45–19:00Z burst pegged the deployment's
+2 vCPU ceiling with 4+ concurrent reviewers plus the poll loop. Throttled
+sessions review *slower*, hold their round slots longer, and widen the very burst
+that is starving them.
+
+The gate closes that. Immediately before spawning — past every branch that
+decides whether a round is owed — the daemon counts the live sessions matching
+**its own grammar** and, at or above `max_concurrent_sessions`, defers:
+
+- **Deferral is not failure.** No spawn-ledger row is written, so the round
+  number is untouched (the next poll computes the same one), no attempt is
+  spent, and the stale-round probe cannot see the round at all — a round can sit
+  gated for hours without ever being "in flight 90 minutes". Nothing is posted:
+  no PR comment, no operator page, no escalation.
+- **Oldest waiter first.** `review_requests` is a `search/issues` query sorted by
+  *relevance* and not stable between calls, so the walk is re-ordered: everything
+  already deferred goes first, in the order it was first deferred, then everything
+  else in the search's own order. A round that has waited two passes takes the
+  next free slot ahead of one that has waited none. The queue is in memory — it
+  is a fairness order, not a decision the daemon must remember, and a restart
+  costs it one pass of ordering and nothing else.
+- **Own grammar only.** Both shapes count: this daemon's
+  `review-<repo>-pr<n>-r<k>-<nonce>` spawns *and* the skill's hand-spawned
+  `review-pr-<n>` — they burn the same CPU, and a gate blind to them would let a
+  hand-driven round and a daemon round each think it held the last slot. Other
+  lanes' sessions in the shared container are invisible, exactly as they are to
+  the reaper.
+- **One line per pass**, at `INFO`, summarizing every deferral
+  (`spawn gate: 2 round(s) deferred — 4/4 reviewer sessions live …`),
+  streak-limited like the poll firewall. A queue that keeps *moving* never
+  escalates however long it holds: a full container handing out freed slots is
+  the gate working, and paging on it would make normal load look like a leak.
+- **A gate that spawns nothing does escalate.** Deferrals across consecutive
+  passes with **no spawn at all**, for longer than the 30-minute
+  `POLL_ESCALATE_SECONDS` window, switch the line to `WARNING` naming how long
+  nothing has started. That is a different subject from a deferred round (which
+  still pages nobody): it is a review outage, and the reap alarm can miss it
+  entirely — a **busy** session is never reaped whatever its PR's state, a
+  hand-spawned `review-pr-<n>` on an **open** PR is outside the reaper's scope
+  by design, and an undecidable session is spared every poll. Four such sessions
+  against the shipped defaults is a permanently shut gate under a silent alarm
+  (`reap_session_cap` 6 > 4), and the gated rounds write no ledger row, so the
+  stale-round probe cannot see them either. Any single spawn clears it.
+- **Alarm coherence.** `Config.build` refuses a config whose `reap_session_cap`
+  sits below `max_concurrent_sessions` — an alarm under the limit pages on
+  healthy load. **Upgrade note:** a config that already sets `reap_session_cap`
+  below `4` now fails to load; lower `max_concurrent_sessions` with it.
+- **Failure mode: open.** If `alissa tmux ls` cannot be read the spawn proceeds,
+  logged once per pass. That list is also the reaper's only input, so a CLI that
+  cannot answer it means nothing is being reaped either — refusing every spawn
+  would turn one broken subprocess into a review outage with the container idle.
+
+The gate bounds what the *daemon* starts. Hand-spawned sessions can still push
+the live count past `reap_session_cap`, and that is exactly when the alarm should
+fire.
+
 ### Poll snapshots (console exhaust)
 
 Every poll pass persists one row to a `poll_snapshots` table in the same SQLite
@@ -486,12 +549,12 @@ state DB — a self-contained record of what that pass *observed*, so the
 console sidecar below can render live daemon state without spending any GitHub API
 budget of its own (the UI-1 pattern ported from the devloop). Each row carries
 the timestamp, the pass duration in ms, the candidate count, the decision-summary
-counts (`spawned`, `stale_reenqueued`, `in_flight`, `deferred`, `converged`,
-`capped`, `escalated`, `skipped`) and the reap count, plus a JSON column of the
-pass's per-item stages (PR slug and number, round, session name, current stage,
-reason, task ref). It is built entirely from the per-PR decisions already in hand
-— **no extra GitHub calls** — and the table is self-bounding: the newest 1,000
-rows are kept and older ones pruned on every write.
+counts (`spawned`, `stale_reenqueued`, `in_flight`, `deferred`, `queued`,
+`converged`, `capped`, `escalated`, `skipped`) and the reap count, plus a JSON
+column of the pass's per-item stages (PR slug and number, round, session name,
+current stage, reason, task ref). It is built entirely from the per-PR decisions
+already in hand — **no extra GitHub calls** — and the table is self-bounding:
+the newest 1,000 rows are kept and older ones pruned on every write.
 
 A snapshot **observes** a pass; it is not an action the daemon takes, so it is
 written in `--dry-run` too (where the counts and stages reflect what *would* have
@@ -529,7 +592,8 @@ alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
   JSON (10m cache, for the running-vs-latest drift chip).
 - **Reviewer semantics.** The pipeline board is PR-centric — PR ref → **round k
   of the cap** → session → stage (`spawned` / `in-flight` / `deferred` /
-  `stale-re-enqueued` / `converged` / `capped` / `escalated` / `skipped`). The
+  `queued` / `stale-re-enqueued` / `converged` / `capped` / `escalated` /
+  `skipped`). The
   inbox pages the two things the daemon pages a human about: CR9 **cap-outs**
   (from `escalations`) and **stalled** deferral episodes (from `pings`), both
   linking to the PR. There is no worker-tasks panel — reviewers create no tasks —

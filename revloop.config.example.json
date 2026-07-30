@@ -35,6 +35,9 @@
   "_reap_session_cap": "Alarm threshold, not a capacity limit: more live reviewer sessions than this after a sweep and the daemon logs page-worthy. A healthy loop runs a couple of concurrent rounds.",
   "reap_session_cap": 6,
 
+  "_max_concurrent_sessions": "SPAWN GATE. At this many live reviewer sessions of this daemon's own grammar (its own review-<repo>-pr<n>-r<k>-<nonce> spawns AND the skill's hand-spawned review-pr-<n>), an owed round waits for a slot instead of spawning, and is retried on later polls. Deferral costs the round nothing: no round number, no attempt, no stale-round respawn, no operator page; the oldest waiter takes the next free slot. Other lanes' sessions in a shared container are invisible to it, exactly as they are to the reaper. Must be <= reap_session_cap (the loader refuses an alarm below the limit, which would page on healthy load). Sized for the container's CPU budget, not for the review backlog: a reviewer session is a full interactive agent.",
+  "max_concurrent_sessions": 4,
+
   "_checks_wait_seconds": "How long a round holds its APPROVE while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a COMMENT instead. PER CONDITION WAITED ON: an unreadable hold that becomes a genuine pending one restarts the clock once, so the worst-case hold is twice this (the daemon reports both numbers) — an approve from the reviewer identity is the operator's merge cue, so it must mean reviewed AND green. A RED rollup never waits: it posts REQUEST_CHANGES leading with the failing check names. 0 means never hold (degrade on the first poll). Skipped/neutral contexts never block.",
   "checks_wait_seconds": 1800,
 
