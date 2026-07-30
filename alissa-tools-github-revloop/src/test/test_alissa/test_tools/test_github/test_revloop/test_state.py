@@ -505,3 +505,93 @@ def test_abandoned_rounds_counts_the_permanent_holes(ledger):
 
     assert ledger.abandoned_rounds(REPO, 7) == 1, "a posted round is not a hole"
     assert ledger.abandoned_rounds(REPO, 8) == 0, "per PR"
+
+
+# -- the PR -> review-task cache (issue #66) -------------------------------
+
+
+def test_a_mapping_round_trips_and_is_keyed_per_pr(ledger):
+    assert ledger.review_task(REPO, 7) is None, "first sighting knows nothing"
+
+    ledger.record_review_task(REPO, 7, "TASK-500")
+
+    assert ledger.review_task(REPO, 7) == "TASK-500"
+    assert ledger.review_task(REPO, 8) is None, "per PR"
+    assert ledger.review_task("other/repo", 7) is None, "per repo"
+
+
+def test_re_resolving_replaces_the_mapping(ledger):
+    """Correcting a mapping is the whole point of re-resolving: the newest
+    answer wins rather than losing to the row already there."""
+    ledger.record_review_task(REPO, 7, "TASK-500")
+    ledger.record_review_task(REPO, 7, "TASK-600")
+
+    assert ledger.review_task(REPO, 7) == "TASK-600"
+
+
+def test_forgetting_a_mapping_returns_the_pr_to_first_sighting(ledger):
+    ledger.record_review_task(REPO, 7, "TASK-500")
+    ledger.forget_review_task(REPO, 7)
+
+    assert ledger.review_task(REPO, 7) is None
+    # Idempotent: a disproof can be reached twice (two passes racing the same
+    # validated task) and the second must not raise.
+    ledger.forget_review_task(REPO, 7)
+
+
+def test_a_mapping_survives_reopen(tmp_path):
+    """The mapping has to outlive the process or every daemon restart pays a
+    full task-list search per open PR again."""
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st.record_review_task(REPO, 7, "TASK-500")
+
+    with State(path) as st:
+        assert st.review_task(REPO, 7) == "TASK-500"
+
+
+def test_migrates_a_pre_review_task_cache_db_in_place(tmp_path):
+    """A database that predates the cache table gains it on open, with its
+    legacy ledgers untouched."""
+    path = tmp_path / "state.db"
+    _legacy_db(path)
+
+    with State(path) as st:
+        assert st.get_spawn(REPO, 7, 1) is not None
+        assert st.review_task(REPO, 7) is None
+        st.record_review_task(REPO, 7, "TASK-500")
+        assert st.review_task(REPO, 7) == "TASK-500"
+
+
+def test_an_unwritable_cache_never_raises_at_the_caller(tmp_path, caplog):
+    """Best-effort like the snapshots: a cache that cannot be written costs the
+    next pass a task search, not the pass itself."""
+    caplog.set_level("WARNING")
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st.record_review_task(REPO, 7, "TASK-500")  # a row to fail to delete
+        path.chmod(0o444)
+        path.parent.chmod(0o555)
+        try:
+            wrote = st.record_review_task(REPO, 8, "TASK-600")
+            forgot = st.forget_review_task(REPO, 7)
+        finally:
+            path.parent.chmod(0o755)
+            path.chmod(0o644)
+
+    assert wrote is False
+    assert forgot is False
+    assert "review-task cache write failed" in caplog.text
+    assert "readonly database" in caplog.text
+
+
+def test_an_unreadable_cache_reads_as_a_miss(ledger, caplog):
+    """The one read in this class that absorbs a database error. A ledger that
+    cannot answer must cost a task search, never a review: the caller sees the
+    same None a first sighting produces."""
+    ledger.record_review_task(REPO, 7, "TASK-500")
+    ledger._db.execute("DROP TABLE review_tasks")
+
+    with caplog.at_level("WARNING"):
+        assert ledger.review_task(REPO, 7) is None
+    assert "review-task cache unreadable" in caplog.text

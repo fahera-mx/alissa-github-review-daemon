@@ -153,29 +153,127 @@ def _title_pattern(owner: str, repo: str, number: int) -> re.Pattern[str]:
     )
 
 
+def is_review_task_for(owner: str, repo: str, number: int, task: "Task") -> bool:
+    """Whether `task` is THE open CR2 review task for this PR.
+
+    The one predicate, shared by the search (`find_review_task`, over a whole
+    task list) and by the cache check (loop._review_task, over a single task
+    read back by ref). They must agree: a cached ref that the search would not
+    have returned is a mapping the daemon has to drop, and a divergence here
+    would either pin a wrong task forever or re-fetch the corpus every pass
+    while disagreeing with itself.
+    """
+    return bool(_title_pattern(owner, repo, number).match(task.title)) and task.is_open
+
+
+def _task_from_row(row: object) -> "Task | None":
+    """One task out of a CLI payload row, or None when it carries no usable ref.
+
+    Shared by the list reader and the single-task reader so both agree on which
+    field is the resolvable ref.
+    """
+    if not isinstance(row, dict):
+        return None
+    # `taskNumber` is the ref the API resolves; `taskSeq` is a display
+    # ordinal and 404s as `TASK-<seq>`.
+    number = row.get("taskNumber")
+    if number is None:
+        return None
+    title = row.get("title")
+    status = row.get("status")
+    return Task(
+        ref=f"TASK-{number}",
+        title=title if isinstance(title, str) else "",
+        status=status if isinstance(status, str) else "",
+    )
+
+
+@dataclass(frozen=True)
+class TaskDetail:
+    """One task as `alissa task get` sees it: the task itself, plus the CR6
+    verdict envelopes already on it.
+
+    The two travel together because they come out of ONE payload. The decide
+    path needs both (is this still the PR's open review task? how many rounds
+    has it recorded?), and reading them separately would cost two task fetches
+    per PR per poll where the CLI already returns everything in one.
+    """
+
+    task: Task
+    verdicts: int
+
+
 class Alissa:
     def list_tasks(self) -> list[Task]:
+        """EVERY non-terminal task owned by this actor -- the expensive call.
+
+        `alissa task list` (CLI 0.1.0) exposes no server-side narrowing at all:
+        its only flags are `--json` and `--include-terminal`. Omitting the
+        latter is therefore the whole of the available filtering, and it is
+        already the default here -- validated and cancelled tasks never come
+        back. What remains is the actor's live corpus (hundreds of tasks,
+        ~250 KB), so the daemon's job is to call this RARELY rather than to
+        call it narrowly: see loop._review_task (persisted PR -> task mapping)
+        and loop._pass_task_list (at most one fetch per poll pass).
+        """
         data = run_json(["alissa", "task", "list", "--json"], timeout=90) or []
         tasks = []
-        for row in data:
-            # `taskNumber` is the ref the API resolves; `taskSeq` is a display
-            # ordinal and 404s as `TASK-<seq>`.
-            number = row.get("taskNumber")
-            if number is None:
-                continue
-            tasks.append(
-                Task(
-                    ref=f"TASK-{number}",
-                    title=row.get("title", ""),
-                    status=row.get("status", ""),
-                )
-            )
+        for row in data if isinstance(data, list) else []:
+            task = _task_from_row(row)
+            if task is not None:
+                tasks.append(task)
         return tasks
 
-    def find_review_task(self, owner: str, repo: str, number: int) -> Task | None:
-        """CR2: exactly one review task per PR. Reuse it across rounds (CR7)."""
-        pattern = _title_pattern(owner, repo, number)
-        matches = [t for t in self.list_tasks() if pattern.match(t.title) and t.is_open]
+    def get_task(self, ref: str) -> "TaskDetail | None":
+        """Read ONE task by ref: title, status and verdict count in one call.
+
+        This is what makes a cached PR -> review-task mapping usable. Resolving
+        the task by ref costs a single-task fetch; resolving it by searching
+        titles costs the actor's entire corpus, which is the read this whole
+        path exists to stop paying every poll.
+
+        None means "could not be read" and NOTHING more -- a deleted task and a
+        transient CLI failure are indistinguishable from here, so a caller must
+        not treat None as proof that a cached mapping is wrong (see
+        loop._review_task, which keeps the row and falls back to the search).
+        Never raises: the daemon polls forever and this runs inside every pass.
+        """
+        try:
+            data = run_json(["alissa", "task", "get", ref, "--json"], timeout=90)
+        except CommandError as exc:
+            log.warning("could not read task %s: %s", ref, exc)
+            return None
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("unexpected failure reading task %s", ref)
+            return None
+
+        try:
+            task = _task_from_row(data)
+            if task is None:
+                return None
+            return TaskDetail(task=task, verdicts=self._count_verdicts(data))
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("could not parse task payload for %s", ref)
+            return None
+
+    def find_review_task(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        tasks: "list[Task] | None" = None,
+    ) -> Task | None:
+        """CR2: exactly one review task per PR. Reuse it across rounds (CR7).
+
+        `tasks` supplies a corpus the caller already fetched, so several PRs
+        missing the cache in the SAME poll pass share one list call instead of
+        issuing an identical one each (the observed 2-4 same-second bursts).
+        Omitted -- the console-script path, and any caller with no pass to
+        scope to -- fetches its own.
+        """
+        pool = self.list_tasks() if tasks is None else tasks
+        matches = [t for t in pool if is_review_task_for(owner, repo, number, t)]
 
         if not matches:
             return None

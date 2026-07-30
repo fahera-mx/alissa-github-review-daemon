@@ -28,6 +28,9 @@ from alissa.tools.github.revloop.alissa import (
     VERDICT_REQUEST_CHANGES,
     ManagedSession,
     SessionRef,
+    Task,
+    TaskDetail,
+    is_review_task_for,
     parse_session_name,
     session_repo_slug,
 )
@@ -254,9 +257,32 @@ class FakeAlissa:
         self.killed: list[str] = []
         self.on_add = None  # optional side effect: actually create the hub
         self.sessions: list = []  # live ManagedSessions, as `alissa tmux ls` sees them
+        # Full-corpus `alissa task list` fetches this fake has served. The
+        # expensive call issue #66 is about, so tests count it directly.
+        self.list_calls = 0
+        # Refs read back one at a time via `alissa task get`, in order.
+        self.get_calls: list[str] = []
+        # When True, `get_task` cannot read the task at all (the CLI failed, or
+        # it is gone) -- the case a cached mapping must survive, not be
+        # invalidated by.
+        self.task_unreadable = False
 
-    def find_review_task(self, owner, repo, number):
+    def list_tasks(self):
+        self.list_calls += 1
+        return [self.task] if self.task is not None else []
+
+    def find_review_task(self, owner, repo, number, *, tasks=None):
+        # Mirrors the real client's contract: a caller that supplies the pass's
+        # corpus does not pay for another fetch; one that does not, does.
+        if tasks is None:
+            self.list_tasks()
         return self.task
+
+    def get_task(self, ref):
+        self.get_calls.append(ref)
+        if self.task_unreadable or self.task is None or ref != self.task.ref:
+            return None
+        return TaskDetail(task=self.task, verdicts=self.verdict_count)
 
     def latest_verdict(self, task_ref):
         return self.verdict
@@ -5336,3 +5362,284 @@ def test_a_production_pass_is_not_bounded_by_a_dry_run_one(config, caplog):
 
     assert "IDENTITY DRIFT" in caplog.text
     assert gh.removed == ["alissa-app"]
+
+
+# -- the PR -> review-task cache (issue #66) -------------------------------
+#
+# `alissa task list` returns this actor's entire non-terminal corpus (~250 KB,
+# hundreds of rows) and the decide path was calling it once per candidate PR
+# per poll pass, forever. These pin the three properties that replaced it: the
+# mapping is persisted and short-circuits the search, a pass that must search
+# does so once for all of its PRs, and every degradation lands on the old
+# behaviour rather than on a skipped review.
+
+
+def test_the_first_sighting_searches_and_the_next_pass_does_not(config):
+    """The steady state: one corpus fetch when a PR is first seen, then never
+    again -- the task is read back by ref instead."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert al.list_calls == 1, "first sighting has nothing cached; it searches"
+    assert al.get_calls == [], "and nothing to read back by ref"
+    assert state.review_task(SLUG, NUMBER) == FakeTask.ref
+
+    w._pass_tasks = None  # a fresh pass
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert al.list_calls == 1, "the persisted mapping short-circuits the search"
+    assert al.get_calls == [FakeTask.ref], "resolved by ref, one small read"
+
+
+def test_the_mapping_outlives_the_process(config):
+    """A restart must not re-pay a corpus fetch per open PR: the mapping is in
+    the ledger, not in the watcher."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert al.list_calls == 1
+
+    fresh, _, al2 = watcher(config, make_pr(), [], state=State(config.state_db))
+    fresh.evaluate(OWNER, REPO, NUMBER)
+
+    assert al2.list_calls == 0, "a new process reads the ledger, not the corpus"
+    assert al2.get_calls == [FakeTask.ref]
+
+
+def test_every_pr_missing_the_cache_shares_one_corpus_fetch(config):
+    """The same-second bursts of 2-4 identical fetches the census caught: one
+    list answers every PR in the pass, so the pass buys it once."""
+    w, _, al = watcher(config, make_pr(), [], state=State(config.state_db))
+
+    for number in (7, 8, 9):
+        w._review_task(dataclasses.replace(make_pr(), number=number))
+
+    assert al.list_calls == 1, "three first sightings, one corpus fetch"
+
+
+def test_a_pass_never_inherits_the_previous_pass_corpus(config):
+    """The memo is a within-pass de-duplication. A corpus carried into the next
+    pass would answer it from titles and statuses that have since moved."""
+    w, _, al = watcher(config, make_pr(), [], state=State(config.state_db))
+    al.task = None  # nothing ever caches, so every pass must search
+
+    w.poll_once()
+    w.poll_once()
+
+    assert al.list_calls == 2, "one fetch per pass, and the memo is reset"
+
+
+def test_a_cached_task_that_no_longer_matches_is_dropped_and_re_resolved(config):
+    """Invalidation on a positive disproof: the ref still reads, but what it
+    reads is not this PR's open review task any more."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert al.list_calls == 1
+
+    class Validated(FakeTask):
+        status = "validated"
+        is_open = False
+
+    al.task = Validated()
+    w._pass_tasks = None
+    task, _ = w._review_task(make_pr())
+
+    assert al.list_calls == 2, "a disproved mapping falls back to the search"
+    assert task is al.task, "and the search's answer is what the pass uses"
+
+
+def test_a_cached_task_that_belongs_to_another_pr_is_dropped(config):
+    """The cache check is the SAME predicate as the search. A ref whose title
+    names a different PR could only ever be a wrong mapping."""
+    state = State(config.state_db)
+    state.record_review_task(SLUG, NUMBER, "TASK-999")
+    w, _, al = watcher(config, make_pr(), [], state=state)
+
+    class OtherPR(FakeTask):
+        ref = "TASK-999"
+        title = f"Review PR {OWNER}/{REPO}#999 (TASK-499)"
+
+    al.task = OtherPR()
+    w._review_task(make_pr())
+
+    assert al.get_calls == ["TASK-999"]
+    assert al.list_calls == 1, "the mapping is disproved, so the pass searches"
+
+
+def test_an_unreadable_task_keeps_the_mapping_and_falls_back(config, caplog):
+    """FAIL OPEN. A task that cannot be read is not a task that is wrong: the
+    row survives the hiccup and the pass degrades to the old search."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    al.task_unreadable = True
+    w._pass_tasks = None
+    with caplog.at_level(logging.WARNING):
+        task, _ = w._review_task(make_pr())
+
+    assert task is al.task, "the review is still resolved, never skipped"
+    assert al.list_calls == 2, "by falling back to the search"
+    assert state.review_task(SLUG, NUMBER) == FakeTask.ref, (
+        "a transient read failure must not throw away a good mapping"
+    )
+    assert "could not read cached review task" in caplog.text
+
+
+def test_a_search_that_finds_nothing_drops_the_mapping(config):
+    """The one negative result that IS a disproof: the search completed and
+    this PR has no open review task, whatever the cache said."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert state.review_task(SLUG, NUMBER) == FakeTask.ref
+
+    al.task = None  # validated and gone: neither readable nor findable
+    w._pass_tasks = None
+    task, _ = w._review_task(make_pr())
+
+    assert task is None
+    assert state.review_task(SLUG, NUMBER) is None
+
+
+def test_state_loss_degrades_to_the_old_lookup_and_skips_no_review(config):
+    """AC 3. With the cache table gone entirely the daemon must still decide
+    every round -- by paying exactly what it paid before the cache existed."""
+    state = State(config.state_db)
+    state.record_review_task(SLUG, NUMBER, FakeTask.ref)
+    state._db.execute("DROP TABLE review_tasks")  # the cache is simply gone
+
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    decision = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert decision.action is Action.SPAWNED, "a review is decided, not skipped"
+    assert decision.round == 1
+    assert decision.task_ref == FakeTask.ref
+    assert al.list_calls == 1, "and resolved the way it always was: by search"
+    assert al.get_calls == [], "with no cached ref to read back"
+
+
+def test_the_cached_round_count_comes_from_the_same_read(config):
+    """The ref read that validates the mapping already carries the round's
+    verdict envelopes, so the cached path costs ONE task fetch, not two."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [review()], state=state, verdict_count=1)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    w._pass_tasks = None
+    al.verdict_count = 2  # a round landed between the passes
+    task, verdicts = w._review_task(make_pr())
+
+    assert task is al.task
+    assert verdicts == 2, "the count is read back with the task, not separately"
+    assert al.get_calls == [FakeTask.ref], "one read on the cached path"
+
+
+# -- the client's half of it ------------------------------------------------
+
+
+def test_a_supplied_corpus_is_not_re_fetched(monkeypatch):
+    """`find_review_task(tasks=...)` is what lets a pass share one fetch."""
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    def never(*a, **k):
+        raise AssertionError("a supplied corpus must not trigger a fetch")
+
+    monkeypatch.setattr(alissa_mod, "run_json", never)
+
+    corpus = [
+        Task(ref="TASK-1", title="Unrelated work", status="committed"),
+        Task(
+            ref="TASK-500",
+            title=f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-499)",
+            status="committed",
+        ),
+    ]
+    found = alissa_mod.Alissa().find_review_task(OWNER, REPO, NUMBER, tasks=corpus)
+
+    assert found is not None and found.ref == "TASK-500"
+
+
+def test_get_task_reads_title_status_and_round_count_in_one_call(monkeypatch):
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    calls = []
+    payload = {
+        "taskNumber": 500,
+        "title": f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-499)",
+        "status": "pending_validation",
+        "evidence": [
+            envelope("request_changes", 1, "2026-07-18T10:00:00Z"),
+            envelope("approve", 2, "2026-07-18T12:00:00Z"),
+        ],
+    }
+
+    def fake_run_json(argv, **kwargs):
+        calls.append(argv)
+        return payload
+
+    monkeypatch.setattr(alissa_mod, "run_json", fake_run_json)
+
+    detail = alissa_mod.Alissa().get_task("TASK-500")
+
+    assert len(calls) == 1, "one CLI call for the task AND its round count"
+    assert calls[0][:3] == ["alissa", "task", "get"]
+    assert detail is not None
+    assert detail.task == alissa_mod.Task(
+        ref="TASK-500",
+        title=f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-499)",
+        status="pending_validation",
+    )
+    assert detail.verdicts == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        CommandError(["alissa", "task", "get"], 1, "API 404 (Not Found)"),
+        CommandError(["alissa", "task", "get"], -1, "timed out after 90s"),
+    ],
+    ids=["gone", "transient"],
+)
+def test_get_task_never_raises_and_never_explains_itself(monkeypatch, failure):
+    """None means 'could not be read' and nothing more. A 404 and a timeout are
+    deliberately indistinguishable here -- the caller must not invalidate on
+    either, and pretending it could tell them apart is how a good mapping gets
+    thrown away on a hiccup."""
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    def boom(*a, **k):
+        raise failure
+
+    monkeypatch.setattr(alissa_mod, "run_json", boom)
+
+    assert alissa_mod.Alissa().get_task("TASK-500") is None
+
+
+def test_get_task_tolerates_a_payload_with_no_ref(monkeypatch):
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: {"title": "x"})
+
+    assert alissa_mod.Alissa().get_task("TASK-500") is None
+
+
+def test_the_cache_check_and_the_search_share_one_predicate():
+    """A divergence between them would either pin a wrong task forever or
+    re-search every pass while disagreeing with itself."""
+    open_match = Task(
+        ref="TASK-500",
+        title=f"Review PR {OWNER}/{REPO}#{NUMBER} (TASK-499)",
+        status="committed",
+    )
+    assert is_review_task_for(OWNER, REPO, NUMBER, open_match)
+
+    assert not is_review_task_for(
+        OWNER, REPO, NUMBER, dataclasses.replace(open_match, status="validated")
+    ), "a terminal task is not a live mapping"
+    assert not is_review_task_for(OWNER, REPO, NUMBER + 1, open_match), "per PR"
+    assert not is_review_task_for(
+        OWNER, REPO, NUMBER, dataclasses.replace(open_match, title="Review PR x/y#7")
+    ), "per repo"
