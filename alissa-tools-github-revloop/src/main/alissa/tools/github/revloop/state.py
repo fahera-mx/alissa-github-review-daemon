@@ -9,6 +9,12 @@ was already escalated, and to count the operator re-entry acks that raise a
 single PR's effective cap. The ledger tolerates sessions dying or being
 killed behind its back: a reap record is bookkeeping, never a precondition.
 
+The `review_tasks` table is a cache, not a ledger: it remembers which CR2
+review task each PR resolved to so the decide path can read that one task by
+ref instead of searching the actor's whole task corpus every poll. Every row is
+re-checked on use and dropped when it stops matching, and losing the table
+costs nothing but the search it was avoiding.
+
 The `poll_snapshots` table is a different animal from the ledger above: it
 records what each poll pass OBSERVED, not what the daemon must remember to
 avoid double-work. One row per pass carries the timing, the candidate count,
@@ -141,6 +147,22 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     review_url    TEXT,
     last_error    TEXT,
     PRIMARY KEY (repo, number, round)
+);
+
+-- The PR -> CR2 review-task mapping, remembered so the decide path does not
+-- have to search for it. CR2 guarantees one review task per PR and CR7 reuses
+-- it across every round, so the mapping is stable for the PR's whole life --
+-- which is exactly what makes it cacheable. A row here is a HINT, never a
+-- fact: it is re-checked by ref on use and dropped when it stops matching, and
+-- losing the whole table only costs one title search per PR (see
+-- loop._review_task). That is why this is best-effort like the snapshots
+-- above, not a correctness write.
+CREATE TABLE IF NOT EXISTS review_tasks (
+    repo        TEXT    NOT NULL,
+    number      INTEGER NOT NULL,
+    task_ref    TEXT    NOT NULL,
+    resolved_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, number)
 );
 
 CREATE TABLE IF NOT EXISTS poll_snapshots (
@@ -851,6 +873,77 @@ class State:
         )
 
     # -- poll snapshots (the console sidecar's exhaust buffer) -------------
+
+    def review_task(self, repo: str, number: int) -> "str | None":
+        """The review-task ref last resolved for this PR, or None.
+
+        None is the FIRST-SIGHTING answer and also the answer after a database
+        that could not be written: both mean "search for it", which is what the
+        daemon did unconditionally before this table existed. There is nothing
+        a caller may conclude from None beyond that.
+
+        The only READ in this class that absorbs a database error, and for the
+        same reason its writes do: this table is an optimization, so a ledger
+        that cannot answer must cost the daemon a task search, never a review.
+        Everything else here is ledger state whose loss the caller has to see.
+        """
+        try:
+            row = self._db.execute(
+                "SELECT task_ref FROM review_tasks WHERE repo=? AND number=?",
+                (repo, number),
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            log.warning(
+                "state: review-task cache unreadable (%s: %s) — this pass "
+                "resolves %s#%d by searching, as it did before the cache",
+                type(exc).__name__, exc, repo, number,
+            )
+            return None
+        return None if row is None else str(row["task_ref"])
+
+    def record_review_task(self, repo: str, number: int, task_ref: str) -> bool:
+        """Remember which review task a PR resolved to. Best-effort.
+
+        REPLACE, not IGNORE: re-resolving is how a mapping is corrected, so the
+        newest answer has to win. `resolved_at` is when the mapping was last
+        confirmed by a search, which is the audit question worth answering.
+
+        A database error here is absorbed exactly like a snapshot's: the cache
+        is an optimization, and a pass that cannot persist it still decides the
+        round correctly -- it just pays the search again next time.
+        """
+        return self._write_telemetry(
+            lambda: self._replace_review_task(repo, number, task_ref),
+            "review-task cache write",
+        )
+
+    def _replace_review_task(self, repo: str, number: int, task_ref: str) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO review_tasks "
+            "(repo, number, task_ref, resolved_at) VALUES (?,?,?,?)",
+            (repo, number, task_ref, int(time.time())),
+        )
+        self._db.commit()
+
+    def forget_review_task(self, repo: str, number: int) -> bool:
+        """Drop a mapping that has been DISPROVED. Best-effort.
+
+        Only ever called on a positive disproof -- the task was read and is no
+        longer this PR's open review task, or a fresh search found none. Never
+        on a failed read: an unreadable task is not a wrong mapping, and
+        forgetting one on a transient CLI error would throw away a good cache
+        entry every time the API hiccups.
+        """
+        return self._write_telemetry(
+            lambda: self._delete_review_task(repo, number),
+            "review-task cache invalidation",
+        )
+
+    def _delete_review_task(self, repo: str, number: int) -> None:
+        self._db.execute(
+            "DELETE FROM review_tasks WHERE repo=? AND number=?", (repo, number)
+        )
+        self._db.commit()
 
     def record_snapshot(
         self,

@@ -27,6 +27,7 @@ from .alissa import (
     ManagedSession,
     SessionRef,
     Task,
+    is_review_task_for,
     session_repo_slug,
 )
 from .config import (
@@ -955,6 +956,16 @@ class ReviewWatcher:
         # rollup (two API calls) on every poll, forever, for every PR with an
         # owed approve. In-memory for the same reason _dry_run_drift is.
         self._dry_run_rollups: dict[tuple[str, int, int, str], str] = {}
+        # The task corpus THIS poll pass already fetched, or None until some
+        # PR in it misses the review-task cache. `alissa task list` returns
+        # every non-terminal task this actor owns (hundreds of rows, ~250 KB)
+        # and the list that answers one PR's search answers all of them, so a
+        # pass pays for it at most once instead of once per missing PR -- the
+        # same-second bursts of 2-4 identical fetches the census caught.
+        # In memory and reset per pass on purpose: this is a within-pass
+        # de-duplication, and a corpus that outlived its pass would answer the
+        # next one from titles and statuses that have since moved.
+        self._pass_tasks: list[Task] | None = None
         # Consecutive passes refused by the ledger gate in poll_once, and when
         # the refusal began -- the same streak-limit-then-escalate shape the
         # poll firewall uses, for the same reason: a read-only volume refuses
@@ -963,6 +974,84 @@ class ReviewWatcher:
         # state, and because the only durable place to put it is the ledger
         # that cannot be written.
         self._ledger_streak = Streak()
+
+    # -- the PR -> review-task mapping ---------------------------------------
+
+    def _pass_task_list(self) -> list[Task]:
+        """The actor's task corpus, fetched AT MOST ONCE per poll pass.
+
+        The fallback behind the review-task cache. Every PR that misses the
+        cache in a given pass needs the same corpus, so the first miss pays for
+        it and the rest read the memo -- see `_pass_tasks` for why it never
+        outlives the pass.
+
+        A fetch that raises propagates, exactly as the unmemoized call did: the
+        pass's caller turns it into a SKIPPED decision for that one PR and the
+        memo stays empty, so the next PR retries rather than inheriting a
+        failure it never saw.
+        """
+        if self._pass_tasks is None:
+            self._pass_tasks = self.alissa.list_tasks()
+        return self._pass_tasks
+
+    def _review_task(self, pr: PullRequest) -> tuple["Task | None", int]:
+        """This PR's open CR2 review task and its verdict count, cheaply.
+
+        The decide path needs the review task on every pass of every open
+        round, and the only way to FIND one is to search the actor's whole
+        non-terminal task corpus by title -- a ~250 KB read that the daemon was
+        paying once per candidate PR per poll, forever (issue #66). CR2 gives
+        one review task per PR and CR7 reuses it across rounds, so the answer
+        does not move once known: it is resolved once, persisted, and from then
+        on read back by ref (one small task fetch, which the round count needed
+        anyway).
+
+        Three outcomes, in the order they are tried:
+
+        * a cached ref that still reads as this PR's open review task -- the
+          steady state, and no search at all;
+        * a cached ref that is READABLE and no longer matches (validated,
+          cancelled, retitled, or plain wrong) -- dropped, then searched for;
+        * no cached ref, or one that could not be read -- searched for. An
+          unreadable task is NOT a disproof, so the row survives a transient
+          CLI failure and the pass just degrades to the old behaviour.
+
+        Fail-open is the whole contract: every degradation here lands on "do
+        what the daemon did before the cache existed", and none of them can
+        answer "no review task" unless a successful search actually said so.
+        """
+        cached = self.state.review_task(pr.full_name, pr.number)
+        if cached is not None:
+            detail = self.alissa.get_task(cached)
+            if detail is not None:
+                if is_review_task_for(pr.owner, pr.repo, pr.number, detail.task):
+                    return detail.task, detail.verdicts
+                log.info(
+                    "%s: cached review task %s no longer matches (title=%r "
+                    "status=%s) — re-resolving",
+                    pr.slug, cached, detail.task.title, detail.task.status,
+                )
+                self.state.forget_review_task(pr.full_name, pr.number)
+            else:
+                log.warning(
+                    "%s: could not read cached review task %s — falling back "
+                    "to the task search for this pass (the mapping is kept: "
+                    "an unreadable task is not a wrong one)",
+                    pr.slug, cached,
+                )
+
+        task = self.alissa.find_review_task(
+            pr.owner, pr.repo, pr.number, tasks=self._pass_task_list()
+        )
+        if task is None:
+            # A search that completed and found nothing IS a disproof: there is
+            # no open review task for this PR, whatever the cache said.
+            if cached is not None:
+                self.state.forget_review_task(pr.full_name, pr.number)
+            return None, 0
+
+        self.state.record_review_task(pr.full_name, pr.number, task.ref)
+        return task, self.alissa.count_verdicts(task.ref)
 
     # -- per-PR decision ---------------------------------------------------
 
@@ -993,11 +1082,9 @@ class ReviewWatcher:
         # Fall back to the substantive-review count only before the review task
         # exists (round 1). Looked up here (not in _spawn) because both the count
         # and convergence need it.
-        task = self.alissa.find_review_task(owner, repo, number)
+        task, verdicts = self._review_task(pr)
         native = countable_rounds(my_reviews)
-        completed = (
-            self.alissa.count_verdicts(task.ref) if task is not None else native
-        )
+        completed = verdicts if task is not None else native
 
         # A round is not over until its verdict exists as a native review by
         # the reviewer identity (issue #51). An envelope ahead of the native
@@ -2923,6 +3010,12 @@ class ReviewWatcher:
     # -- polling -----------------------------------------------------------
 
     def poll_once(self) -> list[tuple[str, Decision]]:
+        # A new pass sees a new corpus. Cleared FIRST, before any early return
+        # can skip it: a memo left over from the previous pass would be handed
+        # to this one's title searches as if it were current, and it is the one
+        # piece of per-pass state whose staleness would be invisible.
+        self._pass_tasks = None
+
         # THE LEDGER GATE (issue #62, PR #63 round-1 blocker). Nothing below
         # may run when the ledger cannot record what it does.
         #
