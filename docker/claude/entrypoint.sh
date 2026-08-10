@@ -919,7 +919,8 @@ fi
 PRUNE_ENABLED=0
 PRUNE_INTERVAL_MINUTES=360
 PRUNE_INTERVAL_SECONDS=$(( 360 * 60 ))
-PRUNE_TIMEOUT_SECONDS=900
+PRUNE_TIMEOUT_SECONDS=240
+PRUNE_KILL_AFTER_SECONDS=30
 # Never contains `--force`. See the block comment above; the entrypoint has no
 # knob that adds it, which is the point.
 PRUNE_ARGS=()
@@ -959,6 +960,26 @@ workspace_prune_supported() {
 #   * command substitution inherits stdin, so a CLI that ever prompts would
 #     wait forever on a container that has no tty.
 #
+# `-k` IS PART OF THE BOUND, not a refinement of it. Plain `timeout` sends TERM
+# and then waits indefinitely, so a child that traps TERM is unbounded again —
+# the same boot-held-open failure, one step further along. That is not a
+# hypothetical for this subcommand: `workspace prune` is the destructive one, and
+# a handler that finishes the in-flight git operation before exiting is exactly
+# what a careful implementation would install, so the bound would go missing at
+# the moment the CLI lands and the feature stops being a no-op. `-k` gives such a
+# handler PRUNE_KILL_AFTER_SECONDS to finish and then KILLs it; the exit status
+# stays 124 either way, so the WARN path below does not care which signal did it.
+#
+# `-k` IS PART OF THE BOUND, not a refinement of it. Plain `timeout` sends TERM
+# and then waits indefinitely, so a child that traps TERM is unbounded again —
+# the same boot-held-open failure, one step further along. That is not a
+# hypothetical for this subcommand: `workspace prune` is the destructive one, and
+# a handler that finishes the in-flight git operation before exiting is exactly
+# what a careful implementation would install, so the bound would go missing at
+# the moment the CLI lands and the feature stops being a no-op. `-k` gives such a
+# handler PRUNE_KILL_AFTER_SECONDS to finish and then KILLs it; the exit status
+# stays 124 either way, so the WARN path below does not care which signal did it.
+#
 # A timed-out pass is just another non-zero exit into the WARN path below (124,
 # named there so the log says "timed out" instead of a bare number). This is
 # deliberately NOT how `workspace sync` above is treated: sync is a
@@ -978,7 +999,7 @@ workspace_prune_run() {
   # Run from the workspace root: the workspace binding is cwd-based, exactly as
   # for the `workspace sync` above.
   out="$( cd "${WORKSPACE_ROOT}" \
-          && timeout "${PRUNE_TIMEOUT_SECONDS}" \
+          && timeout -k "${PRUNE_KILL_AFTER_SECONDS}" "${PRUNE_TIMEOUT_SECONDS}" \
              alissa code workspace prune ${PRUNE_ARGS[@]+"${PRUNE_ARGS[@]}"} </dev/null 2>&1 )" \
     || rc=$?
   if [ -n "${out}" ]; then
@@ -987,7 +1008,15 @@ workspace_prune_run() {
   if [ "${rc}" = "0" ]; then
     log "workspace prune (${label}) finished"
   elif [ "${rc}" = "124" ]; then
-    log "WARN: workspace prune (${label}) TIMED OUT after ${PRUNE_TIMEOUT_SECONDS}s and was killed — the boot was not held open, and nothing was removed. A first pass over a never-pruned volume can legitimately need longer: raise ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS."
+    log "WARN: workspace prune (${label}) TIMED OUT after ${PRUNE_TIMEOUT_SECONDS}s and was terminated — the boot was not held open, and nothing was removed. A first pass over a never-pruned volume can legitimately need longer: raise ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS, but keep it (plus the grace) inside your platform's health-check window."
+  elif [ "${rc}" = "137" ]; then
+    # 124 is `timeout`'s own "I terminated it"; 137 (128+9) is what it reports
+    # when the child had to be KILLED after `-k`. Measured, not assumed: GNU
+    # timeout does NOT normalise the kill path to 124, so a 124-only branch would
+    # file exactly the case `-k` exists for under the generic "exited N" message.
+    # Worth its own line either way — a CLI that ignores SIGTERM is a fact about
+    # the CLI, not about this boot.
+    log "WARN: workspace prune (${label}) TIMED OUT after ${PRUNE_TIMEOUT_SECONDS}s and did NOT exit on SIGTERM, so it was KILLED after the ${PRUNE_KILL_AFTER_SECONDS}s grace — the boot was not held open, and nothing was removed. Raise ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS (keeping it plus the grace inside your health-check window); if this recurs, the CLI is trapping SIGTERM and the grace may need to be longer."
   else
     log "WARN: workspace prune (${label}) exited ${rc} — nothing was removed by this pass; the volume keeps what it holds until the next one. Check the verdict lines above."
   fi
@@ -1022,23 +1051,48 @@ else
 fi
 
 if [ "${PRUNE_ENABLED}" = "1" ]; then
-  # How long ONE pass may run before it is killed — a bound, not a budget. 900s
-  # is generous for a warm volume and still well inside any platform's startup
-  # window. Both roles resolve it, because both run the boot pass. Garbage falls
-  # back to the default with a warning rather than failing closed: a bound that
-  # is merely wrong is still a bound, and disabling the hygiene over a typo
-  # would trade the smaller problem for the larger one.
-  PRUNE_TIMEOUT_SECONDS="${ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS:-900}"
+  # How long ONE pass may run before it is killed — a bound, not a budget.
+  #
+  # 240s, and the number is chosen against a specific window rather than being
+  # "generously large": this pass runs at 3c-ii, while the console that serves
+  # the documented `/healthz` deployment health check does not start until 4b —
+  # so the pass sits IN FRONT of the endpoint the platform probes. Railway's
+  # healthcheck timeout defaults to 300s (and the README's own Railway walkthrough
+  # tells the operator to point it at `/healthz`), so any default above that
+  # reproduces the restart loop this bound exists to prevent, under the shipped
+  # configuration. A bound whose default permits its own failure mode is not a
+  # bound.
+  #
+  # The trade runs one way: a timed-out pass costs a warning and nothing else —
+  # the volume simply keeps what it holds until the next tick — while an overrun
+  # boot costs the container. So the default protects the boot, and the known
+  # slow case (a first sweep over a never-pruned volume) is served by RAISING the
+  # knob, which is exactly what the timeout WARN tells the operator to do.
+  #
+  # Both roles resolve it, because both run the boot pass. Garbage falls back to
+  # the default with a warning rather than failing closed: a bound that is merely
+  # wrong is still a bound, and disabling the hygiene over a typo would trade the
+  # smaller problem for the larger one.
+  PRUNE_TIMEOUT_SECONDS="${ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS:-240}"
   if ! printf '%s' "${PRUNE_TIMEOUT_SECONDS}" | grep -qE '^[1-9][0-9]*$'; then
-    log "WARN: ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=${PRUNE_TIMEOUT_SECONDS} is not a positive whole number of seconds — falling back to 900"
-    PRUNE_TIMEOUT_SECONDS=900
+    log "WARN: ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=${PRUNE_TIMEOUT_SECONDS} is not a positive whole number of seconds — falling back to 240"
+    PRUNE_TIMEOUT_SECONDS=240
+  fi
+  # Grace for a CLI that traps TERM, before KILL. Test-only override; a deploy
+  # leaves it unset. 30s is long enough for an in-flight git operation to finish
+  # and short enough that TIMEOUT+GRACE (270s) still lands inside that 300s
+  # window — the pair is what has to fit, not the timeout alone.
+  PRUNE_KILL_AFTER_SECONDS="${ALISSA_WORKSPACE_PRUNE_KILL_AFTER_SECONDS:-30}"
+  if ! printf '%s' "${PRUNE_KILL_AFTER_SECONDS}" | grep -qE '^[1-9][0-9]*$'; then
+    log "WARN: ALISSA_WORKSPACE_PRUNE_KILL_AFTER_SECONDS=${PRUNE_KILL_AFTER_SECONDS} is not a positive whole number of seconds — falling back to 30"
+    PRUNE_KILL_AFTER_SECONDS=30
   fi
 
   if [ "${CONTAINER_ROLE}" = "executor" ]; then
     # No interval resolution at all in this role: it never reaches 4c, and
     # validating, defaulting and ANNOUNCING a cadence it will not run would put
     # two contradicting lines in its boot log.
-    log "workspace prune ENABLED — boot pass only (executor role; min-age: ${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS:-CLI default}, timeout ${PRUNE_TIMEOUT_SECONDS}s, --force never passed). The interval loop belongs to the daemon's process chain: this role 'exec's the bridge, so there would be nothing left here to tear a loop down."
+    log "workspace prune ENABLED — boot pass only (executor role; min-age: ${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS:-CLI default}, timeout ${PRUNE_TIMEOUT_SECONDS}s+${PRUNE_KILL_AFTER_SECONDS}s, --force never passed). The interval loop belongs to the daemon's process chain: this role 'exec's the bridge, so there would be nothing left here to tear a loop down."
   else
     # The interval is not a safety knob — a bad one only changes how often a
     # best-effort pass runs — so a garbage value falls back to the default with
@@ -1066,7 +1120,7 @@ if [ "${PRUNE_ENABLED}" = "1" ]; then
       fi
     fi
 
-    log "workspace prune ENABLED — boot pass now, then every ${PRUNE_INTERVAL_MINUTES} min (min-age: ${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS:-CLI default}, timeout ${PRUNE_TIMEOUT_SECONDS}s, --force never passed)"
+    log "workspace prune ENABLED — boot pass now, then every ${PRUNE_INTERVAL_MINUTES} min (min-age: ${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS:-CLI default}, timeout ${PRUNE_TIMEOUT_SECONDS}s+${PRUNE_KILL_AFTER_SECONDS}s, --force never passed)"
   fi
 
   # Best-effort, exactly like the other boot steps: prune is an optimization,
