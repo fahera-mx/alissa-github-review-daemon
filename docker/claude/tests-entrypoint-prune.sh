@@ -31,6 +31,10 @@
 #   6. executor role             -> boot pass yes, interval loop no (the role
 #                                   `exec`s the bridge; a loop would outlive the
 #                                   only code that stops it)
+#   7. a HANGING prune           -> `timeout` cuts it, the boot continues to the
+#                                   worker, and the warning names the knob. The
+#                                   boot hook runs BEFORE the worker starts, so
+#                                   an unbounded pass delays every boot
 #
 # Usage: bash docker/claude/tests-entrypoint-prune.sh
 # Needs: bash, python3, jq (the entrypoint's own bootstrap uses both).
@@ -85,7 +89,8 @@ STUB
 # --help` SUCCEEDS on a CLI that has never heard of prune.
 #
 # PRUNE_FAIL_ON=<n> makes the n-th prune invocation fail, so the interval loop's
-# tolerance of a failing pass is exercised rather than assumed.
+# tolerance of a failing pass is exercised rather than assumed. PRUNE_HANG makes
+# it block forever, which is what the boot pass's `timeout` bound exists for.
 cat > "${BIN}/alissa" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-} ${2:-} ${3:-}" in
@@ -126,6 +131,9 @@ HELP
       exit 0
     fi
     printf 'cwd=%s argv=%s\n' "${PWD}" "$*" >> "${SPY_DIR}/prune-argv"
+    # PRUNE_HANG models the slow first sweep (or a prompt on a tty-less
+    # container): the entrypoint's `timeout` is the only thing that ends it.
+    [ -n "${PRUNE_HANG:-}" ] && sleep 120
     n="$(wc -l < "${SPY_DIR}/prune-argv" | tr -d ' ')"
     echo "keep  main (never pruned)"
     echo "prune TASK-1-EXAMPLE (branch merged, PR closed)"
@@ -311,7 +319,8 @@ reset_spies
 LOG4="${TMPROOT}/knobs.log"
 run_entrypoint "${LOG4}" \
   ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS=48 \
-  ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES=soon
+  ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES=soon \
+  ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS=3
 PID4="${EP_PID}"
 wait_for_log "${LOG4}" "${DAEMON_UP}" 40 || bad "entrypoint never reached the worker-up milestone (see ${LOG4})"
 if [ "$(prune_count)" -ge 1 ]; then
@@ -324,6 +333,14 @@ assert_contains "${LOG4}" "ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES=soon is not a
   "a garbage interval warns"
 assert_contains "${LOG4}" "starting the workspace prune loop (every 360 min" \
   "a garbage interval falls back to 360 (an interval is not a safety knob)"
+# The INTERVAL pass must carry the same flags as the boot pass — PRUNE_ARGS is a
+# global the loop's subshell inherits, and nothing else pins that.
+if wait_for_prune_count 2 30; then
+  assert_eq "$(sed -n 2p "${SPY}/prune-argv" | sed 's/^.* argv=//')" "--min-age-hours 48" \
+    "the interval pass inherits --min-age-hours too, not just the boot pass"
+else
+  bad "no interval pass observed within 30s (count=$(prune_count))"
+fi
 stop_entrypoint "${PID4}"
 
 # -----------------------------------------------------------------------------
@@ -360,11 +377,39 @@ PID6="${EP_PID}"
 wait_for_log "${LOG6}" "starting alissa bridge start" 40 \
   || bad "the executor never reached the bridge (see ${LOG6})"
 assert_eq "$(prune_count)" "1" "the executor prunes once at boot (it grows the same volume)"
-assert_contains "${LOG6}" "executor role runs the boot pass only" "and says why there is no loop"
+assert_contains "${LOG6}" "boot pass only (executor role" "the ENABLED line says boot-pass-only for this role"
+assert_contains "${LOG6}" "nothing left here to tear a loop down" "and says why there is no loop"
 assert_not_contains "${LOG6}" "starting the workspace prune loop" "no interval loop in the executor role"
+assert_not_contains "${LOG6}" "then every" "the executor's log announces no cadence it will not run"
 sleep 8   # >2 ticks at the 3s override: an orphaned loop would show up here
 assert_eq "$(prune_count)" "1" "no loop survived the exec into the bridge"
 stop_entrypoint "${PID6}"
+
+# -----------------------------------------------------------------------------
+info ""
+info "7. a HANGING prune cannot hold the boot open"
+# -----------------------------------------------------------------------------
+reset_spies
+LOG7="${TMPROOT}/hang.log"
+# The boot hook runs before the worker starts, so an unbounded pass would delay
+# every boot by however long the CLI takes — and on a never-pruned volume the
+# first `git gc --auto` sweep is exactly that case. PRUNE_HANG makes the stub
+# sleep for two minutes; a 2s timeout must cut it and let the boot continue.
+run_entrypoint "${LOG7}" PRUNE_HANG=1 ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=2
+PID7="${EP_PID}"
+if wait_for_log "${LOG7}" "${DAEMON_UP}" 40; then
+  pass "the boot reaches the worker even though the prune pass hangs"
+else
+  bad "a hanging prune pass held the boot open (see ${LOG7})"
+fi
+assert_contains "${LOG7}" "workspace prune (boot) TIMED OUT after 2s" \
+  "the timeout is reported as a timeout, not as a bare exit code"
+assert_contains "${LOG7}" "ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS" \
+  "and names the knob that raises the bound"
+kill -0 "${PID7}" 2>/dev/null \
+  && pass "the container is alive after a timed-out pass" \
+  || bad "a timed-out prune killed the container"
+stop_entrypoint "${PID7}"
 
 info ""
 if [ "${fail}" = "0" ]; then

@@ -237,6 +237,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_FORCE_CHOWN` | `0` | `1`/`true`/`yes`/`on` forces the root phase's full `chown -R` of the volume for that boot; anything else (incl. unset) leaves the probe in charge. Off by default: the entrypoint probes ownership at depth 1 and walks only when it finds a foreign owner (see [Boot-time ownership](#boot-time-ownership-the-volume-walk-is-guarded)). Set it for **one** boot after a root shell wrote files deeper in the tree |
 | `ALISSA_WORKSPACE_PRUNE` | `1` (**on**) | volume hygiene: `1`/`true`/`yes`/`on` runs `alissa code workspace prune` at boot **and** on an interval; `0` opts out, after which nothing in the container reclaims anything. Default-on because this is the container whose volume grows (see [Volume hygiene](#volume-hygiene-finished-worktrees-are-pruned)). Skipped, with one loud warning, if the installed CLI predates the subcommand |
 | `ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES` | `360` | minutes between prune passes. Daemon role only — the executor gets the boot pass and no loop. A non-numeric or non-positive value warns and falls back to `360` |
+| `ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS` | `900` | how long ONE prune pass may run before it is killed, so a slow first sweep over a never-pruned volume cannot hold the boot open. A timed-out pass warns (exit 124) and changes nothing. Garbage falls back to `900` |
 | `ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS` | *(CLI default)* | passed straight through as `--min-age-hours`; **pass-through** — unset ⇒ the CLI's own age gate. A value that is not a whole number of hours **disables prune for that boot** instead of falling back (the CLI's default gate may be *shorter* than the one you asked for) |
 
 #### Config precedence: env var > daemon library default
@@ -352,6 +353,25 @@ safe to leave on by default:
   gets the boot pass — it grows the same volume the same way — but not the loop:
   that role `exec`s `alissa bridge start`, which replaces the shell, so a loop
   started there would outlive the only code that knows how to stop it.
+
+**A pass cannot hold the boot open.** The boot hook runs before `alissa worker`
+starts, and the first pass after the CLI lands sweeps `git gc --auto` across hubs
+on a volume that has never had anything reclaimed — minutes of work on a large
+object store, and on a platform with a startup health-check window a slow enough
+boot is a *dead* boot. So a pass runs under `timeout`
+(`ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS`, default 900) with **stdin closed**, and
+a pass that hits either bound lands in the same warning path as any other
+failure. The neighbouring `alissa code workspace sync` is deliberately *not*
+bounded this way: hubs are a precondition for reviewing anything, while prune is
+an optimization, and only one of those may delay a boot.
+
+> **`ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS` is test-only — do not set it in a
+> deploy.** `docker/claude/tests-entrypoint-prune.sh` has to watch the loop tick
+> more than once, and the smallest cadence the supported knob can express is a
+> minute. It silently overrides
+> `ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES`, and the boot log then reads
+> `starting the workspace prune loop (every 360 min = 3s)` — which is what you
+> will find first if it is ever set by accident.
 
 If you turn this off (`ALISSA_WORKSPACE_PRUNE=0`), nothing else reclaims the
 volume; plan on pruning by hand.
@@ -783,11 +803,12 @@ volumes:
    daemon's on-demand `alissa code workspace add` no-ops on a repo already listed
    in the manifest, leaving an empty folder and looping forever hub-ifying a hub
    that never completes.
-3b. **`alissa code workspace prune`** — best-effort volume hygiene, on the path
+3c-ii. **`alissa code workspace prune`** — best-effort volume hygiene, on the path
    both roles share: remove finished-branch worktrees (never `main/`, never
    dirty, never an open PR, never `--force`) and run the hub-level git prune/gc.
    Skipped with one loud warning if the CLI predates the subcommand, or if
-   `ALISSA_WORKSPACE_PRUNE=0`. A failure here is a warning, never a dead boot
+   `ALISSA_WORKSPACE_PRUNE=0`, and bounded by `timeout` with stdin closed so a
+   slow or prompting pass cannot hold the boot open. A failure here is a warning, never a dead boot
    ([why](#volume-hygiene-finished-worktrees-are-pruned)).
 3d. **Executor role only, and the end of the shared path**: drop this executor's
    stale lockfile, then `exec alissa bridge

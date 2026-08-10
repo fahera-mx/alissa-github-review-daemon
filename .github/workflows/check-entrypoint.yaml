@@ -103,8 +103,8 @@ jobs:
         # nothing" assertions rather than claims. The stub reproduces
         # commander's real behaviour for an unknown subcommand (parent help,
         # exit 0), so the capability probe is tested against the trap it exists
-        # for. Two cases wait out several ticks of the test-only seconds
-        # override, hence the headroom.
+        # for. Three cases wait out several ticks of the test-only seconds
+        # override or a real `timeout` firing, hence the headroom.
         timeout-minutes: 6
         run: bash docker/claude/tests-entrypoint-prune.sh
       - name: Execute Entrypoint Console Wiring Tests
