@@ -48,6 +48,29 @@ def test_read_stat_comm_with_parens_and_spaces(tmp_path):
     assert st["comm"] == "wei )rd (name"
 
 
+def test_read_stat_without_an_opening_paren_returns_none(tmp_path):
+    """The `(` guard, which no fixture reached before (round-1 [minor], caught
+    by mutation and invisible to statement coverage -- all three conditions sit
+    on one already-covered `if`). Without it `data[lparen + 1:rparen]` silently
+    evaluates to `data[0:rparen]`, so `comm` comes back carrying the PID and
+    the top-process panel renders that garbage as a process name."""
+    d = tmp_path / "42"
+    d.mkdir()
+    tail = ["S"] + ["0"] * 21
+    (d / "stat").write_text("42 no-parens-here) " + " ".join(tail))
+    assert sysinfo.read_stat(tmp_path, 42) is None
+
+
+def test_read_stat_with_a_close_paren_before_the_open_returns_none(tmp_path):
+    """The `lparen > rparen` half of the same guard: a line whose only `(`
+    follows its last `)` would slice backwards, not just wrongly."""
+    d = tmp_path / "42"
+    d.mkdir()
+    tail = ["S"] + ["0"] * 21
+    (d / "stat").write_text("42 )bash( " + " ".join(tail))
+    assert sysinfo.read_stat(tmp_path, 42) is None
+
+
 def test_read_stat_missing_returns_none(tmp_path):
     assert sysinfo.read_stat(tmp_path, 999) is None
 
@@ -298,6 +321,8 @@ def test_cgroup_memory_splits_the_charge(tmp_path):
     m = sysinfo.cgroup_memory(write_cgroup(tmp_path / "cg"))
     assert m["charged"] == RAILWAY_CURRENT
     assert m["resident"] == RAILWAY_ANON
+    # the audited plateau has `shmem 0`, so dropping shmem changes nothing here
+    assert m["shmem"] == 0
     assert m["reclaimable"] == RAILWAY_FILE + RAILWAY_SLAB_RECLAIMABLE
     # the raw keys ride along for an in-container memory.stat spot check
     assert m["anon"] == RAILWAY_ANON
@@ -310,6 +335,46 @@ def test_cgroup_memory_splits_the_charge(tmp_path):
     assert "slab" not in m and "active_file" not in m
     # ...and the split really is the operator's answer: reclaimable dominates
     assert m["reclaimable"] > 50 * m["resident"]
+
+
+def test_cgroup_memory_excludes_shmem_from_reclaimable(tmp_path):
+    """Round-1 [minor]: `shmem` is a SUBSET of `file` and is swap-backed, so on
+    a container with swap disabled it cannot be reclaimed under pressure. A
+    tmpfs-heavy container must not read as "all cache, no leak" -- the one way
+    this tile could be wrong in the reassuring direction."""
+    root = tmp_path / "cg"
+    root.mkdir()
+    (root / "memory.current").write_text("10000\n")
+    (root / "memory.stat").write_text(
+        "anon 1000\nfile 6000\nshmem 5000\nslab_reclaimable 500\n"
+    )
+    m = sysinfo.cgroup_memory(root)
+    # 6000 file - 5000 shmem = 1000 droppable, + 500 slab
+    assert m["reclaimable"] == 1500
+    # and shmem survives in the payload as its own magnitude, so the console
+    # can account for the 5000 that is neither resident nor reclaimable
+    assert m["shmem"] == 5000
+    assert m["resident"] == 1000
+
+
+def test_cgroup_memory_unknown_shmem_makes_reclaimable_unknown(tmp_path):
+    """`file` whole would be the reassuring-direction error the split exists to
+    prevent, so an unknown shmem propagates rather than being treated as 0."""
+    root = tmp_path / "cg"
+    root.mkdir()
+    (root / "memory.stat").write_text("anon 1000\nfile 6000\nslab_reclaimable 500\n")
+    m = sysinfo.cgroup_memory(root)
+    assert m["file"] == 6000 and m["shmem"] is None
+    assert m["reclaimable"] is None
+
+
+def test_cgroup_memory_clamps_a_shmem_larger_than_file(tmp_path):
+    """shmem cannot legitimately exceed file (one read of one file), but a
+    negative "cache" number would be worse to render than a zero."""
+    root = tmp_path / "cg"
+    root.mkdir()
+    (root / "memory.stat").write_text("file 100\nshmem 900\nslab_reclaimable 50\n")
+    assert sysinfo.cgroup_memory(root)["reclaimable"] == 50
 
 
 def test_cgroup_memory_missing_root_is_all_none(tmp_path):
@@ -338,9 +403,12 @@ def test_cgroup_memory_malformed_values_are_none(tmp_path):
     assert m["charged"] is None
     assert m["resident"] is None and m["anon"] is None
     assert m["file"] == 1024
-    assert m["reclaimable"] == 3072
     # keys the kernel never wrote are None, so the payload shape is stable
     assert m["shmem"] is None and m["inactive_file"] is None
+    # ...and an unknown shmem propagates: the droppable part of `file` is not
+    # knowable without it, so reclaimable stays unknown rather than counting
+    # `file` whole (see test_cgroup_memory_unknown_shmem_makes_reclaimable_unknown)
+    assert m["reclaimable"] is None
 
 
 def test_cgroup_memory_reclaimable_needs_both_parts(tmp_path):
@@ -358,7 +426,14 @@ def test_cgroup_memory_reclaimable_needs_both_parts(tmp_path):
 
 def test_cgroup_memory_current_missing_keeps_the_stat_split(tmp_path):
     """Each file degrades on its own: an unreadable memory.current does not
-    blank the breakdown the console can still show."""
+    blank the breakdown.
+
+    Data layer only -- that the CONSOLE still renders that breakdown is a
+    separate property, pinned by
+    `test_webui_page.test_dashboard_keeps_a_partial_cgroup_read`. Round-1
+    [minor]: this docstring used to claim the rendering property while
+    asserting the data one, and the tile did in fact throw the breakdown away.
+    """
     root = write_cgroup(tmp_path / "cg", current=None)
     m = sysinfo.cgroup_memory(root)
     assert m["charged"] is None

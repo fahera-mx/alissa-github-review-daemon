@@ -15,14 +15,16 @@ pass writes one `poll_snapshots` row (UI-1, PR #35) carrying the pass timing,
 the candidate count, the decision-summary counts, and the compact per-item
 stage list. The sidecar reads that table through `State.read_snapshots`, plus
 the spawn ledger, the escalation table and the ping ledger (the operator
-inbox), all read-only. Its only live signals are local (`alissa tmux ls`, a
-`/proc` walk of each session's pane-PID tree) or cached (`gh api rate_limit`,
-60s; the PyPI version JSON, 10m) -- so a fleet of operators refreshing the
-dashboard never moves the daemon's rate budget.
+inbox), all read-only. Its only live signals are local (`alissa tmux ls`, one
+`/proc` walk serving both each session's pane-PID tree and the host-wide
+top-by-RSS list, and the container's own cgroup v2 memory charge) or cached
+(`gh api rate_limit`, 60s; the PyPI version JSON, 10m) -- so a fleet of
+operators refreshing the dashboard never moves the daemon's rate budget.
 
 Layout:
   auth.py     -- fail-closed passcode, HMAC-signed sessions, CSRF, login throttle
-  sysinfo.py  -- /proc process-tree CPU%/RSS (sample-free, vanished-PID tolerant)
+  sysinfo.py  -- /proc process-tree CPU%/RSS + host-wide top-by-RSS and the
+                 cgroup memory split (sample-free, vanished-PID tolerant)
   sources.py  -- the read-only data layer + the retry-now UPDATE, cached checks
   page.py     -- the single static HTML page (studio design system, both themes)
   server.py   -- ThreadingHTTPServer wiring, routing, auth/CSRF gating, actions
