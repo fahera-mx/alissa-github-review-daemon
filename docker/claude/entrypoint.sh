@@ -156,11 +156,26 @@ fi
 #
 # So the walk now runs only when a cheap probe says it has to. The probe is
 # O(top-level entries) BY CONSTRUCTION — one `stat` over the mount point plus
-# its depth-1 children. It deliberately does NOT `find … ! -user alissa`: find
-# stats every inode too, which is the exact slab storm this guard exists to
-# remove. The blind spot that buys is root-owned files created DEEPER in the
-# tree (a Railway console shell running as root is the realistic way) — hence
-# ALISSA_FORCE_CHOWN=1, which forces the full walk for one boot.
+# its depth-1 children, testing owner AND group, because `alissa:alissa` is what
+# the walk asserts and a probe that tested only the owner would read `alissa:root`
+# as clean and never repair it. It deliberately does NOT `find … ! -user alissa`:
+# find stats every inode too, which is the exact slab storm this guard exists to
+# remove.
+#
+# WHAT THE PROBE CANNOT SEE, precisely: anything DEEPER than the mount point's
+# immediate children. A platform console shell running as root is the realistic
+# way to get there — hence ALISSA_FORCE_CHOWN=1, which forces the full walk for
+# one boot.
+#
+# AND THE INVARIANT THIS LEANS ON, which is easy to break by accident:
+# `chown -R` walks POST-ORDER, so the mount point itself is chowned LAST. That is
+# the only reason an interrupted first boot self-heals — a partial walk leaves
+# depth 0 still root-owned, so the next boot's probe trips and the walk resumes.
+# An "optimisation" that chowned the mount point first would convert every killed
+# first boot into a permanently latched half-owned volume. Do not reorder it.
+# The same post-order property is why a walk that FAILS deep still leaves depths
+# 0 and 1 owned by `alissa` — i.e. looking clean to this probe forever — which is
+# why the failure is logged loudly below instead of being swallowed.
 #
 # Reclaiming after the fact is not an option here: `/sys/fs/cgroup` is mounted
 # read-only inside a Railway container, so `echo … > memory.reclaim` fails with
@@ -169,8 +184,8 @@ fi
 # -----------------------------------------------------------------------------
 
 # Does <path> need the recursive chown? Returns 0 (yes) when the probe finds any
-# entry not owned by ${RUNTIME_USER} — or when it cannot tell, because a walk we
-# did not need is cheaper than a volume the daemon cannot write.
+# entry that is not ${RUNTIME_USER}:${RUNTIME_USER} — or when it cannot tell,
+# because a walk we did not need is cheaper than a volume the daemon cannot write.
 #
 # Scope is the path itself plus its immediate children, nothing deeper: that is
 # what makes the probe O(top-level entries) instead of O(inodes). One `stat`
@@ -188,13 +203,19 @@ needs_recursive_chown() {
     entries+=("${entry}")
   done
 
+  # `%U:%G`, not `%U`: the repair this guards sets owner AND group, so testing
+  # only the owner would leave `alissa:root` looking clean with no repair path
+  # left (the unconditional every-boot walk used to be that path). Same single
+  # stat call either way.
+  #
   # GNU stat does not dereference symlinks without -L, so a dangling link
   # reports its own ownership rather than failing the whole call.
-  owners="$(stat -c '%U' -- "${entries[@]}" 2>/dev/null)" || return 0
+  owners="$(stat -c '%U:%G' -- "${entries[@]}" 2>/dev/null)" || return 0
   [ -n "${owners}" ] || return 0
   while IFS= read -r owner; do
-    # An uid with no passwd entry prints as UNKNOWN, which is correctly "not ours".
-    [ "${owner}" = "${RUNTIME_USER}" ] || return 0
+    # An uid/gid with no passwd/group entry prints as UNKNOWN, which is correctly
+    # "not ours".
+    [ "${owner}" = "${RUNTIME_USER}:${RUNTIME_USER}" ] || return 0
   done <<<"${owners}"
   return 1
 }
@@ -215,14 +236,27 @@ if [ "$(id -u)" = "0" ]; then
   fi
   for CHOWN_TARGET in "${WORKSPACE_ROOT}" "${TMUX_DIR}"; do
     if [ "${FORCE_CHOWN}" = "1" ] || needs_recursive_chown "${CHOWN_TARGET}"; then
-      chown -R "${RUNTIME_USER}:${RUNTIME_USER}" "${CHOWN_TARGET}" 2>/dev/null || true
+      # `|| true` stays — step 0 must not die here — but the STATUS is not
+      # discarded any more. `chown -R` continues past per-entry errors and still
+      # processes the parent directories (post-order), so a walk that fails deep
+      # finishes with depths 0 and 1 owned by ${RUNTIME_USER}: the probe reads
+      # clean on every later boot and the unrepaired subtree latches silently.
+      # Under the old unconditional walk that failure was retried next boot; now
+      # the warning is the operator's only signal, so it must exist. stderr stays
+      # suppressed so a per-entry error storm cannot flood the boot log.
+      if chown -R "${RUNTIME_USER}:${RUNTIME_USER}" "${CHOWN_TARGET}" 2>/dev/null; then
+        CHOWN_OK=1
+      else
+        CHOWN_OK=0
+      fi
       if [ "${FORCE_CHOWN}" = "1" ]; then
         log "chown -R ${RUNTIME_USER}:${RUNTIME_USER} ${CHOWN_TARGET} (forced)"
       else
-        log "chown -R ${RUNTIME_USER}:${RUNTIME_USER} ${CHOWN_TARGET} (probe found entries not owned by ${RUNTIME_USER})"
+        log "chown -R ${RUNTIME_USER}:${RUNTIME_USER} ${CHOWN_TARGET} (probe found entries that are not ${RUNTIME_USER}:${RUNTIME_USER})"
       fi
+      [ "${CHOWN_OK}" = "1" ] || log "WARNING: chown -R ${CHOWN_TARGET} reported errors — entries below depth 1 may still be foreign-owned, and the depth-1 probe will read this tree as clean on every later boot. Re-deploy once with ALISSA_FORCE_CHOWN=1 if the daemon cannot write."
     else
-      log "${CHOWN_TARGET} already owned by ${RUNTIME_USER} — skipping the recursive chown (set ALISSA_FORCE_CHOWN=1 to force it)"
+      log "${CHOWN_TARGET} already owned by ${RUNTIME_USER}:${RUNTIME_USER} — skipping the recursive chown (set ALISSA_FORCE_CHOWN=1 to force it)"
     fi
   done
   log "workspace mount ${WORKSPACE_ROOT} owned by ${RUNTIME_USER}"

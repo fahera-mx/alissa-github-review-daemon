@@ -11,7 +11,7 @@
 #
 # The contract this pins:
 #
-#   1. warm boot (probe finds everything alissa-owned) -> NO recursive chown,
+#   1. warm boot (probe finds everything alissa:alissa) -> NO recursive chown,
 #      and the probe stays O(top-level entries): one stat per target, never a
 #      `find`, never a depth-2 path
 #   2. a root-owned entry among the mount's depth-1 CHILDREN -> full chown runs
@@ -23,6 +23,13 @@
 #   6. the probe against the REAL filesystem and the REAL stat, with the outcome
 #      derived from the tree's actual owner — so a stub that lies about stat's
 #      interface cannot make cases 1-5 pass on their own
+#   7. the targets are decided INDEPENDENTLY: a root-owned tmux dir walks on its
+#      own and does not drag the volume into a walk (PR #79 round 1)
+#   8. an entry at alissa:root -> full chown runs. The walk sets owner AND group,
+#      so the probe has to test both or the group half has no repair path left
+#   9. a walk that FAILS is logged, not swallowed: chown -R keeps going past
+#      per-entry errors and still processes the parents, so a deep failure leaves
+#      depths 0/1 clean and would latch silently on every later boot
 #
 # HOW (no docker, no root — CI has neither): this boots the REAL entrypoint.sh
 # with the commands its root phase shells out to replaced by stubs.
@@ -31,8 +38,9 @@
 #   * `gosu` drops its user argument and execs, standing in for the privilege drop
 #   * `chown` and `find` record their arguments instead of running (a non-root
 #     test cannot chown, and `find` must never be called at all)
-#   * `stat` answers scripted ownership per path (cases 1-5) or is the real stat
-#     (case 6), and records every invocation so the probe's COST is assertable
+#   * `stat` answers scripted `owner:group` per path (every case but 6) or is the
+#     real stat (case 6), and records every invocation so the probe's COST is
+#     assertable
 #
 # Usage: bash docker/claude/tests-entrypoint-chown.sh
 # Needs: bash, awk, coreutils.
@@ -78,16 +86,26 @@ exec $(command -v id) "\$@"
 STUB
 
 # The privilege drop: `gosu <user> <cmd...>` -> run <cmd...> as who we already are.
+#
+# Through `bash`, not by executing the script directly: entrypoint.sh is mode 644
+# in the repo (the Dockerfile chmods it into the image), so an `exec "$@"` here
+# dies with "Permission denied" the moment the entrypoint re-execs itself — and
+# every assertion in this file is about the root phase, which happens BEFORE the
+# drop, so that death would go unnoticed. run_boot launches the first pass the
+# same way.
 cat > "${BIN}/gosu" <<'STUB'
 #!/usr/bin/env bash
 shift
-exec "$@"
+exec bash "$@"
 STUB
 
 # chown / find never really run here; what matters is WHETHER they were called.
+# CHOWN_FAIL makes the stub exit non-zero, standing in for the real thing's
+# "kept going past per-entry errors, still processed the parents, exited 1".
 cat > "${BIN}/chown" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${CHOWN_LOG}"
+[ -n "${CHOWN_FAIL:-}" ] && exit 1
 exit 0
 STUB
 cat > "${BIN}/find" <<'STUB'
@@ -96,10 +114,11 @@ printf '%s\n' "$*" >> "${FIND_LOG}"
 exit 0
 STUB
 
-# Scripted ownership. FAKE_OWNERS names a TSV of "<path>\t<owner>" lines; any
-# path not listed is owned by `alissa`. Unset FAKE_OWNERS => the real stat.
-# Every invocation is appended to STAT_LOG, which is how the probe's cost (one
-# call per target, depth-1 paths only) becomes an assertion instead of a claim.
+# Scripted ownership. FAKE_OWNERS names a TSV of "<path>\t<owner>[:<group>]"
+# lines; a bare owner means owner:owner, and any path not listed is
+# `alissa:alissa`. Unset FAKE_OWNERS => the real stat. Every invocation is
+# appended to STAT_LOG, which is how the probe's cost (one call per target,
+# depth-1 paths only) becomes an assertion instead of a claim.
 cat > "${BIN}/stat" <<STUB
 #!/usr/bin/env bash
 if [ -z "\${FAKE_OWNERS:-}" ]; then
@@ -108,10 +127,14 @@ fi
 printf '%s\n' "\$*" >> "\${STAT_LOG}"
 for arg in "\$@"; do
   case "\${arg}" in
-    -*|'%U') continue ;;
+    -*|%*) continue ;;   # the -c flag and its format
   esac
   owner="\$(awk -F'\t' -v p="\${arg}" '\$1==p{print \$2; exit}' "\${FAKE_OWNERS}")"
   [ -n "\${owner}" ] || owner=alissa
+  case "\${owner}" in
+    *:*) ;;
+    *)   owner="\${owner}:\${owner}" ;;
+  esac
   printf '%s\n' "\${owner}"
 done
 exit 0
@@ -194,12 +217,12 @@ run_boot() {
 chowned_workspace() { grep -qF -- "-R alissa:alissa ${WORKSPACE}" "${CHOWN_LOG}"; }
 
 # --- 1. warm boot: the whole volume is already alissa-owned ------------------
-info "1. warm boot (everything alissa-owned) -> no recursive walk"
+info "1. warm boot (everything alissa:alissa) -> no recursive walk"
 : > "${TMPROOT}/owners-warm.tsv"
 run_boot warm FAKE_OWNERS="${TMPROOT}/owners-warm.tsv"
 if chowned_workspace; then bad "the recursive chown must NOT run on a warm boot"
 else pass "no recursive chown of the workspace mount"; fi
-assert_contains "${LOG}" "already owned by alissa — skipping the recursive chown" \
+assert_contains "${LOG}" "already owned by alissa:alissa — skipping the recursive chown" \
   "the log says the walk was skipped, and how to force it"
 if [ ! -s "${FIND_LOG}" ]; then pass "no \`find\` sweep (it would stat every inode too)"
 else bad "the probe shelled out to find: $(cat "${FIND_LOG}")"; fi
@@ -224,7 +247,7 @@ printf '%s\t%s\n' "$(case_workspace child-root)/fahera-mx" root > "${TMPROOT}/ow
 run_boot child-root FAKE_OWNERS="${TMPROOT}/owners-child.tsv"
 if chowned_workspace; then pass "the recursive chown of the mount ran"
 else bad "a root-owned child must trigger the full chown"; fi
-assert_contains "${LOG}" "probe found entries not owned by alissa" \
+assert_contains "${LOG}" "probe found entries that are not alissa:alissa" \
   "the log says why the walk ran"
 
 # --- 3. the mount point itself is root-owned (first boot) --------------------
@@ -271,6 +294,46 @@ else
   if chowned_workspace; then pass "tree really owned by ${REAL_OWNER} (not alissa) -> walked"
   else bad "a tree owned by ${REAL_OWNER} must trigger the walk"; fi
 fi
+
+# --- 7. the two targets are decided independently -----------------------------
+info ""
+info "7. the tmux dir is root-owned, the workspace is clean -> only the tmux dir walks"
+# The whole point of probing per target: the tmux dir is a handful of sockets,
+# the volume is millions of inodes, and one dirty socket dir must not buy the
+# volume's walk. A combined `chown -R ... "${WORKSPACE_ROOT}" "${TMUX_DIR}"`
+# repair passes every case above and fails this one.
+printf '%s\t%s\n' "${TMPROOT}/tmux-only/tmux" root > "${TMPROOT}/owners-tmux.tsv"
+run_boot tmux-only FAKE_OWNERS="${TMPROOT}/owners-tmux.tsv"
+if chowned_workspace; then bad "the workspace must NOT be dragged into the tmux dir's walk"
+else pass "the workspace is left alone"; fi
+if grep -qF -- "-R alissa:alissa ${TMPROOT}/tmux-only/tmux" "${CHOWN_LOG}"; then
+  pass "...while the tmux dir walks on its own"
+else
+  bad "the root-owned tmux dir should have been walked: $(cat "${CHOWN_LOG}")"
+fi
+
+# --- 8. the group half of the invariant --------------------------------------
+info ""
+info "8. a depth-1 child at alissa:root -> the full chown runs"
+# The walk asserts alissa:alissa, so the probe must too. Probing only %U would
+# read this tree as clean — and this PR removed the unconditional every-boot
+# walk that used to be the group's only repair path.
+printf '%s\t%s\n' "$(case_workspace group-drift)/.revloop" alissa:root > "${TMPROOT}/owners-group.tsv"
+run_boot group-drift FAKE_OWNERS="${TMPROOT}/owners-group.tsv"
+if chowned_workspace; then pass "a foreign GROUP triggers the walk, like a foreign owner"
+else bad "alissa:root must not read as clean — the walk sets owner AND group"; fi
+
+# --- 9. a failed walk is loud ------------------------------------------------
+info ""
+info "9. the recursive chown fails -> the boot warns and continues"
+printf '%s\t%s\n' "$(case_workspace chown-fails)" root > "${TMPROOT}/owners-fail.tsv"
+run_boot chown-fails FAKE_OWNERS="${TMPROOT}/owners-fail.tsv" CHOWN_FAIL=1
+assert_contains "${LOG}" "WARNING: chown -R" "the failure is reported, not swallowed"
+assert_contains "${LOG}" "Re-deploy once with ALISSA_FORCE_CHOWN=1" \
+  "...with the operator's remedy named"
+assert_contains "${LOG}" "may still be foreign-owned" \
+  "...and the reason it matters: a deep failure leaves the probe reading clean"
+assert_contains "${LOG}" "[entrypoint] role: " "step 0 does not die on a failed walk"
 
 info ""
 [ "${fail}" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
