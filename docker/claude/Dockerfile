@@ -297,6 +297,13 @@ ARG ALISSA_WORKER_INTERVAL="2"
 # Optional egress firewall (needs --cap-add=NET_ADMIN at runtime).
 ARG ALISSA_ENABLE_FIREWALL="0"
 ARG ALISSA_FIREWALL_EXTRA=""
+# Force the root phase's full `chown -R` of the volume (issue #78). Default OFF:
+# the entrypoint probes ownership at depth 1 and only walks when it finds
+# something not owned by `alissa`, because the walk charges GBs of reclaimable
+# dentry/inode slab to the container cgroup and a warm boot gains nothing from
+# it. Set this to 1 for ONE boot after a root shell has written files DEEPER in
+# the tree than the probe can see — that is the probe's only blind spot.
+ARG ALISSA_FORCE_CHOWN="0"
 
 ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_REVIEW_OPERATORS=${ALISSA_REVIEW_OPERATORS} \
@@ -315,7 +322,8 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_ON_MISSING_HUB=${ALISSA_ON_MISSING_HUB} \
     ALISSA_WORKER_INTERVAL=${ALISSA_WORKER_INTERVAL} \
     ALISSA_ENABLE_FIREWALL=${ALISSA_ENABLE_FIREWALL} \
-    ALISSA_FIREWALL_EXTRA=${ALISSA_FIREWALL_EXTRA}
+    ALISSA_FIREWALL_EXTRA=${ALISSA_FIREWALL_EXTRA} \
+    ALISSA_FORCE_CHOWN=${ALISSA_FORCE_CHOWN}
 
 # The reviewer console (alissa-revloop-ui) listens here when ALISSA_UI_ENABLED is
 # set. EXPOSE is documentation/metadata only — it opens no port by itself; the
