@@ -1,4 +1,5 @@
-"""Per-session resource accounting off `/proc`, plus workspace disk usage.
+"""Per-session resource accounting off `/proc`, plus workspace disk and
+container-memory usage.
 
 The sessions panel wants CPU% and RSS for each managed tmux session. tmux hands
 us a pane PID; the real work runs in that pane's child tree (a shell, the agent,
@@ -19,6 +20,19 @@ Two deliberate properties:
 The `/proc` root is a parameter so the parsing is testable against a crafted
 fixture directory (including a PID that is indexed but whose `stat` was deleted
 mid-walk -- the vanished-PID case the mutation bar pins).
+
+Per-session accounting cannot answer the question a platform memory graph
+asks. A Railway-style flat multi-GB plateau with zero reviewer sessions is
+CONTAINER-wide, and the per-pane sums (tens of MB) say nothing about it, so
+`cgroup_memory` reads the container's own cgroup v2 charge and splits it into
+the three numbers that settle "is that a leak?": what the container is charged
+for, what is really process memory, and what is page cache the kernel would
+drop the moment anything asked for it. `top_procs` is the same question one
+level down -- the whole `/proc`, not one pane tree -- so a charge that IS
+resident can be attributed to a process without shelling into the container.
+Both follow the module's conventions: roots are parameters, every read
+degrades to None instead of raising (a dev laptop or macOS has no cgroup v2
+and must still render the console), and neither samples.
 """
 
 from __future__ import annotations
@@ -40,17 +54,41 @@ _TAIL_STARTTIME = 19
 _TAIL_RSS = 21
 _TAIL_MIN_LEN = 22
 
+# The cgroup v2 files the memory tile reads, and the `memory.stat` keys it
+# keeps. Deliberately a fixed, small set: `memory.stat` carries ~40 keys and
+# the tile answers one question, so parsing the rest would be payload we never
+# render. `anon` is process memory, `file` is page cache, `slab_reclaimable` is
+# kernel cache the shrinkers can free -- together they are the split between a
+# real footprint and a charge the kernel would give back under pressure.
+_CGROUP_CURRENT = "memory.current"
+_CGROUP_STAT = "memory.stat"
+_CGROUP_STAT_KEYS = (
+    "anon",
+    "file",
+    "inactive_file",
+    "shmem",
+    "slab_reclaimable",
+    "slab_unreclaimable",
+)
+
 
 def read_stat(proc_root: "str | os.PathLike[str]", pid: int) -> "dict | None":
     """Parse one `/proc/<pid>/stat`, or None if the PID has vanished or the
     line is malformed. The `comm` field can contain spaces and parentheses, so
-    we split on the LAST ')' before tokenising -- the canonical safe parse."""
+    we split on the LAST ')' before tokenising -- the canonical safe parse.
+
+    `comm` is carried in the row (between the FIRST '(' and that last ')', the
+    mirror of the same parse) purely for the top-process list: the tree sums
+    need only the numbers, but a top-5 by RSS that shows bare PIDs tells an
+    operator nothing about what is holding the memory.
+    """
     try:
         data = (Path(proc_root) / str(pid) / "stat").read_text()
     except (OSError, ValueError):
         return None
     rparen = data.rfind(")")
-    if rparen == -1:
+    lparen = data.find("(")
+    if rparen == -1 or lparen == -1 or lparen > rparen:
         return None
     tail = data[rparen + 1:].split()
     if len(tail) < _TAIL_MIN_LEN:
@@ -58,6 +96,7 @@ def read_stat(proc_root: "str | os.PathLike[str]", pid: int) -> "dict | None":
     try:
         return {
             "pid": int(pid),
+            "comm": data[lparen + 1:rparen],
             "ppid": int(tail[_TAIL_PPID]),
             "cpu_ticks": int(tail[_TAIL_UTIME]) + int(tail[_TAIL_STIME]),
             "starttime": int(tail[_TAIL_STARTTIME]),
@@ -156,6 +195,121 @@ def tree_usage(
         "rss_bytes": rss_pages * _PAGE_SIZE,
         "cpu_percent": cpu_percent,
     }
+
+
+def top_procs(
+    n: int = 5,
+    *,
+    proc_root: "str | os.PathLike[str]" = "/proc",
+    index: "tuple[dict[int, list[int]], dict[int, dict]] | None" = None,
+) -> "list[dict]":
+    """The n biggest processes on the HOST by RSS: [{pid, comm, rss_bytes}],
+    largest first.
+
+    Deliberately the whole `/proc` and not a pane tree: the memory tile's
+    question is container-wide, so when the charge really is resident the
+    operator needs to see whatever is holding it -- which is routinely not a
+    reviewer session at all (the daemon itself, a stray build, the shell that
+    started everything).
+
+    `index` is the same (children, stats) pair `tree_usage` takes, so a
+    dashboard build that already scanned `/proc` for its session table ranks
+    processes off that ONE snapshot instead of walking every PID twice.
+    Vanished PIDs never appear: `build_index` has already dropped them, and a
+    process that exits after the scan simply ranks with its last-known RSS.
+
+    Ties break on PID so the order is total -- an equal-RSS pair must not
+    reshuffle between polls and make a still list look like it is churning.
+    """
+    if n <= 0:
+        return []
+    _, stats = index if index is not None else build_index(proc_root)
+    ranked = sorted(stats.values(), key=lambda st: (-st["rss_pages"], st["pid"]))
+    return [
+        {
+            "pid": st["pid"],
+            "comm": st.get("comm") or "?",
+            "rss_bytes": st["rss_pages"] * _PAGE_SIZE,
+        }
+        for st in ranked[:n]
+    ]
+
+
+def _read_int_file(path: Path) -> "int | None":
+    """One cgroup scalar file as an int, or None when it is absent, unreadable
+    or not a number. cgroup v2 writes the literal `max` in some files, which is
+    exactly the malformed case this returns None for."""
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_stat_keys(path: Path, keys: "tuple[str, ...]") -> "dict[str, int | None]":
+    """The requested `key value` lines of a cgroup `*.stat` file. Every key is
+    present in the result whether or not the file had it, so the payload shape
+    never depends on the kernel version -- a missing or unparseable key is
+    None, the same thing the whole-file failure produces."""
+    out: "dict[str, int | None]" = {key: None for key in keys}
+    try:
+        text = path.read_text()
+    except (OSError, ValueError):
+        return out
+    wanted = set(keys)
+    for line in text.splitlines():
+        name, _, value = line.partition(" ")
+        if name not in wanted:
+            continue
+        try:
+            out[name] = int(value.strip())
+        except ValueError:
+            out[name] = None
+    return out
+
+
+def _sum_or_none(*values: "int | None") -> "int | None":
+    """Sum only when EVERY part is known. A partial sum would be reported as a
+    whole bucket and read as a smaller cache than the container really holds --
+    an unknown number must stay unknown rather than become a wrong one."""
+    if any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
+
+
+def cgroup_memory(
+    cgroup_root: "str | os.PathLike[str]" = "/sys/fs/cgroup",
+) -> dict:
+    """The container's own memory charge, split for the operator.
+
+    Answers the question a platform memory graph raises and cannot settle: a
+    flat multi-GB plateau is `charged` (cgroup v2 `memory.current`), but most
+    of it is routinely cache the kernel would drop under pressure, not a leak.
+    So we also report:
+
+    * `resident` -- `anon`, the process memory that is really in use.
+    * `reclaimable` -- `file` + `slab_reclaimable`, the page cache plus the
+      shrinkable kernel caches: the "not really in use" bucket.
+
+    The raw keys ride along for a spot check against an in-container
+    `memory.stat`. Note the three summary numbers do NOT partition the charge
+    (kernel stacks, pagetables, sockets are charged too, and `shmem` is counted
+    inside `file` while behaving like anon memory) -- they are the three
+    magnitudes an operator compares, not a balance sheet.
+
+    Never raises. On a host without cgroup v2 -- a dev laptop, macOS, a v1
+    cgroup tree -- every field is None and the console renders "unavailable";
+    the root is a parameter so all of that is testable off a fixture dir.
+    """
+    root = Path(cgroup_root)
+    charged = _read_int_file(root / _CGROUP_CURRENT)
+    stat = _read_stat_keys(root / _CGROUP_STAT, _CGROUP_STAT_KEYS)
+    out: "dict[str, int | None]" = {
+        "charged": charged,
+        "resident": stat["anon"],
+        "reclaimable": _sum_or_none(stat["file"], stat["slab_reclaimable"]),
+    }
+    out.update(stat)
+    return out
 
 
 def disk_usage(path: "str | os.PathLike[str]") -> "dict | None":

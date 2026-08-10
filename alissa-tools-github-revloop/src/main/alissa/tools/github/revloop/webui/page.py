@@ -165,7 +165,7 @@ header.top h1 {
 
 /* stat tiles: seamless 1px-gap grid */
 .tiles {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px;
   background: var(--surface-border); border: 1px solid var(--surface-border);
   border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 2rem;
 }
@@ -182,6 +182,9 @@ header.top h1 {
 .meter.crit > span { background: var(--status-cancelled); }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+/* Five tiles do not fit a laptop viewport at the tile's own type scale; the
+   900px rule below must stay LAST so the narrow case still wins. */
+@media (max-width: 1100px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; }
   .tiles { grid-template-columns: repeat(2, 1fr); } }
 
@@ -332,6 +335,11 @@ _DASHBOARD = """<!doctype html>
 <section class="panel"><p class="overline">Sessions</p><div id="sessions"></div></section>
 
 <section class="panel">
+  <p class="overline">Top Processes &middot; by RSS, host-wide</p>
+  <div id="topprocs"></div>
+</section>
+
+<section class="panel">
   <p class="overline">Daemon Log &middot; <span id="log-path" class="mono muted"></span></p>
   <div class="log" id="log"></div>
 </section>
@@ -422,6 +430,21 @@ _JS = r"""
       var vsub = bytes(t.volume.used_bytes) + ' / ' + bytes(t.volume.total_bytes);
       out += tile('Volume', t.volume.percent + '%', vsub, t.volume.percent);
     } else { out += tile('Volume', '--', 'unavailable'); }
+    // The tile a platform memory graph sends you here to read: the headline is
+    // what the container is CHARGED, the sub splits it into what is really
+    // process memory and what is cache the kernel would drop under pressure --
+    // so a "6 GB" plateau reads as "72 MB real + 5.9 GB cache" at a glance.
+    // The meter is the RESIDENT share of the charge, deliberately: it is the
+    // only part of a rising charge that a limit can actually kill for, so the
+    // shared warn/crit thresholds mean the same thing here as on the others.
+    var mem = t.memory;
+    if (mem && mem.charged != null) {
+      var msub = (mem.resident == null ? '--' : bytes(mem.resident)) + ' resident · ' +
+        (mem.reclaimable == null ? '--' : bytes(mem.reclaimable)) + ' reclaimable';
+      var mpct = (mem.resident == null || !mem.charged) ? null :
+        Math.round(100 * mem.resident / mem.charged);
+      out += tile('Container Memory', bytes(mem.charged), msub, mpct);
+    } else { out += tile('Container Memory', '--', 'no cgroup v2'); }
     out += tile('Review Queue', t.queue_depth, 'PRs awaiting me, last poll');
     el('tiles').innerHTML = out;
   }
@@ -524,6 +547,25 @@ _JS = r"""
     });
   }
 
+  // Host-wide, not per session: it names whatever holds a resident charge,
+  // which is routinely not a reviewer at all. Read-only -- no kill button
+  // here, because these PIDs are unmanaged and the sessions panel above is
+  // the only place a process should be killed from.
+  function renderTopProcs(rows) {
+    rows = rows || [];
+    if (!rows.length) {
+      el('topprocs').innerHTML = '<div class="empty">No process data (/proc unreadable).</div>';
+      return;
+    }
+    var head = '<table><thead><tr><th class="num">PID</th><th>Process</th>' +
+      '<th class="num">RSS</th></tr></thead><tbody>';
+    el('topprocs').innerHTML = head + rows.map(function (p) {
+      return '<tr><td class="num mono">' + esc(p.pid) + '</td>' +
+        '<td class="mono">' + esc(p.comm) + '</td>' +
+        '<td class="num">' + bytes(p.rss_bytes) + '</td></tr>';
+    }).join('') + '</tbody></table>';
+  }
+
   function renderLog(log) {
     el('log-path').textContent = log.path || '(no log configured)';
     el('log').textContent = log.lines.length ? log.lines.join('\n') : '(log empty or unavailable)';
@@ -558,6 +600,7 @@ _JS = r"""
     renderPipeline(d.pipeline);
     renderInbox(d.inbox);
     renderSessions(d.sessions);
+    renderTopProcs(d.top_procs);
     renderLog(d.log);
     var when = new Date(d.generated_at * 1000).toLocaleTimeString();
     el('status-line').textContent = 'updated ' + when;
