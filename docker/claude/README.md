@@ -234,7 +234,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_WORKER_INTERVAL` | `2` | worker reconcile tick (seconds) |
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |
 | `ALISSA_FIREWALL_EXTRA` | *(empty)* | extra firewall allowlist hosts, space-separated |
-| `ALISSA_FORCE_CHOWN` | `0` | `1` forces the root phase's full `chown -R` of the volume for that boot. Off by default: the entrypoint probes ownership at depth 1 and walks only when it finds a foreign owner (see [Boot-time ownership](#boot-time-ownership-the-volume-walk-is-guarded)). Set it for **one** boot after a root shell wrote files deeper in the tree |
+| `ALISSA_FORCE_CHOWN` | `0` | `1`/`true`/`yes`/`on` forces the root phase's full `chown -R` of the volume for that boot; anything else (incl. unset) leaves the probe in charge. Off by default: the entrypoint probes ownership at depth 1 and walks only when it finds a foreign owner (see [Boot-time ownership](#boot-time-ownership-the-volume-walk-is-guarded)). Set it for **one** boot after a root shell wrote files deeper in the tree |
 
 #### Config precedence: env var > daemon library default
 
@@ -273,16 +273,30 @@ cgroup limit), but it plateaus flat from the moment of deploy and makes the
 memory graph useless for spotting a real problem.
 
 So step 0 now **probes before it walks**: one `stat` over the mount point and its
-immediate children, and the `chown -R` runs only if something there is not owned
-by `alissa`. The probe is O(top-level entries) by construction — deliberately not
-`find … ! -user alissa`, which stats every inode and would recreate the same slab
-storm. A first boot on a fresh root-owned volume is unaffected: the mount point
-itself is root-owned, so the probe trips and the full walk runs exactly as before.
+immediate children, and the `chown -R` runs only if something there is not
+`alissa:alissa`. Owner **and** group, because that is what the walk asserts — a
+probe testing only the owner would read an `alissa:root` entry as clean, and the
+unconditional every-boot walk that used to repair the group is exactly what this
+change removes. The probe is O(top-level entries) by construction — deliberately
+not `find … ! -user alissa`, which stats every inode and would recreate the same
+slab storm. A first boot on a fresh root-owned volume is unaffected: the mount
+point itself is root-owned, so the probe trips and the full walk runs exactly as
+before.
 
-The blind spot is a root-owned file created **deeper** than depth 1 — realistically,
-a platform console shell running as root. `ALISSA_FORCE_CHOWN=1` is the escape
-hatch: it skips the probe and forces the full walk for that boot. Set it, restart,
-then unset it.
+The blind spot is precisely one thing: **depth**. Anything below the mount point's
+immediate children is invisible to the probe — realistically, a platform console
+shell running as root. `ALISSA_FORCE_CHOWN=1` is the escape hatch: it skips the
+probe and forces the full walk for that boot. Set it, redeploy, then unset it.
+
+Two failure modes are worth knowing about, because the guard changed their
+consequences. A walk that **fails** partway (a permission error deep in the tree)
+still processes the mount point and its children — `chown -R` is post-order and
+continues past per-entry errors — so the probe would read the tree as clean
+forever after. The entrypoint therefore logs `WARNING: chown -R … reported errors`
+and names `ALISSA_FORCE_CHOWN=1` as the remedy; that warning is the only signal
+there is, so it is worth alerting on. A walk that is **interrupted** (the container
+is killed mid-boot) is self-healing for the same post-order reason: the mount point
+is chowned last, so a partial walk leaves the probe tripping on the next boot.
 
 Reclaiming the cache after the fact is not an option on Railway: `/sys/fs/cgroup`
 is mounted read-only inside the container, so writing `memory.reclaim` fails with
@@ -689,8 +703,9 @@ volumes:
    persisted. A bad role or an unarmed executor **dies here**, before any
    bootstrap. See [Bridge executor role](#bridge-executor-role-a-second-service-from-this-same-image).
 0b. As root: make the `/workspace` mount writable by `alissa` — probing
-   ownership at depth 1 and running the full `chown -R` only when the probe finds
-   a foreign owner or `ALISSA_FORCE_CHOWN=1` says so
+   ownership (owner **and** group) at depth 1 and running the full `chown -R` only
+   when the probe finds something foreign or `ALISSA_FORCE_CHOWN=1` says so, and
+   **warning** if that walk reports errors
    ([why](#boot-time-ownership-the-volume-walk-is-guarded)) — then (optionally)
    raise the egress firewall and drop to `alissa` via `gosu`. Everything below
    runs unprivileged.
