@@ -9,6 +9,11 @@ and enqueues sessions; the worker is what drains the queue and spawns reviewers,
 so the image bundles all three tiers (see the top-of-file comment in
 [`Dockerfile`](./Dockerfile)).
 
+The same image also serves a **second, separate service**: with
+`CONTAINER_ROLE=executor` it runs `alissa bridge start` as an Alissa Studio queue
+executor instead of the review loop. See
+[Bridge executor role](#bridge-executor-role-a-second-service-from-this-same-image).
+
 ## Build
 
 ```sh
@@ -437,6 +442,182 @@ docker run -d --name alissa-review \
 
 See [`init-firewall.sh`](./init-firewall.sh) for the allowlist.
 
+## Bridge executor role (a SECOND service from this same image)
+
+`CONTAINER_ROLE=executor` boots this image as an **Alissa Studio queue
+executor** instead of the review daemon. The executor is `alissa bridge start`:
+it registers a `bridgeExecutors` row, polls `/v1/bridge/jobs`, and runs each
+claimed job as an `alissa code --handoff claude` session in its own tmux session
+inside the workspace hubs.
+
+### Why a separate service, and not a sidecar of the daemon
+
+This is a pinned decision, recorded here so it survives the next round of
+refactoring:
+
+1. **Different restart domains.** A queue job is a tmux session that runs for
+   hours (6h default budget). Every revloop redeploy or restart would kill the
+   in-flight ones, and each hand-back costs the job a retry attempt
+   (`reconcileResumed`, attempt + 1). The review daemon redeploys often; the
+   executor must not.
+2. **A separate service is a separate environment, and that is a security
+   control.** The executor resolves a job spec's env **names** out of its own
+   process environment (`resolveJobEnv`), so *every variable this service holds
+   is nameable by any queue agent belonging to the token's user*. Running it as
+   its own service is what lets you give it a minimal credential set instead of
+   the review daemon's full one. See [Exactly what a job spec can
+   name](#exactly-what-a-job-spec-can-name) below.
+3. **An in-container background sidecar was considered and rejected.** That
+   pattern (the devloop repo's UI console) is fine for a stateless console; it is
+   wrong for hour-long stateful jobs, for reason 1.
+
+The entrypoint enforces the split by construction rather than by convention: the
+executor role `exec`s the CLI, so the container's only process is the executor —
+no `alissa worker`, no `alissa-revloop`, no console. And the daemon role never
+starts a bridge, however the `ALISSA_BRIDGE_*` variables are set. Both directions
+are asserted in
+[`tests-entrypoint-executor.sh`](./tests-entrypoint-executor.sh).
+
+### Deploying it
+
+Same image, same Dockerfile, no second build. On Railway: add a second service
+from this repo, attach **its own** volume at `/workspace`, and set the runtime
+variables below. Locally:
+
+```sh
+docker run -d --name alissa-bridge-executor \
+  -e CONTAINER_ROLE=executor \
+  -e ALISSA_BRIDGE_EXECUTOR=1 \
+  -e ALISSA_BRIDGE_EXECUTOR_ID=revloop-executor \
+  -e ALISSA_BRIDGE_LABEL="Revloop executor" \
+  -e ALISSA_API_TOKEN=alissa_… \
+  -e GH_TOKEN=ghp_… \
+  -e ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" \
+  -v alissa-executor-workspace:/workspace \
+  alissa-review-daemon
+```
+
+Extra CMD args pass through to `alissa bridge start`, so
+`docker run … alissa-review-daemon --once` is a one-poll smoke test.
+
+### Configuration (runtime env only — no build ARGs)
+
+Unlike the daemon knobs, none of these is a build ARG. `CONTAINER_ROLE` is what
+makes one image serve two services, so baking it would make the artifact
+role-specific; `ALISSA_BRIDGE_EXECUTOR` is an arming gate, so it ships unset; and
+the rest only mean anything on a service that already set those two.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CONTAINER_ROLE` | `daemon` | `executor` selects this role. Any other value **dies at boot** naming the two the image ships |
+| `ALISSA_BRIDGE_EXECUTOR` | *(unset ⇒ off)* | the arming gate: `1`/`true`/`yes`/`on`. With the role set and this off, the container **refuses cleanly** and registers nothing — selecting the role is not consent to claim jobs |
+| `ALISSA_BRIDGE_EXECUTOR_ID` | `revloop-executor` | **required** (an explicitly empty value is fatal), validated as a slug at boot. It **must differ from every other executor of the same Alissa user** — the devloop image's executor above all. Identity is `(userId, executorId)` and registration *takes over* an existing row, so a shared id means two services evicting each other in a loop and stranding every sticky claim pinned to it. Never left to the CLI's own fallback (a slugified hostname, which on a platform is a fresh string per deploy) |
+| `ALISSA_BRIDGE_HANDOFF` | `claude` | agent used when a job spec names none. Structural, like `ALISSA_AGENT_PROFILE`: it must name a profile in the baked [`agents.yaml`](./agents.yaml) |
+| `ALISSA_BRIDGE_LABEL` | *(CLI default: the hostname)* | human name shown in Studio; **pass-through** — unset ⇒ the CLI decides |
+| `ALISSA_BRIDGE_MAX_CONCURRENT` | *(CLI default)* | jobs to run at once (the CLI clamps to 1–16); **pass-through** |
+| `ALISSA_BRIDGE_POLL_SECONDS` | *(CLI default: 15)* | seconds between queue polls; maps to the CLI's `--interval`; **pass-through** |
+
+The model pin works exactly as it does for the daemon: `ALISSA_AGENT_MODEL`
+(default `opus`) is rewritten into the `claude` profile's `command:` at boot, and
+job sessions inherit it. The profile deliberately carries **no**
+`disable_alissa_code`, which is what makes the CLI launch it via `alissa code -y
+--handoff claude` — that wrapper is what registers the codeSession and its
+10-minute log checkpoints. Adding the flag would launch a bare `claude` and lose
+both.
+
+### Exactly what a job spec can name
+
+A job spec carries environment variable **names**, never values; the executor
+resolves each name against its own process environment and fails the job
+(`spec_rejected`) if one is missing. So the set of variables a queue agent can
+pull into a job session is *exactly the set this service holds*. Keep it minimal.
+
+What the executor genuinely needs:
+
+| Variable | Why |
+| --- | --- |
+| `ALISSA_API_TOKEN` | polls the job queue and reports results — without it there is no executor |
+| `GH_TOKEN` (or `GITHUB_TOKEN`) | the workspace bootstrap clones the hubs, and job sessions do the repo work |
+| `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | only if you are not using the persisted `claude /login` on the volume (which is preferred — see [claude auth](#claude-auth-log-in-once-persisted-on-the-volume-recommended)) |
+| `ALISSA_REVIEW_REPOS` | the repo allowlist the manifest (and therefore the hubs) is built from |
+
+What it must **not** carry:
+
+* **the reviewer's GitHub token.** An executor posts no verdicts. If
+  `ALISSA_REVIEWER_TOKEN_ENV` is set on an executor service the entrypoint warns
+  and ignores it — but the *token itself* being present is the problem, because a
+  job spec can name it.
+* **`ALISSA_UI_PASSCODE`.** The console is a review-loop surface and is never
+  started in this role.
+* anything else the review daemon happens to hold. Copying the daemon service's
+  variable set across is the mistake this whole split exists to prevent.
+
+### Persistence, and what happens when the volume is not there
+
+Two things have to outlive a redeploy, and both live on the `/workspace` volume —
+plus a third that lands there as a consequence, and that you should know about:
+
+* **the executor identity** — `${ALISSA_CONFIG_DIR}/bridge-executor.json`, the id
+  plus the fingerprint Studio displays. In this role `ALISSA_CONFIG_DIR` defaults
+  to `/workspace/.alissa-config` (the CLI's own default is the *ephemeral* home,
+  which would mint a new fingerprint on every boot and re-register as a changed
+  machine). Set it explicitly only if you move the volume.
+* **the claude credential** — `CLAUDE_CONFIG_DIR`, already `/workspace/.claude-config`
+  in this image. The entrypoint verifies it is under the workspace root and warns
+  if a deploy moved it off; a queue job is long and unattended, and re-logging in
+  is manual.
+
+* **the Alissa API token — a consequence, not a goal.** `alissa auth login` (the
+  same preflight the daemon role runs) writes the *verified* `ALISSA_API_TOKEN`
+  in cleartext to `${ALISSA_CONFIG_DIR}/config.json` with default permissions.
+  Relocating that directory onto the volume therefore moves that secret from the
+  ephemeral home to persistent storage. Nothing about the executor needs it
+  persisted — it is the price of persisting the identity file that sits beside
+  it — but the volume now holds a live credential, so give it the same handling
+  you would give any credential store: no snapshots into shared buckets, no
+  attaching it to a second service to "have a look", and rotate the token if the
+  volume is ever exposed. This is the same class of exposure as
+  [Exactly what a job spec can name](#exactly-what-a-job-spec-can-name) above,
+  one layer down: that section is about what a job can *read from the process*,
+  this is about what sits *on the disk*.
+
+The resolved `agents.yaml` is copied into the executor's config dir on **every**
+boot, so the image — not a file left behind by an older image — is always the
+source of truth for the profile.
+
+The CLI's executor **lockfile** (`…/bridge/executor-<id>.lock`) also lands in
+that directory, and it is deliberately *not* treated as persistent state: the
+entrypoint deletes this executor's lock immediately before starting. A lock is a
+claim that a process on this machine is already running, decided by a bare
+`kill(pid, 0)`; a container that died ungracefully leaves one behind, and the
+next boot's fresh PID namespace can easily make that dead PID look alive —
+refusing to start, forever. A fresh container has no executor running by
+definition, so the lock is stale by construction. Only *this* executor's lock is
+removed, never every `executor-*.lock`, so a lock belonging to some other id is
+left alone rather than pulled out from under whoever owns it.
+
+Volume unavailability is **not** fatal. Because the identity dir is the same
+directory the `alissa auth login` preflight probes, a missing or root-owned mount
+lands in that gate's "config dir unwritable" class: it logs what it saw and
+retries with capped backoff, forever, and proceeds the moment the mount appears —
+[the same posture](#alissa-auth-failures-are-triaged-not-guessed) the rest of the
+entrypoint takes, and deliberately not a crash loop.
+
+### Firewall
+
+The egress allowlist is shared by both roles and **verified**, not assumed: a job
+session needs the Alissa API (`api.alissa.app`), `api.anthropic.com`, GitHub
+(`github.com`, `api.github.com`, `codeload.github.com`,
+`objects.githubusercontent.com`) and the skill/installer hosts
+(`skills.alissa.app`, `share.alissa.app`), and every one of those is already in
+[`init-firewall.sh`](./init-firewall.sh). Nothing had to be added for this role.
+`firewall_domains` there is sourceable precisely so
+[`tests-entrypoint-executor.sh`](./tests-entrypoint-executor.sh) asserts that
+membership against the shipped list instead of a second copy of it. Package
+registries (`registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`) are
+allowed too, which a job that installs dependencies will want; extend with
+`ALISSA_FIREWALL_EXTRA` for anything else.
+
 ## docker-compose
 
 ```yaml
@@ -465,7 +646,11 @@ volumes:
 
 ## What the entrypoint does
 
-0. As root: `chown` the `/workspace` mount to `alissa`, (optionally) raise the
+0. Resolve `CONTAINER_ROLE` (`daemon` by default) and, in the `executor` role,
+   its gates — the arming flag, the executor id, and where the identity is
+   persisted. A bad role or an unarmed executor **dies here**, before any
+   bootstrap. See [Bridge executor role](#bridge-executor-role-a-second-service-from-this-same-image).
+0b. As root: `chown` the `/workspace` mount to `alissa`, (optionally) raise the
    egress firewall, then drop to `alissa` via `gosu`. Everything below runs
    unprivileged.
 1. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
@@ -483,6 +668,11 @@ volumes:
    daemon's on-demand `alissa code workspace add` no-ops on a repo already listed
    in the manifest, leaving an empty folder and looping forever hub-ifying a hub
    that never completes.
+3d. **Executor role only, and the end of the shared path**: drop this executor's
+   stale lockfile, then `exec alissa bridge
+   start …`. `exec`, so the container's only process is the executor — steps 4
+   and 5 below never run in this role, and the daemon role never reaches this
+   step. Nothing after this point applies to an executor service.
 4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).
 4b. When `ALISSA_UI_ENABLED` is set, start the reviewer console

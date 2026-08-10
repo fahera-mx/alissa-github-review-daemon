@@ -81,6 +81,12 @@ To run the whole loop unattended in Docker — the poller, an `alissa worker`, a
 the `claude` reviewer it spawns, bundled in one image — see
 [`docker/claude/`](./docker/claude/README.md).
 
+That image also serves a second, separate role: `CONTAINER_ROLE=executor` runs
+`alissa bridge start` (an Alissa Studio queue executor) instead of the review
+loop, deployed as its own service so hours-long queue jobs never share a restart
+domain with the daemon. See
+[Bridge executor role](./docker/claude/README.md#bridge-executor-role-a-second-service-from-this-same-image).
+
 ### Settings
 
 Three layers, each winning over the one before: **defaults → config file → CLI**.
@@ -748,12 +754,15 @@ bash check-style.sh alissa-tools-github-revloop
 bash check-types.sh alissa-tools-github-revloop
 ```
 
-The container entrypoint has its own two shell suites (no docker needed — the
-CLIs it shells out to are stubbed):
+The container entrypoint has its own shell suites (no docker needed — the CLIs it
+shells out to are stubbed, and the entrypoint under test is the real one):
 
 ```sh
-bash docker/claude/tests-entrypoint-config.sh   # config renderer pass-through
-bash docker/claude/tests-entrypoint-ui.sh       # reviewer-console wiring
+bash docker/claude/tests-entrypoint-config.sh    # config renderer pass-through
+bash docker/claude/tests-entrypoint-identity.sh  # reviewer-identity preflight
+bash docker/claude/tests-entrypoint-auth.sh      # alissa auth failure triage
+bash docker/claude/tests-entrypoint-executor.sh  # bridge-executor role + gates
+bash docker/claude/tests-entrypoint-ui.sh        # reviewer-console wiring
 ```
 
 282 tests cover the decision state machine, the config layering, the

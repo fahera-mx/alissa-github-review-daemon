@@ -11,6 +11,24 @@
 #
 # The daemon is a thin poller; the worker is what actually spawns reviewers, so
 # the worker MUST be running first — the daemon only warns if it isn't.
+#
+# TWO ROLES, ONE IMAGE (CONTAINER_ROLE, issue #73)
+# ------------------------------------------------
+# `CONTAINER_ROLE=executor` boots this same image as an Alissa Studio queue
+# EXECUTOR instead: it shares steps 0-3 (identities, workspace bootstrap, hub
+# sync) and then `exec`s `alissa bridge start` — no worker, no console, no
+# `alissa-revloop`. The executor is a SEPARATE SERVICE, not a sidecar of the
+# daemon, and the split is the point:
+#
+#   * queue jobs are hours-long tmux sessions; a revloop redeploy would kill
+#     them mid-run and burn a retry attempt each. Different restart domain.
+#   * the executor resolves a job spec's env NAMES out of its OWN process env,
+#     so every variable this service holds is nameable by any queue agent of the
+#     token's user. A separate service is what keeps that set minimal — see
+#     "Bridge executor role" in docker/claude/README.md.
+#
+# So the two roles never share a process chain: whichever one is selected, the
+# other's supervisor is never started.
 # =============================================================================
 set -euo pipefail
 
@@ -27,6 +45,92 @@ ENTRYPOINT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="${ALISSA_WORKSPACE_ROOT:-/workspace}"
 WORKSPACE_NAME="${ALISSA_WORKSPACE:-alissa-review}"
 RUNTIME_USER=alissa
+
+# Truthiness for the container's on/off flags: 1/true/yes/on (case-insensitive),
+# anything else — including unset — is off. Shared by the console gate (2d) and
+# the bridge-executor gate below, so those two cannot drift apart.
+#
+# NOT used by the ALISSA_ENABLE_FIREWALL gate in the root block, which still
+# tests `= "1"` exactly — a pre-existing narrower contract, left alone here on
+# purpose (TASK-112733143): widening it would make a deploy that today sets
+# `true`, gets no firewall and therefore never passed --cap-add=NET_ADMIN start
+# attempting the firewall init and die on it. That is a rollout, not a drive-by.
+is_truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# Role selection + the executor's gates (issue #73).
+#
+# Resolved FIRST, before any bootstrap: a role/gate misconfiguration is a deploy
+# mistake, and the cheapest place to say so is the top of the log. This block
+# runs on the root pass too, so a refusal happens before the privilege drop.
+# -----------------------------------------------------------------------------
+CONTAINER_ROLE="$(printf '%s' "${CONTAINER_ROLE:-daemon}" | tr '[:upper:]' '[:lower:]')"
+case "${CONTAINER_ROLE}" in
+  daemon|executor) ;;
+  *) die "CONTAINER_ROLE=${CONTAINER_ROLE} is not a role this image ships. Use 'daemon' (the review loop, the default) or 'executor' (an Alissa Studio queue executor running 'alissa bridge start')." ;;
+esac
+
+BRIDGE_EXECUTOR_ID=""
+BRIDGE_HANDOFF=""
+if [ "${CONTAINER_ROLE}" = "executor" ]; then
+  # (a) The master gate. Default OFF: selecting the role is not consent to run
+  #     one. An executor claims queued jobs from the whole user's queue and runs
+  #     them as unattended agent sessions holding this service's credentials, so
+  #     it takes TWO explicit settings to arm — and a service that only has the
+  #     role set refuses cleanly instead of quietly registering itself.
+  is_truthy "${ALISSA_BRIDGE_EXECUTOR:-0}" \
+    || die "CONTAINER_ROLE=executor but ALISSA_BRIDGE_EXECUTOR=${ALISSA_BRIDGE_EXECUTOR:-0} (default off) — refusing to register an executor or claim any job. Set ALISSA_BRIDGE_EXECUTOR=1 on THIS service to arm it (see 'Bridge executor role' in docker/claude/README.md), or unset CONTAINER_ROLE to run the review daemon."
+
+  # (b) The executor id, which is the identity half of the registry key
+  #     (userId, executorId). Registration TAKES OVER an existing row with the
+  #     same key, so two executors of the same user sharing an id evict each
+  #     other in a loop and strand every sticky claim pinned to it. Hence:
+  #     defaulted (never the CLI's slugified-hostname fallback, which on a
+  #     platform is a random per-deploy string), required non-empty, and
+  #     validated here so a bad slug fails at boot instead of at register time.
+  #     `-` not `:-`: an explicitly EMPTY value is an error, not a request for
+  #     the default — it is exactly how a deploy silently falls back to the
+  #     hostname slug.
+  BRIDGE_EXECUTOR_ID="${ALISSA_BRIDGE_EXECUTOR_ID-revloop-executor}"
+  [ -n "${BRIDGE_EXECUTOR_ID}" ] \
+    || die "ALISSA_BRIDGE_EXECUTOR_ID is set but EMPTY — an executor id is required. Leave it unset for the default 'revloop-executor', or give this service its own id; it MUST differ from every other executor of the same Alissa user (the devloop image's executor included), because registering the same id takes the other one over."
+  #     The pattern is the CLI's own EXECUTOR_ID_RE, length bound included: an
+  #     unbounded version would pass a 65-character id here and let it die
+  #     inside `alissa bridge start` after the whole bootstrap had run — which
+  #     is the register-time failure this gate exists to convert into a boot-time
+  #     one.
+  printf '%s' "${BRIDGE_EXECUTOR_ID}" | grep -qE '^[a-z0-9][a-z0-9-]{0,63}$' \
+    || die "ALISSA_BRIDGE_EXECUTOR_ID=${BRIDGE_EXECUTOR_ID} is not a valid executor id — lowercase letters, digits and dashes, starting with a letter or digit, at most 64 characters (e.g. 'revloop-executor')."
+
+  # (c) Which agent runs a job whose spec names none. STRUCTURAL, like
+  #     agent_profile: it must name a profile the baked agents.yaml ships, and
+  #     that file defines exactly `claude`. Drifting to the CLI's own default
+  #     would select a profile this image may not have.
+  BRIDGE_HANDOFF="${ALISSA_BRIDGE_HANDOFF:-claude}"
+
+  # (d) Identity persistence. The CLI keeps the executor identity (its id and
+  #     the fingerprint Studio shows) in ${ALISSA_CONFIG_DIR}/bridge-executor.json,
+  #     which defaults to the EPHEMERAL home — so every redeploy would mint a new
+  #     fingerprint and re-register as a changed machine. Point the whole config
+  #     dir at the persisted volume instead (it also holds the verified API token,
+  #     same posture as the claude credential already kept there), and EXPORT it
+  #     so the CLI actually sees it.
+  #
+  #     Volume unavailability is handled, not crashed on: this is the same dir
+  #     the auth preflight's writability probe (class 2 below) guards, so a mount
+  #     that is missing or root-owned degrades to that capped backoff — log and
+  #     retry forever, never a crash loop (2026-07-29 lesson).
+  export ALISSA_CONFIG_DIR="${ALISSA_CONFIG_DIR:-${WORKSPACE_ROOT}/.alissa-config}"
+  # Logged once, after the privilege drop — this block runs on both passes.
+  ROLE_SUMMARY="EXECUTOR — id=${BRIDGE_EXECUTOR_ID}, handoff=${BRIDGE_HANDOFF}, identity file ${ALISSA_CONFIG_DIR}/bridge-executor.json"
+else
+  ROLE_SUMMARY="daemon (review loop)"
+fi
 
 # -----------------------------------------------------------------------------
 # 0. Privilege bootstrap (runs only on the first pass, as root)
@@ -58,6 +162,8 @@ if [ "$(id -u)" = "0" ]; then
   exec gosu "${RUNTIME_USER}" "$0" "$@"
 fi
 
+log "role: ${ROLE_SUMMARY}"
+
 # -----------------------------------------------------------------------------
 # 1. Preflight the three identities
 #
@@ -82,6 +188,22 @@ else
   log "WARN: no persisted claude login and no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN — run 'claude /login' once (see README); reviewers will 401 until then"
 fi
 
+# 2a-ii. Executor role: the claude credential has to OUTLIVE a redeploy, because
+#        a queue job is an hours-long agent session and a re-login is manual. The
+#        image points CLAUDE_CONFIG_DIR at the volume already; verify it rather
+#        than assume it, and WARN (never die) if a deploy has moved it off — the
+#        executor still runs, it just loses the login on the next restart.
+if [ "${CONTAINER_ROLE}" = "executor" ]; then
+  case "${CLAUDE_CONFIG_DIR:-}" in
+    "${WORKSPACE_ROOT}"/*|"${WORKSPACE_ROOT}")
+      log "claude config persisted on the volume: ${CLAUDE_CONFIG_DIR}" ;;
+    "")
+      log "WARN: CLAUDE_CONFIG_DIR is unset — a 'claude /login' lands in the ephemeral home and is gone on the next redeploy. Point it at a path under ${WORKSPACE_ROOT}." ;;
+    *)
+      log "WARN: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} is not under ${WORKSPACE_ROOT} — if that path is not a persisted mount, a 'claude /login' is gone on the next redeploy and job sessions 401 until someone logs in again." ;;
+  esac
+fi
+
 # 2b. gh — the review queue, round counting, PR comments. gh reads GH_TOKEN /
 #     GITHUB_TOKEN from the environment automatically.
 if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
@@ -101,7 +223,16 @@ log "gh authenticated as: ${GH_LOGIN}"
 # token routes every daemon `gh` call through it explicitly. We resolve it here
 # so a bad credential fails at boot with a login in the log, not silently at the
 # first verdict; the daemon re-asserts the same identity before every post.
-if [ -n "${ALISSA_REVIEWER_TOKEN_ENV:-}" ]; then
+if [ "${CONTAINER_ROLE}" = "executor" ]; then
+  # An executor posts no verdicts, so it needs no reviewer identity — and it
+  # must not HOLD one. `resolveJobEnv` resolves a job spec's env names out of
+  # this process's environment, so any credential parked on this service is
+  # nameable by any queue agent of the token's user. Say so rather than
+  # silently ignoring the variable.
+  if [ -n "${ALISSA_REVIEWER_TOKEN_ENV:-}" ]; then
+    log "WARN: ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} is set on an EXECUTOR service. The executor posts no reviews, so it is unused — and a job spec can name any variable this service holds. Drop the reviewer credential from this service's env."
+  fi
+elif [ -n "${ALISSA_REVIEWER_TOKEN_ENV:-}" ]; then
   # Indirect expansion: read the variable whose NAME is in
   # ALISSA_REVIEWER_TOKEN_ENV. The `:-` keeps `set -u` from aborting when that
   # variable does not exist, so the empty check below is what reports it.
@@ -312,12 +443,19 @@ done
 # Truthiness matches the sidecar's own _env_flag (1/true/yes/on, case-insensitive)
 # so `ALISSA_UI_ENABLED=true` behaves like `=1`; anything else (incl. unset) is off.
 # -----------------------------------------------------------------------------
+#
+# The console renders the review loop's own panels (spawn ledger, review-*
+# sessions), of which an executor has none — so the executor role never starts
+# it, and says so if a deploy asked for one.
 UI_ENABLED=0
-case "$(printf '%s' "${ALISSA_UI_ENABLED:-0}" | tr '[:upper:]' '[:lower:]')" in
-  1|true|yes|on) UI_ENABLED=1 ;;
-esac
+if is_truthy "${ALISSA_UI_ENABLED:-0}"; then UI_ENABLED=1; fi
 UI_PORT="${PORT:-8080}"
-if [ "${UI_ENABLED}" = "1" ]; then
+if [ "${CONTAINER_ROLE}" = "executor" ]; then
+  [ "${UI_ENABLED}" = "1" ] \
+    && log "WARN: ALISSA_UI_ENABLED is set on an EXECUTOR service — the reviewer console is a review-loop surface and is NOT started here; no listener." \
+    || log "reviewer console not applicable in the executor role — no listener"
+  UI_ENABLED=0
+elif [ "${UI_ENABLED}" = "1" ]; then
   [ -n "${ALISSA_UI_PASSCODE:-}" ] \
     || die "ALISSA_UI_ENABLED is set but ALISSA_UI_PASSCODE is empty — the console is fail-closed on the passcode (it is the ONLY gate, and it rides the public URL once you enable networking). Set ALISSA_UI_PASSCODE, or unset ALISSA_UI_ENABLED."
   log "reviewer console ENABLED (ALISSA_UI_ENABLED) — will serve on 0.0.0.0:${UI_PORT} (passcode required)"
@@ -380,6 +518,38 @@ PY
   log "effective reviewer command: ${CLAUDE_CMD}"
 fi
 
+# 2e-ii. Executor role: put the resolved agents.yaml where the CLI will look.
+#
+# The CLI reads agent profiles from ${ALISSA_CONFIG_DIR}/agents.yaml, and the
+# role block at the top moved that dir onto the volume — so the baked profile
+# in the ephemeral home would be invisible and `alissa bridge start` would reject
+# every job with "no agent profile named claude". Copy the just-resolved file
+# across on EVERY boot (never generate-if-absent): the image is the source of
+# truth for the profile, and a copy left on the volume by an older image must not
+# outlive it. Both locations stay populated, so whichever one a job session
+# resolves finds the same profile.
+#
+# The profile deliberately carries no `disable_alissa_code`, which is what makes
+# the CLI launch it via `alissa code -y --handoff claude` — that is the wrapper
+# registering the codeSession and its 10-minute log checkpoints. Adding the flag
+# would launch a bare claude and lose both.
+if [ "${CONTAINER_ROLE}" = "executor" ] && [ -f "${AGENTS_YAML}" ]; then
+  EXECUTOR_AGENTS_YAML="${ALISSA_CONFIG_DIR}/agents.yaml"
+  if [ "${EXECUTOR_AGENTS_YAML}" = "${AGENTS_YAML}" ]; then
+    log "executor agent profiles: ${AGENTS_YAML} (config dir is the baked one)"
+  elif mkdir -p "${ALISSA_CONFIG_DIR}" 2>/dev/null \
+       && cp "${AGENTS_YAML}" "${EXECUTOR_AGENTS_YAML}" 2>/dev/null; then
+    log "executor agent profiles: copied ${AGENTS_YAML} -> ${EXECUTOR_AGENTS_YAML}"
+  else
+    # Non-fatal by design. The auth preflight above already proved this exact
+    # directory writable, so reaching here means the mount changed under us —
+    # and a mount blip must not become a crash loop (2026-07-29). The job that
+    # would have used the profile fails with the CLI's own "no agent profile"
+    # rejection, which is a per-job failure, not a dead service.
+    log "WARN: could not copy agents.yaml to ${EXECUTOR_AGENTS_YAML} (volume not writable?) — jobs will be rejected with 'no agent profile' until the next boot"
+  fi
+fi
+
 # -----------------------------------------------------------------------------
 # 3. Bootstrap the workspace (bootstrap-from-manifest model)
 #
@@ -432,7 +602,16 @@ if [ -n "$(repos_lines)" ]; then
   # the allowlist is the full set of repos the daemon may touch (on_missing_hub
   # only hub-ifies repos already in it), and the cloned hub dirs on the volume
   # are untouched by rewriting this text.
-  log "generating ${MANIFEST} + revloop.config.json from ALISSA_REVIEW_REPOS"
+  #
+  # The EXECUTOR role shares this exact flow — a queue job runs inside the same
+  # worktree hubs a reviewer does, so the manifest is what makes those hubs
+  # exist. It skips only revloop.config.json, which configures a daemon this
+  # service never starts.
+  if [ "${CONTAINER_ROLE}" = "executor" ]; then
+    log "generating ${MANIFEST} from ALISSA_REVIEW_REPOS (executor role: no revloop.config.json — no daemon here)"
+  else
+    log "generating ${MANIFEST} + revloop.config.json from ALISSA_REVIEW_REPOS"
+  fi
   {
     printf 'name: %s\n' "${WORKSPACE_NAME}"
     printf 'description: Containerized Alissa review daemon workspace\n'
@@ -453,17 +632,19 @@ if [ -n "$(repos_lines)" ]; then
   # own default applies (env var > library default, no shadowing entrypoint
   # layer). Structural keys (on_missing_hub, agent_profile) are always emitted.
   # See revloop-config.sh for the precedence contract and per-key rationale.
-  repos_json="$(repos_lines | jq -R . | jq -s -c .)"
-  # `|| true` because an EMPTY operator list is the normal case: the last
-  # filter in operators_lines is a grep, which exits 1 when it matches nothing,
-  # and under `set -e -o pipefail` that non-zero status would kill the
-  # entrypoint mid-bootstrap. jq's own status still propagates.
-  operators_json="$({ operators_lines || true; } | jq -R . | jq -s -c .)"
-  render_revloop_config "${repos_json}" "${operators_json}" > "${CONFIG}"
+  if [ "${CONTAINER_ROLE}" != "executor" ]; then
+    repos_json="$(repos_lines | jq -R . | jq -s -c .)"
+    # `|| true` because an EMPTY operator list is the normal case: the last
+    # filter in operators_lines is a grep, which exits 1 when it matches nothing,
+    # and under `set -e -o pipefail` that non-zero status would kill the
+    # entrypoint mid-bootstrap. jq's own status still propagates.
+    operators_json="$({ operators_lines || true; } | jq -R . | jq -s -c .)"
+    render_revloop_config "${repos_json}" "${operators_json}" > "${CONFIG}"
+  fi
 else
   # MOUNTED MODE: no allowlist in the env — respect a mounted workspace as-is.
   [ -f "${MANIFEST}" ] \
-    || die "no alissa-workspace.yaml mounted and ALISSA_REVIEW_REPOS is empty — nothing to review"
+    || die "no alissa-workspace.yaml mounted and ALISSA_REVIEW_REPOS is empty — nothing to work on (the manifest is what materializes the worktree hubs a reviewer, or a queue job, runs inside)"
   log "using mounted workspace at ${WORKSPACE_ROOT} (ALISSA_REVIEW_REPOS unset)"
 fi
 
@@ -542,8 +723,12 @@ PY
 # A fresh container has no reviewer running by definition (tmux server is down),
 # so every `spawns` row is stale: clear them and the daemon re-enqueues on its
 # first poll. `escalations` is kept, so capped-out PRs are not re-escalated.
+#
+# Daemon-only: the ledger belongs to `alissa-revloop`, which the executor role
+# never starts. An executor's own in-flight jobs are reconciled server-side
+# (`reconcileResumed`), not from this file.
 STATE_DB="${WORKSPACE_ROOT}/.revloop/state.db"
-if [ -f "${STATE_DB}" ]; then
+if [ "${CONTAINER_ROLE}" != "executor" ] && [ -f "${STATE_DB}" ]; then
   python3 - "${STATE_DB}" <<'PY' || true
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
@@ -577,7 +762,78 @@ if [ -f "${MANIFEST}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Start the worker, wait until it reports running.
+# 3d. EXECUTOR ROLE — hand the container over to `alissa bridge start`.
+#
+# This is the end of the shared path. `exec` replaces this shell, so tini's only
+# child is the executor itself: no worker, no console, no `alissa-revloop`, and
+# nothing of this entrypoint left to be torn down with them. That is the "not in
+# the daemon's process chain" property, enforced by construction rather than by
+# a flag someone has to remember.
+#
+# Flag mapping, on this repo's usual pass-through contract (env > CLI default,
+# no hidden entrypoint layer):
+#
+#   ALISSA_BRIDGE_EXECUTOR_ID   -> --executor-id     STRUCTURAL, always passed
+#   ALISSA_BRIDGE_HANDOFF       -> --handoff         STRUCTURAL, always passed
+#   ALISSA_BRIDGE_LABEL         -> --label           pass-through (unset: the CLI
+#                                                    falls back to the hostname)
+#   ALISSA_BRIDGE_MAX_CONCURRENT-> --max-concurrent  pass-through (CLI clamps 1-16)
+#   ALISSA_BRIDGE_POLL_SECONDS  -> --interval        pass-through (CLI default 15s)
+#
+# The two structural ones are pinned for the same reason `agent_profile` is: the
+# CLI's own fallbacks (slugified hostname, its default handoff) are wrong for a
+# platform container — a per-deploy hostname is an identity that takes over its
+# own registry row every redeploy, and a handoff this image has no profile for
+# rejects every job.
+#
+# Extra CMD args still pass through, so `docker run … --once` works for a smoke
+# test exactly as the daemon's flags do.
+# -----------------------------------------------------------------------------
+if [ "${CONTAINER_ROLE}" = "executor" ]; then
+  mkdir -p "${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}"
+
+  # Drop this executor's stale lockfile before starting.
+  #
+  # The CLI guards against two executors of the same id on one machine with
+  # ${ALISSA_CONFIG_DIR}/bridge/executor-<id>.lock, holding the owner's pid, and
+  # decides staleness with a bare `process.kill(pid, 0)` — no boot id, no start
+  # time, no cmdline. That was safe while the config dir was the ephemeral home,
+  # because a lock could not outlive its container. It is NOT safe now that the
+  # dir is on the volume: any ungraceful stop (OOM, platform hard-restart,
+  # SIGKILL after the grace period) leaves the file behind, and the next boot
+  # evaluates that pid against a fresh pid namespace that restarts at 1 and
+  # replays the same deterministic boot — so it can easily be live, and can even
+  # be this container's own executor (`exec` hands the CLI this shell's pid).
+  # The CLI then refuses to start, exits non-zero, the platform restarts it, and
+  # it repeats: a crash loop, which is the one thing this entrypoint must never
+  # cause (2026-07-29).
+  #
+  # Same argument step 3b makes for the spawn ledger: a fresh container has no
+  # executor running, by definition, so a lock found here is stale by
+  # construction. Scoped to OUR id and NOT globbed over `executor-*.lock`: if a
+  # config dir is ever shared with another container, a glob would delete a LIVE
+  # peer's lock. A stale lock under some other id is never consulted for ours,
+  # so leaving it is harmless.
+  rm -f "${ALISSA_CONFIG_DIR}/bridge/executor-${BRIDGE_EXECUTOR_ID}.lock" 2>/dev/null || true
+
+  BRIDGE_ARGS=( --executor-id "${BRIDGE_EXECUTOR_ID}"
+                --workspace-root "${WORKSPACE_ROOT}"
+                --handoff "${BRIDGE_HANDOFF}" )
+  if [ -n "${ALISSA_BRIDGE_LABEL:-}" ]; then
+    BRIDGE_ARGS+=( --label "${ALISSA_BRIDGE_LABEL}" )
+  fi
+  if [ -n "${ALISSA_BRIDGE_MAX_CONCURRENT:-}" ]; then
+    BRIDGE_ARGS+=( --max-concurrent "${ALISSA_BRIDGE_MAX_CONCURRENT}" )
+  fi
+  if [ -n "${ALISSA_BRIDGE_POLL_SECONDS:-}" ]; then
+    BRIDGE_ARGS+=( --interval "${ALISSA_BRIDGE_POLL_SECONDS}" )
+  fi
+  log "starting alissa bridge start (executor ${BRIDGE_EXECUTOR_ID}) over ${WORKSPACE_ROOT}"
+  exec alissa bridge start "${BRIDGE_ARGS[@]}" "$@"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Start the worker, wait until it reports running.  (daemon role only)
 # -----------------------------------------------------------------------------
 mkdir -p "${TMUX_TMPDIR:-/home/alissa/.tmux}"
 
