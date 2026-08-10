@@ -47,8 +47,14 @@ WORKSPACE_NAME="${ALISSA_WORKSPACE:-alissa-review}"
 RUNTIME_USER=alissa
 
 # Truthiness for the container's on/off flags: 1/true/yes/on (case-insensitive),
-# anything else — including unset — is off. One definition, so the console gate
-# (2d) and the bridge-executor gate below can never drift apart.
+# anything else — including unset — is off. Shared by the console gate (2d) and
+# the bridge-executor gate below, so those two cannot drift apart.
+#
+# NOT used by the ALISSA_ENABLE_FIREWALL gate in the root block, which still
+# tests `= "1"` exactly — a pre-existing narrower contract, left alone here on
+# purpose (TASK-112733143): widening it would make a deploy that today sets
+# `true`, gets no firewall and therefore never passed --cap-add=NET_ADMIN start
+# attempting the firewall init and die on it. That is a rollout, not a drive-by.
 is_truthy() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes|on) return 0 ;;
@@ -93,8 +99,13 @@ if [ "${CONTAINER_ROLE}" = "executor" ]; then
   BRIDGE_EXECUTOR_ID="${ALISSA_BRIDGE_EXECUTOR_ID-revloop-executor}"
   [ -n "${BRIDGE_EXECUTOR_ID}" ] \
     || die "ALISSA_BRIDGE_EXECUTOR_ID is set but EMPTY — an executor id is required. Leave it unset for the default 'revloop-executor', or give this service its own id; it MUST differ from every other executor of the same Alissa user (the devloop image's executor included), because registering the same id takes the other one over."
-  printf '%s' "${BRIDGE_EXECUTOR_ID}" | grep -qE '^[a-z0-9][a-z0-9-]*$' \
-    || die "ALISSA_BRIDGE_EXECUTOR_ID=${BRIDGE_EXECUTOR_ID} is not a valid executor id — lowercase letters, digits and dashes, starting with a letter or digit (e.g. 'revloop-executor')."
+  #     The pattern is the CLI's own EXECUTOR_ID_RE, length bound included: an
+  #     unbounded version would pass a 65-character id here and let it die
+  #     inside `alissa bridge start` after the whole bootstrap had run — which
+  #     is the register-time failure this gate exists to convert into a boot-time
+  #     one.
+  printf '%s' "${BRIDGE_EXECUTOR_ID}" | grep -qE '^[a-z0-9][a-z0-9-]{0,63}$' \
+    || die "ALISSA_BRIDGE_EXECUTOR_ID=${BRIDGE_EXECUTOR_ID} is not a valid executor id — lowercase letters, digits and dashes, starting with a letter or digit, at most 64 characters (e.g. 'revloop-executor')."
 
   # (c) Which agent runs a job whose spec names none. STRUCTURAL, like
   #     agent_profile: it must name a profile the baked agents.yaml ships, and
@@ -780,6 +791,31 @@ fi
 # -----------------------------------------------------------------------------
 if [ "${CONTAINER_ROLE}" = "executor" ]; then
   mkdir -p "${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}"
+
+  # Drop this executor's stale lockfile before starting.
+  #
+  # The CLI guards against two executors of the same id on one machine with
+  # ${ALISSA_CONFIG_DIR}/bridge/executor-<id>.lock, holding the owner's pid, and
+  # decides staleness with a bare `process.kill(pid, 0)` — no boot id, no start
+  # time, no cmdline. That was safe while the config dir was the ephemeral home,
+  # because a lock could not outlive its container. It is NOT safe now that the
+  # dir is on the volume: any ungraceful stop (OOM, platform hard-restart,
+  # SIGKILL after the grace period) leaves the file behind, and the next boot
+  # evaluates that pid against a fresh pid namespace that restarts at 1 and
+  # replays the same deterministic boot — so it can easily be live, and can even
+  # be this container's own executor (`exec` hands the CLI this shell's pid).
+  # The CLI then refuses to start, exits non-zero, the platform restarts it, and
+  # it repeats: a crash loop, which is the one thing this entrypoint must never
+  # cause (2026-07-29).
+  #
+  # Same argument step 3b makes for the spawn ledger: a fresh container has no
+  # executor running, by definition, so a lock found here is stale by
+  # construction. Scoped to OUR id and NOT globbed over `executor-*.lock`: if a
+  # config dir is ever shared with another container, a glob would delete a LIVE
+  # peer's lock. A stale lock under some other id is never consulted for ours,
+  # so leaving it is harmless.
+  rm -f "${ALISSA_CONFIG_DIR}/bridge/executor-${BRIDGE_EXECUTOR_ID}.lock" 2>/dev/null || true
+
   BRIDGE_ARGS=( --executor-id "${BRIDGE_EXECUTOR_ID}"
                 --workspace-root "${WORKSPACE_ROOT}"
                 --handoff "${BRIDGE_HANDOFF}" )

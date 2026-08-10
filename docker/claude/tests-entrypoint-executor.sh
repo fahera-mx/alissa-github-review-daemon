@@ -22,8 +22,12 @@
 #                                            appear when they are set
 #   5. daemon role, bridge env set        -> still the daemon; bridge never runs
 #   6. unknown CONTAINER_ROLE             -> dies naming the two it ships
+#   4b. the id length bound              -> matches the CLI's own 64, so a long
+#                                            id is refused at boot, not later
 #   7. volume unwritable                  -> capped backoff, NOT a crash loop,
 #                                            and it self-heals mid-flight
+#   7b. a stale executor lock             -> swept, so persisting the config dir
+#                                            cannot wedge the next boot
 #   8. CLAUDE_CONFIG_DIR off the volume   -> WARNs, still boots
 #   9. firewall + agents.yaml             -> the allowlist really does admit what
 #                                            a job session needs; the profile
@@ -97,7 +101,28 @@ case "$1 $2" in
     ;;
   "bridge start")
     shift 2
+    # Model the CLI's own single-daemon lock, because the entrypoint's stale-lock
+    # sweep is only meaningful against it. Faithful to `acquireExecutorLock` /
+    # `runningExecutorPid`: the lock is ${ALISSA_CONFIG_DIR}/bridge/executor-<id>.lock
+    # holding a pid, and staleness is decided by a bare liveness check with no
+    # boot id and no start time — so a leftover file whose pid happens to be live
+    # in the new namespace refuses the start and exits non-zero.
+    eid="revloop-executor"
+    prev=""
+    for arg in "$@"; do
+      [ "${prev}" = "--executor-id" ] && eid="${arg}"
+      prev="${arg}"
+    done
+    lock="${ALISSA_CONFIG_DIR:-${HOME}/.config/alissa}/bridge/executor-${eid}.lock"
+    if [ -f "${lock}" ] && kill -0 "$(cat "${lock}" 2>/dev/null)" 2>/dev/null; then
+      echo "A bridge executor \"${eid}\" is already running on this machine (pid $(cat "${lock}"))." >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "${lock}")"
+    printf '%s\n' "$$" > "${lock}"
     printf '%s\n' "$*" > "${SPY_DIR}/bridge-argv"
+    # Deliberately NO lock cleanup on the way out: an ungraceful stop is exactly
+    # the condition the sweep exists for.
     trap 'exit 0' TERM INT
     sleep 600 &
     wait $!
@@ -129,10 +154,15 @@ reset_spies() {
   rm -f "${SPY}"/bridge-argv "${SPY}"/worker-start "${SPY}"/revloop-start \
         "${SPY}"/workspace-sync
   rm -rf "${WORKSPACE:?}"/* "${WORKSPACE:?}"/.alissa-config
+  BOOT_ARGS=()
 }
 
 BOOT_PID=""
 BOOT_STATUS=0
+# Extra CMD args handed to the entrypoint itself (not env assignments) — the
+# `docker run … --once` path. Reset by reset_spies; `${…[@]+…}` so an empty
+# array is safe under `set -u`.
+BOOT_ARGS=()
 start_boot() {
   local log="$1"; shift
   env -i \
@@ -147,7 +177,7 @@ start_boot() {
     ALISSA_AUTH_RETRY_SECONDS=1 \
     ALISSA_AUTH_RETRY_CAP_SECONDS=4 \
     "$@" \
-    bash "${ENTRYPOINT}" > "${log}" 2>&1 &
+    bash "${ENTRYPOINT}" ${BOOT_ARGS[@]+"${BOOT_ARGS[@]}"} > "${log}" 2>&1 &
   BOOT_PID=$!
 }
 
@@ -286,6 +316,44 @@ assert_contains "${SPY}/bridge-argv" "--max-concurrent 3" "the concurrency cap i
 assert_contains "${SPY}/bridge-argv" "--interval 45" \
   "ALISSA_BRIDGE_POLL_SECONDS maps to the CLI's --interval"
 
+# Extra CMD args, which the README promotes as the one-poll smoke test
+# (`docker run … --once`). Without the trailing "$@" on the exec line every
+# assertion above still passes, so this is what pins it — position included,
+# since a flag ahead of the structural ones would be a different command.
+reset_spies
+BOOT_ARGS=( --once )
+LOG4B="${TMPROOT}/cmd-args.log"
+start_boot "${LOG4B}" CONTAINER_ROLE=executor ALISSA_BRIDGE_EXECUTOR=1
+wait_boot "${LOG4B}" 30 "${EXECUTOR_UP}"
+assert_contains "${SPY}/bridge-argv" "--once" "extra CMD args reach alissa bridge start"
+case "$(cat "${SPY}/bridge-argv" 2>/dev/null || true)" in
+  *"--handoff claude --once") pass "...after the structural flags, not ahead of them" ;;
+  *) bad "extra args must come LAST (got: $(cat "${SPY}/bridge-argv" 2>/dev/null || true))" ;;
+esac
+
+info ""
+info "4b. the executor id boundary matches the CLI's own (64 characters)"
+# The CLI's EXECUTOR_ID_RE caps the id at 64. An unbounded boot check would let a
+# 65-character id through and kill it INSIDE `alissa bridge start`, after the
+# whole bootstrap — the register-time failure this gate exists to prevent.
+ID64="$(printf 'a%.0s' $(seq 1 64))"
+ID65="$(printf 'a%.0s' $(seq 1 65))"
+reset_spies
+LOG4C="${TMPROOT}/id-64.log"
+start_boot "${LOG4C}" CONTAINER_ROLE=executor ALISSA_BRIDGE_EXECUTOR=1 \
+                      ALISSA_BRIDGE_EXECUTOR_ID="${ID64}"
+wait_boot "${LOG4C}" 30 "${EXECUTOR_UP}"
+assert_contains "${SPY}/bridge-argv" "--executor-id ${ID64}" \
+  "a 64-character id is accepted (the CLI's own bound)"
+reset_spies
+LOG4D="${TMPROOT}/id-65.log"
+start_boot "${LOG4D}" CONTAINER_ROLE=executor ALISSA_BRIDGE_EXECUTOR=1 \
+                      ALISSA_BRIDGE_EXECUTOR_ID="${ID65}"
+wait_boot "${LOG4D}" 20 "${EXECUTOR_UP}"
+[ "${BOOT_STATUS}" != "0" ] && pass "a 65-character id is refused at BOOT, not at register time" \
+  || bad "a 65-character id should not have booted"
+assert_no_file "${SPY}/bridge-argv" "...so the bootstrap never runs for it"
+
 # -----------------------------------------------------------------------------
 info ""
 info "5. the daemon role is unaffected, even with the bridge env set"
@@ -342,6 +410,36 @@ wait_boot "${LOG7}" 30 "${EXECUTOR_UP}"
 assert_file "${SPY}/bridge-argv" "restoring the volume is enough — it proceeds, no restart"
 assert_contains "${LOG7}" "identity file ${UNWRITABLE}/alissa/bridge-executor.json" \
   "an explicit ALISSA_CONFIG_DIR is honoured for the identity file"
+
+# -----------------------------------------------------------------------------
+info ""
+info "7b. a stale executor lock on the volume does not wedge the next boot"
+# -----------------------------------------------------------------------------
+# Persisting ALISSA_CONFIG_DIR also persists the CLI's executor lockfile, and the
+# CLI decides that lock is stale with a bare `kill(pid, 0)` — no boot id, no
+# start time. A container that died ungracefully leaves the file behind, and the
+# next boot's fresh PID namespace can make that dead PID look alive, so the CLI
+# refuses to start and the platform restart-loops it.
+#
+# The lock is planted with a PID that is definitely LIVE (this test's own), which
+# is the case the CLI would reject — so this fails if the sweep is removed,
+# rather than passing beside it.
+reset_spies
+LOG7B="${TMPROOT}/stale-lock.log"
+LOCK_DIR="${WORKSPACE}/.alissa-config/bridge"
+mkdir -p "${LOCK_DIR}"
+printf '%s\n' "$$" > "${LOCK_DIR}/executor-revloop-executor.lock"
+# A second executor's lock, which this container does not own.
+printf '%s\n' "$$" > "${LOCK_DIR}/executor-someone-else.lock"
+start_boot "${LOG7B}" CONTAINER_ROLE=executor ALISSA_BRIDGE_EXECUTOR=1
+wait_boot "${LOG7B}" 30 "${EXECUTOR_UP}"
+assert_file "${SPY}/bridge-argv" \
+  "a stale lock holding a LIVE pid does not stop the boot"
+assert_not_contains "${LOG7B}" "is already running on this machine" \
+  "...and the CLI never refuses to start (the crash-loop condition)"
+assert_eq "${BOOT_STATUS}" "0" "...with a live container, not a non-zero exit"
+assert_file "${LOCK_DIR}/executor-someone-else.lock" \
+  "...and another id's lock is left alone (never a blanket executor-*.lock glob)"
 
 # -----------------------------------------------------------------------------
 info ""

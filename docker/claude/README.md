@@ -554,7 +554,8 @@ What it must **not** carry:
 
 ### Persistence, and what happens when the volume is not there
 
-Two things have to outlive a redeploy, and both live on the `/workspace` volume:
+Two things have to outlive a redeploy, and both live on the `/workspace` volume —
+plus a third that lands there as a consequence, and that you should know about:
 
 * **the executor identity** — `${ALISSA_CONFIG_DIR}/bridge-executor.json`, the id
   plus the fingerprint Studio displays. In this role `ALISSA_CONFIG_DIR` defaults
@@ -566,9 +567,34 @@ Two things have to outlive a redeploy, and both live on the `/workspace` volume:
   if a deploy moved it off; a queue job is long and unattended, and re-logging in
   is manual.
 
+* **the Alissa API token — a consequence, not a goal.** `alissa auth login` (the
+  same preflight the daemon role runs) writes the *verified* `ALISSA_API_TOKEN`
+  in cleartext to `${ALISSA_CONFIG_DIR}/config.json` with default permissions.
+  Relocating that directory onto the volume therefore moves that secret from the
+  ephemeral home to persistent storage. Nothing about the executor needs it
+  persisted — it is the price of persisting the identity file that sits beside
+  it — but the volume now holds a live credential, so give it the same handling
+  you would give any credential store: no snapshots into shared buckets, no
+  attaching it to a second service to "have a look", and rotate the token if the
+  volume is ever exposed. This is the same class of exposure as
+  [Exactly what a job spec can name](#exactly-what-a-job-spec-can-name) above,
+  one layer down: that section is about what a job can *read from the process*,
+  this is about what sits *on the disk*.
+
 The resolved `agents.yaml` is copied into the executor's config dir on **every**
 boot, so the image — not a file left behind by an older image — is always the
 source of truth for the profile.
+
+The CLI's executor **lockfile** (`…/bridge/executor-<id>.lock`) also lands in
+that directory, and it is deliberately *not* treated as persistent state: the
+entrypoint deletes this executor's lock immediately before starting. A lock is a
+claim that a process on this machine is already running, decided by a bare
+`kill(pid, 0)`; a container that died ungracefully leaves one behind, and the
+next boot's fresh PID namespace can easily make that dead PID look alive —
+refusing to start, forever. A fresh container has no executor running by
+definition, so the lock is stale by construction. Only *this* executor's lock is
+removed, never every `executor-*.lock`, so a lock belonging to some other id is
+left alone rather than pulled out from under whoever owns it.
 
 Volume unavailability is **not** fatal. Because the identity dir is the same
 directory the `alissa auth login` preflight probes, a missing or root-owned mount
@@ -642,7 +668,8 @@ volumes:
    daemon's on-demand `alissa code workspace add` no-ops on a repo already listed
    in the manifest, leaving an empty folder and looping forever hub-ifying a hub
    that never completes.
-3b. **Executor role only, and the end of the shared path**: `exec alissa bridge
+3d. **Executor role only, and the end of the shared path**: drop this executor's
+   stale lockfile, then `exec alissa bridge
    start …`. `exec`, so the container's only process is the executor — steps 4
    and 5 below never run in this role, and the daemon role never reaches this
    step. Nothing after this point applies to an executor service.
