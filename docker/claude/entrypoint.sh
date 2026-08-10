@@ -143,13 +143,88 @@ fi
 #
 # claude refuses --dangerously-skip-permissions as root, so everything past this
 # point MUST run unprivileged — that is exactly what the drop guarantees.
+#
+# THE WALK IS GUARDED (issue #78). `chown -R` over the persistent volume stats
+# every inode of every worktree hub, and the dentry/inode slab it fills is
+# charged to the container's cgroup: a 2026-08-09 audit of the Railway service
+# found `memory.current` at ~5.98 GB with 176 MB of actual RSS — 3.71 GB of it
+# `slab_reclaimable` from this walk, the rest page cache from the hub sync in
+# step 3c. The kernel has no pressure to drop any of it below the cgroup limit,
+# so the metric plateaus flat at ~6 GB from the moment of deploy and stops being
+# usable for spotting a real leak. On a warm restart that whole cost buys
+# nothing: the volume is already `alissa`-owned from the previous boot.
+#
+# So the walk now runs only when a cheap probe says it has to. The probe is
+# O(top-level entries) BY CONSTRUCTION — one `stat` over the mount point plus
+# its depth-1 children. It deliberately does NOT `find … ! -user alissa`: find
+# stats every inode too, which is the exact slab storm this guard exists to
+# remove. The blind spot that buys is root-owned files created DEEPER in the
+# tree (a Railway console shell running as root is the realistic way) — hence
+# ALISSA_FORCE_CHOWN=1, which forces the full walk for one boot.
+#
+# Reclaiming after the fact is not an option here: `/sys/fs/cgroup` is mounted
+# read-only inside a Railway container, so `echo … > memory.reclaim` fails with
+# EROFS even as root (verified 2026-08-09). Avoidance is the only lever, which
+# is why there is no reclaim call in this block.
 # -----------------------------------------------------------------------------
+
+# Does <path> need the recursive chown? Returns 0 (yes) when the probe finds any
+# entry not owned by ${RUNTIME_USER} — or when it cannot tell, because a walk we
+# did not need is cheaper than a volume the daemon cannot write.
+#
+# Scope is the path itself plus its immediate children, nothing deeper: that is
+# what makes the probe O(top-level entries) instead of O(inodes). One `stat`
+# call for the lot, so a hub-per-repo mount costs a single process.
+needs_recursive_chown() {
+  local path="$1"
+  local entry owners owner
+  local -a entries=()
+
+  [ -e "${path}" ] || return 0
+  entries+=("${path}")
+  # Dotfiles included; `..?*` catches `..foo` without ever matching `..`.
+  for entry in "${path}"/* "${path}"/.[!.]* "${path}"/..?*; do
+    [ -e "${entry}" ] || [ -L "${entry}" ] || continue   # unmatched glob / dangling link
+    entries+=("${entry}")
+  done
+
+  # GNU stat does not dereference symlinks without -L, so a dangling link
+  # reports its own ownership rather than failing the whole call.
+  owners="$(stat -c '%U' -- "${entries[@]}" 2>/dev/null)" || return 0
+  [ -n "${owners}" ] || return 0
+  while IFS= read -r owner; do
+    # An uid with no passwd entry prints as UNKNOWN, which is correctly "not ours".
+    [ "${owner}" = "${RUNTIME_USER}" ] || return 0
+  done <<<"${owners}"
+  return 1
+}
+
 if [ "$(id -u)" = "0" ]; then
-  mkdir -p "${WORKSPACE_ROOT}" "${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}"
-  # Fix ownership so the unprivileged user can write. -R because a restart may
-  # find files a previous root-mounted run left behind.
-  chown -R "${RUNTIME_USER}:${RUNTIME_USER}" \
-    "${WORKSPACE_ROOT}" "${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}" 2>/dev/null || true
+  TMUX_DIR="${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}"
+  mkdir -p "${WORKSPACE_ROOT}" "${TMUX_DIR}"
+
+  # Fix ownership so the unprivileged user can write. -R because a first boot
+  # finds a root-owned mount, and a root console shell can leave root-owned
+  # files behind — but only when the probe (or the operator) says so, per the
+  # block comment above. Each target is decided on its own: the tmux dir is a
+  # handful of sockets, the volume is millions of inodes.
+  FORCE_CHOWN=0
+  if is_truthy "${ALISSA_FORCE_CHOWN:-0}"; then
+    FORCE_CHOWN=1
+    log "ALISSA_FORCE_CHOWN=${ALISSA_FORCE_CHOWN} — forcing the full recursive chown (the depth-1 probe is skipped; use this once after a root shell has written deeper into the volume)"
+  fi
+  for CHOWN_TARGET in "${WORKSPACE_ROOT}" "${TMUX_DIR}"; do
+    if [ "${FORCE_CHOWN}" = "1" ] || needs_recursive_chown "${CHOWN_TARGET}"; then
+      chown -R "${RUNTIME_USER}:${RUNTIME_USER}" "${CHOWN_TARGET}" 2>/dev/null || true
+      if [ "${FORCE_CHOWN}" = "1" ]; then
+        log "chown -R ${RUNTIME_USER}:${RUNTIME_USER} ${CHOWN_TARGET} (forced)"
+      else
+        log "chown -R ${RUNTIME_USER}:${RUNTIME_USER} ${CHOWN_TARGET} (probe found entries not owned by ${RUNTIME_USER})"
+      fi
+    else
+      log "${CHOWN_TARGET} already owned by ${RUNTIME_USER} — skipping the recursive chown (set ALISSA_FORCE_CHOWN=1 to force it)"
+    fi
+  done
   log "workspace mount ${WORKSPACE_ROOT} owned by ${RUNTIME_USER}"
 
   if [ "${ALISSA_ENABLE_FIREWALL:-0}" = "1" ]; then

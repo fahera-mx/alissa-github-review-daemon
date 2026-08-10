@@ -16,7 +16,10 @@ on: [pull_request]
 #     fast FATAL), same way — docker/claude/tests-entrypoint-auth.sh;
 #   * the bridge-executor role (CONTAINER_ROLE / ALISSA_BRIDGE_* gate, executor
 #     identity, and the guarantee that neither role starts the other's
-#     supervisor) — docker/claude/tests-entrypoint-executor.sh.
+#     supervisor) — docker/claude/tests-entrypoint-executor.sh;
+#   * the guarded boot-time chown (warm boot skips the volume walk, a root-owned
+#     probe result or ALISSA_FORCE_CHOWN=1 still runs it) —
+#     docker/claude/tests-entrypoint-chown.sh.
 jobs:
   entrypoint-config-check:
     name: Entrypoint config renderer + console wiring
@@ -81,6 +84,15 @@ jobs:
         # off instead of crash-looping, hence the timeout headroom.
         timeout-minutes: 6
         run: bash docker/claude/tests-entrypoint-executor.sh
+      - name: Execute Entrypoint Guarded-Chown Tests
+        # Boots the entrypoint six times through a FAKE root pass (`id -u`
+        # answers 0 once, `gosu` execs in place) so the root-only step 0 is
+        # exercised without root or docker. `chown`/`find` record instead of
+        # running and `stat` answers scripted ownership, which is what makes
+        # "the probe stayed O(top-level entries)" an assertion rather than a
+        # claim; the last case runs against the real stat and the real tree.
+        timeout-minutes: 4
+        run: bash docker/claude/tests-entrypoint-chown.sh
       - name: Execute Entrypoint Console Wiring Tests
         # Boots the entrypoint four times (console off / enabled-without-passcode
         # / enabled / sidecar killed under it). No docker needed: the CLIs the

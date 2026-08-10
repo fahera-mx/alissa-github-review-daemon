@@ -234,6 +234,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_WORKER_INTERVAL` | `2` | worker reconcile tick (seconds) |
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |
 | `ALISSA_FIREWALL_EXTRA` | *(empty)* | extra firewall allowlist hosts, space-separated |
+| `ALISSA_FORCE_CHOWN` | `0` | `1` forces the root phase's full `chown -R` of the volume for that boot. Off by default: the entrypoint probes ownership at depth 1 and walks only when it finds a foreign owner (see [Boot-time ownership](#boot-time-ownership-the-volume-walk-is-guarded)). Set it for **one** boot after a root shell wrote files deeper in the tree |
 
 #### Config precedence: env var > daemon library default
 
@@ -256,6 +257,37 @@ that the baked [`agents.yaml`](./agents.yaml) ships (`claude`), and
 `on_missing_hub` must be `add` for the self-contained hub-ify-on-demand model —
 the library default `skip` would make a fresh volume review nothing. Both are
 still overridable via their env var.
+
+#### Boot-time ownership: the volume walk is guarded
+
+The container starts as root only to make a root-owned volume mount writable
+(see [Persistence](#persistence--mount-the-volume-at-workspace)). That `chown -R`
+used to run on **every** boot, and on a warm volume it is both a no-op and
+expensive: the walk stats every inode of every worktree hub, and the resulting
+dentry/inode slab is charged to the container's cgroup. An audit of the Railway
+service on 2026-08-09 found `memory.current` at **~5.98 GB** against **176 MB**
+of actual process RSS — 3.71 GB of it `slab_reclaimable` from the walk, the rest
+page cache from the hub sync — with zero reviewer sessions running. It is
+reclaimable cache, not a leak (the kernel drops it under real pressure at the
+cgroup limit), but it plateaus flat from the moment of deploy and makes the
+memory graph useless for spotting a real problem.
+
+So step 0 now **probes before it walks**: one `stat` over the mount point and its
+immediate children, and the `chown -R` runs only if something there is not owned
+by `alissa`. The probe is O(top-level entries) by construction — deliberately not
+`find … ! -user alissa`, which stats every inode and would recreate the same slab
+storm. A first boot on a fresh root-owned volume is unaffected: the mount point
+itself is root-owned, so the probe trips and the full walk runs exactly as before.
+
+The blind spot is a root-owned file created **deeper** than depth 1 — realistically,
+a platform console shell running as root. `ALISSA_FORCE_CHOWN=1` is the escape
+hatch: it skips the probe and forces the full walk for that boot. Set it, restart,
+then unset it.
+
+Reclaiming the cache after the fact is not an option on Railway: `/sys/fs/cgroup`
+is mounted read-only inside the container, so writing `memory.reclaim` fails with
+`EROFS` even as root (verified 2026-08-09). Avoidance is the only lever, which is
+why the entrypoint has no reclaim call.
 
 ### Reviewer console (runtime env only — `ALISSA_UI_ENABLED`, `ALISSA_UI_PASSCODE`, `PORT`)
 
@@ -425,6 +457,12 @@ volumes typically mount **root-owned**, so the container starts as root, the
 entrypoint `chown`s the mount to `alissa` (uid 1000), and then drops to that user
 (via `gosu`) for everything else — so a root-owned mount just works, no manual
 `chown` or init container needed. (claude still runs unprivileged, as it must.)
+
+That `chown` is **guarded**: on a warm volume it is skipped, because walking it
+charges GBs of reclaimable kernel cache to the container's memory metric for no
+benefit. See [Boot-time ownership](#boot-time-ownership-the-volume-walk-is-guarded)
+for the numbers and for `ALISSA_FORCE_CHOWN`, the escape hatch to use after a root
+console shell has written into the volume.
 
 ### Optional egress firewall
 
@@ -650,9 +688,12 @@ volumes:
    its gates — the arming flag, the executor id, and where the identity is
    persisted. A bad role or an unarmed executor **dies here**, before any
    bootstrap. See [Bridge executor role](#bridge-executor-role-a-second-service-from-this-same-image).
-0b. As root: `chown` the `/workspace` mount to `alissa`, (optionally) raise the
-   egress firewall, then drop to `alissa` via `gosu`. Everything below runs
-   unprivileged.
+0b. As root: make the `/workspace` mount writable by `alissa` — probing
+   ownership at depth 1 and running the full `chown -R` only when the probe finds
+   a foreign owner or `ALISSA_FORCE_CHOWN=1` says so
+   ([why](#boot-time-ownership-the-volume-walk-is-guarded)) — then (optionally)
+   raise the egress firewall and drop to `alissa` via `gosu`. Everything below
+   runs unprivileged.
 1. Preflight + onboard the identities: validate `gh` (fatal if missing) and run
    `gh auth setup-git`; `alissa auth login` — fatal only when the API **rejects**
    the token, otherwise triaged and retried (see
