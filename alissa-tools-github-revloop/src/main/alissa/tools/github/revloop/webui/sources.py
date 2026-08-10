@@ -501,6 +501,12 @@ class Sources:
         # trees out of it and the top-process list ranks the same snapshot, so
         # the two panels can never disagree about a process that exited between
         # them -- and the host pays for one walk per poll, not two.
+        #
+        # The cost on the other side of that trade, so nobody reorders this
+        # thinking it is free: the snapshot is now taken BEFORE `sessions()`
+        # shells out to tmux, so a pane that starts inside that window is
+        # missing from `stats` and its row shows "--" for CPU%/RSS for one
+        # poll. Self-healing in ~10s, and cheaper than walking /proc twice.
         proc_index = sysinfo.build_index(self._proc_root)
         sessions = self.sessions(index=proc_index)
         rate = self.rate_limit()

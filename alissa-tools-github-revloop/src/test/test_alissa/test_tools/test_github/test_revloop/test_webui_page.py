@@ -109,8 +109,15 @@ def test_dashboard_reads_a_container_memory_plateau_at_a_glance():
     assert "Container Memory" in html
     assert "' resident \u00b7 '" in html
     assert "' reclaimable'" in html
-    # a host without cgroup v2 says so instead of erroring
-    assert "'no cgroup v2'" in html
+    # shmem is charged, is NOT droppable, and is excluded from reclaimable --
+    # so it must be visible or a tmpfs-heavy container shows a charge that
+    # neither of the other two numbers accounts for
+    assert "bytes(mem.shmem) + ' shmem'" in html
+    # ...and a host that cannot be read says so instead of erroring. Round-1
+    # [nit]: 'unavailable' (the word the acceptance detail and the neighbouring
+    # tiles use), not the diagnosis 'no cgroup v2' the console cannot make.
+    assert "tile('Container Memory', '--', 'unavailable')" in html
+    assert "'no cgroup v2'" not in html  # the JS string literal is gone
     # the meter is the RESIDENT share of the charge -- the part a limit kills
     # for -- so warn/crit mean the same thing here as on the other tiles
     assert "100 * mem.resident / mem.charged" in html
@@ -131,3 +138,16 @@ def test_dashboard_tiles_grid_fits_five_tiles():
     html = dashboard_page("c", "1.0.0")
     assert "grid-template-columns: repeat(5, 1fr)" in html
     assert html.index("max-width: 1100px") < html.index("max-width: 900px")
+
+
+def test_dashboard_keeps_a_partial_cgroup_read():
+    """Round-1 [minor]: `cgroup_memory` reads memory.current and memory.stat
+    through separate helpers so each degrades on its own, and the tile used to
+    throw the whole breakdown away when only the headline was missing. This is
+    the rendering half of the property that
+    `test_webui_sysinfo.test_cgroup_memory_current_missing_keeps_the_stat_split`
+    asserts at the data layer -- it lives here because the console, not the
+    reader, is what has to still show it."""
+    html = dashboard_page("c", "1.0.0")
+    assert ("mem.charged != null || mem.resident != null || mem.reclaimable != null"
+            in html)

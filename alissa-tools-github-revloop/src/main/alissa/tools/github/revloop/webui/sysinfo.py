@@ -276,6 +276,15 @@ def _sum_or_none(*values: "int | None") -> "int | None":
     return sum(value for value in values if value is not None)
 
 
+def _drop_shmem(file_bytes: "int | None", shmem: "int | None") -> "int | None":
+    """The droppable part of `file`. `shmem` unknown means the droppable part
+    is unknown -- publishing `file` whole would be the reassuring-direction
+    error the split exists to prevent."""
+    if file_bytes is None or shmem is None:
+        return None
+    return max(0, file_bytes - shmem)
+
+
 def cgroup_memory(
     cgroup_root: "str | os.PathLike[str]" = "/sys/fs/cgroup",
 ) -> dict:
@@ -287,13 +296,25 @@ def cgroup_memory(
     So we also report:
 
     * `resident` -- `anon`, the process memory that is really in use.
-    * `reclaimable` -- `file` + `slab_reclaimable`, the page cache plus the
-      shrinkable kernel caches: the "not really in use" bucket.
+    * `reclaimable` -- `(file - shmem) + slab_reclaimable`: the page cache plus
+      the shrinkable kernel caches, the "not really in use" bucket.
+    * `shmem` -- broken out of `file` rather than left inside it, because it is
+      not droppable: tmpfs, shm segments and shared anonymous mmaps are
+      swap-backed, so with swap disabled or capped (the normal container case)
+      the kernel cannot reclaim them under pressure -- they are what the
+      container gets OOM-killed for. Counting them as reclaimable is the one
+      way this reader can be wrong in the REASSURING direction, telling an
+      operator "5.9 GB of cache, no leak" about pages nothing can free. Issue
+      #74's scope text prescribes `file + slab_reclaimable` verbatim; the same
+      sentence calls the result the "not really in use" bucket, and where the
+      formula and the words disagree the words are the requirement. Surfaced as
+      its own magnitude instead of folded into `resident`, because "5 GB of
+      tmpfs" and "5 GB of process heap" are different operator problems even
+      though neither is droppable.
 
     The raw keys ride along for a spot check against an in-container
-    `memory.stat`. Note the three summary numbers do NOT partition the charge
-    (kernel stacks, pagetables, sockets are charged too, and `shmem` is counted
-    inside `file` while behaving like anon memory) -- they are the three
+    `memory.stat`. Note the summary numbers do NOT partition the charge --
+    kernel stacks, pagetables and sockets are charged too -- they are the
     magnitudes an operator compares, not a balance sheet.
 
     Never raises. On a host without cgroup v2 -- a dev laptop, macOS, a v1
@@ -306,7 +327,14 @@ def cgroup_memory(
     out: "dict[str, int | None]" = {
         "charged": charged,
         "resident": stat["anon"],
-        "reclaimable": _sum_or_none(stat["file"], stat["slab_reclaimable"]),
+        # `shmem` is a SUBSET of `file` in cgroup v2, so it is subtracted, not
+        # added. Clamped at zero: the two keys are sampled from one read of one
+        # file and cannot legitimately cross, but a negative "cache" number
+        # would be a worse thing to render than a zero if a kernel ever
+        # disagreed with that.
+        "reclaimable": _sum_or_none(
+            _drop_shmem(stat["file"], stat["shmem"]), stat["slab_reclaimable"]
+        ),
     }
     out.update(stat)
     return out

@@ -437,14 +437,29 @@ _JS = r"""
     // The meter is the RESIDENT share of the charge, deliberately: it is the
     // only part of a rising charge that a limit can actually kill for, so the
     // shared warn/crit thresholds mean the same thing here as on the others.
+    // Gated on ANY of the three, not on `charged`: cgroup_memory reads
+    // memory.current and memory.stat through separate helpers so each degrades
+    // on its own, and a tile keyed to the headline alone would throw away a
+    // breakdown the reader deliberately preserved. The headline and the meter
+    // carry their own null handling, so a missing `charged` costs only itself.
     var mem = t.memory;
-    if (mem && mem.charged != null) {
+    if (mem && (mem.charged != null || mem.resident != null || mem.reclaimable != null)) {
       var msub = (mem.resident == null ? '--' : bytes(mem.resident)) + ' resident · ' +
         (mem.reclaimable == null ? '--' : bytes(mem.reclaimable)) + ' reclaimable';
+      // shmem is charged, is NOT droppable (swap-backed), and is excluded from
+      // reclaimable -- so it has to be visible, or a tmpfs-heavy container
+      // shows a charge that neither of the other two numbers accounts for.
+      if (mem.shmem) msub += ' · ' + bytes(mem.shmem) + ' shmem';
       var mpct = (mem.resident == null || !mem.charged) ? null :
         Math.round(100 * mem.resident / mem.charged);
       out += tile('Container Memory', bytes(mem.charged), msub, mpct);
-    } else { out += tile('Container Memory', '--', 'no cgroup v2'); }
+      // 'unavailable', not a cgroup-v2 verdict: this branch is also reached on a
+      // host-namespace deployment (the controller exists, its interface files
+      // are absent from the v2 root) and on a partial read. The console cannot
+      // tell those apart, and a wrong diagnosis sends an operator to check the
+      // wrong thing -- the neighbouring tiles say 'unavailable' for the same
+      // reason, and so does the origin task's acceptance detail.
+    } else { out += tile('Container Memory', '--', 'unavailable'); }
     out += tile('Review Queue', t.queue_depth, 'PRs awaiting me, last poll');
     el('tiles').innerHTML = out;
   }
