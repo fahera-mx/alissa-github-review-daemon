@@ -17,6 +17,9 @@ on: [pull_request]
 #   * the bridge-executor role (CONTAINER_ROLE / ALISSA_BRIDGE_* gate, executor
 #     identity, and the guarantee that neither role starts the other's
 #     supervisor) — docker/claude/tests-entrypoint-executor.sh;
+#   * the workspace-prune wiring (boot pass + supervised interval loop,
+#     default-on with an opt-out, capability-gated, --force never passed) —
+#     docker/claude/tests-entrypoint-prune.sh;
 #   * the guarded boot-time chown (warm boot skips the volume walk, a root-owned
 #     probe result or ALISSA_FORCE_CHOWN=1 still runs it) —
 #     docker/claude/tests-entrypoint-chown.sh.
@@ -93,6 +96,17 @@ jobs:
         # claim; the last case runs against the real stat and the real tree.
         timeout-minutes: 4
         run: bash docker/claude/tests-entrypoint-chown.sh
+      - name: Execute Entrypoint Workspace-Prune Tests
+        # Boots the entrypoint six times against an `alissa` stub that records
+        # every `code workspace prune` invocation with its argv AND its cwd —
+        # which is what makes "--force is never passed" and "an old CLI runs
+        # nothing" assertions rather than claims. The stub reproduces
+        # commander's real behaviour for an unknown subcommand (parent help,
+        # exit 0), so the capability probe is tested against the trap it exists
+        # for. Two cases wait out several ticks of the test-only seconds
+        # override, hence the headroom.
+        timeout-minutes: 6
+        run: bash docker/claude/tests-entrypoint-prune.sh
       - name: Execute Entrypoint Console Wiring Tests
         # Boots the entrypoint four times (console off / enabled-without-passcode
         # / enabled / sidecar killed under it). No docker needed: the CLIs the

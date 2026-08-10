@@ -5,6 +5,8 @@
 #   0. as root: fix the volume-mount ownership (+ firewall), then drop to alissa
 #   1. preflight the identities the loop depends on (gh / alissa / claude)
 #   2. bootstrap the worktree-hub workspace + revloop config from a manifest
+#   2b. prune finished worktrees off the volume, then again on an interval
+#       (`alissa code workspace prune`, capability-gated, best-effort)
 #   3. start `alissa worker` (backgrounded) and wait until it is up
 #   4. optionally start the `alissa-revloop-ui` console sidecar (ALISSA_UI_ENABLED)
 #   5. run `alissa-revloop` in the foreground, stopping the worker on exit
@@ -871,6 +873,148 @@ if [ -f "${MANIFEST}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# 3e. Volume hygiene — `alissa code workspace prune` (issue #81).
+#
+# Nothing in this container ever removed anything from the volume. Every review
+# round materializes a per-PR worktree in a hub (plus whatever a session's build
+# leaves behind), merged or closed PRs leave theirs in place forever, and the
+# bare `.source` object store only grows. `alissa code workspace prune` is the
+# remediation primitive: it removes finished-branch worktrees behind the CLI's
+# own safety rails (never `main/`, never a dirty tree without --force, an age
+# gate, a live-tmux-session guard, never a worktree whose PR is still open, and
+# a lookup failure KEEPS the worktree) and then runs the hub-level
+# `git worktree prune` / `git remote prune origin` / `git gc --auto` sequence.
+#
+# Three properties this wiring must have, in order of how much they matter:
+#
+#   * it can never take the container down. Prune is an optimization; a failing
+#     one leaves exactly the disk usage we already had. So: best-effort at boot,
+#     and an interval loop that warns and waits for the next tick.
+#   * `--force` is NEVER passed. In a review container a dirty worktree is
+#     evidence — a session that died mid-round, with uncommitted work someone
+#     may still want. The rail that keeps it is the one this entrypoint most
+#     needs, so the flag that defeats it is not exposed at all.
+#   * it is CAPABILITY-GATED, not version-pinned. The image installs the alissa
+#     CLI from an install channel that may predate the subcommand, and a hard
+#     pin here would go stale on every CLI release. An older CLI gets exactly
+#     one loud warning and both hooks skip.
+#
+# The interval loop is DAEMON-ONLY, and deliberately so: the executor role
+# `exec`s `alissa bridge start` a few lines below, which replaces this shell —
+# a loop started here would outlive the only code that knows how to stop it and
+# would keep pruning against jobs it cannot see being torn down. The executor
+# still gets the boot pass, because it grows the same volume the same way.
+# -----------------------------------------------------------------------------
+PRUNE_ENABLED=0
+PRUNE_INTERVAL_MINUTES=360
+PRUNE_INTERVAL_SECONDS=$(( 360 * 60 ))
+# Never contains `--force`. See the block comment above; the entrypoint has no
+# knob that adds it, which is the point.
+PRUNE_ARGS=()
+
+# Does this CLI ship `alissa code workspace prune`?
+#
+# NOT "does `--help` exit 0". Commander answers an UNKNOWN subcommand by
+# printing the PARENT command's help and exiting 0 — verified against alissa
+# CLI 0.1.0, where `alissa code workspace prune --help` prints the `workspace`
+# help and exits 0 without a word about prune. A probe on the exit status alone
+# would therefore report every old CLI as capable and we would discover the
+# truth one failing prune at a time. So the probe reads the OUTPUT: a real
+# subcommand prints its own `Usage: … workspace prune …`, and a help that lists
+# a `prune` command counts too.
+workspace_prune_supported() {
+  local out
+  out="$(alissa code workspace prune --help 2>&1)" || return 1
+  printf '%s\n' "${out}" \
+    | grep -qE '^[[:space:]]*(Usage:[[:space:]].*workspace[[:space:]]+prune|prune([[:space:]]|$))'
+}
+
+# One prune pass. ALWAYS returns 0: both callers treat a failure as "warn and
+# carry on", and the interval loop runs under this script's `set -e`, where a
+# non-zero return would silently kill the loop instead of the pass.
+#
+# The CLI's per-worktree verdicts are captured and re-emitted through log(), so
+# they carry the entrypoint prefix and are greppable in the platform's boot log
+# next to everything else this boot did.
+workspace_prune_run() {
+  local label="$1" out line rc=0
+  # Run from the workspace root: the workspace binding is cwd-based, exactly as
+  # for the `workspace sync` above.
+  out="$( cd "${WORKSPACE_ROOT}" && alissa code workspace prune ${PRUNE_ARGS[@]+"${PRUNE_ARGS[@]}"} 2>&1 )" \
+    || rc=$?
+  if [ -n "${out}" ]; then
+    while IFS= read -r line; do log "prune[${label}]: ${line}"; done <<<"${out}"
+  fi
+  if [ "${rc}" = "0" ]; then
+    log "workspace prune (${label}) finished"
+  else
+    log "WARN: workspace prune (${label}) exited ${rc} — nothing was removed by this pass; the volume keeps what it holds until the next one. Check the verdict lines above."
+  fi
+  return 0
+}
+
+# Default ON: this container is the one whose volume is growing, so the knob is
+# an opt-OUT. Same truthiness as every other gate here.
+if ! is_truthy "${ALISSA_WORKSPACE_PRUNE:-1}"; then
+  log "workspace prune DISABLED (ALISSA_WORKSPACE_PRUNE=${ALISSA_WORKSPACE_PRUNE:-1}) — nothing in this container reclaims finished worktrees, so the volume grows until someone prunes it by hand"
+elif ! workspace_prune_supported; then
+  # Exactly one warning, and it is loud: this is a silent-growth condition, and
+  # the only signal an operator gets that the hygiene they think is running is
+  # not. Both hooks stay off — see the capability-gate rationale above.
+  log "WARN: this alissa CLI predates 'alissa code workspace prune' — workspace prune is SKIPPED at boot AND on the interval, and the volume WILL grow. Upgrade the CLI in the image's install channel; nothing about this entrypoint needs to change when it lands."
+else
+  PRUNE_ENABLED=1
+
+  # `--min-age-hours` is a SAFETY knob: a larger value keeps MORE worktrees. A
+  # value the CLI would reject therefore must not fall back to the CLI's own
+  # default — that would prune worktrees younger than the operator asked to
+  # keep, which is the one direction of error that destroys something. Fail
+  # closed instead: skip the whole feature for this boot and say why.
+  if [ -n "${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS:-}" ]; then
+    if printf '%s' "${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS}" | grep -qE '^[0-9]+$'; then
+      PRUNE_ARGS+=( --min-age-hours "${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS}" )
+    else
+      PRUNE_ENABLED=0
+      log "WARN: ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS=${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS} is not a whole number of hours — workspace prune is SKIPPED entirely rather than run with the CLI's default age gate, because that gate could be SHORTER than the one you asked for. Fix the value (or unset it to accept the CLI's default) and redeploy."
+    fi
+  fi
+fi
+
+if [ "${PRUNE_ENABLED}" = "1" ]; then
+  # The interval is not a safety knob — a bad one only changes how often a
+  # best-effort pass runs — so a garbage value falls back to the default with a
+  # warning instead of disabling the feature.
+  PRUNE_INTERVAL_MINUTES="${ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES:-360}"
+  if ! printf '%s' "${PRUNE_INTERVAL_MINUTES}" | grep -qE '^[1-9][0-9]*$'; then
+    log "WARN: ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES=${PRUNE_INTERVAL_MINUTES} is not a positive whole number of minutes — falling back to 360"
+    PRUNE_INTERVAL_MINUTES=360
+  fi
+  PRUNE_INTERVAL_SECONDS=$(( PRUNE_INTERVAL_MINUTES * 60 ))
+
+  # ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS is TEST-ONLY, on the same footing as
+  # ALISSA_AUTH_RETRY_SECONDS: tests-entrypoint-prune.sh has to watch the loop
+  # tick more than once, and the smallest value the documented knob can express
+  # is a minute per tick. A deploy leaves it unset.
+  if [ -n "${ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS:-}" ]; then
+    if printf '%s' "${ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS}" | grep -qE '^[1-9][0-9]*$'; then
+      PRUNE_INTERVAL_SECONDS="${ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS}"
+      log "workspace prune: interval overridden to ${PRUNE_INTERVAL_SECONDS}s (ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS — test-only)"
+    else
+      log "WARN: ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS=${ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS} is not a positive whole number of seconds — ignoring it"
+    fi
+  fi
+
+  log "workspace prune ENABLED — boot pass now, then every ${PRUNE_INTERVAL_MINUTES} min (min-age: ${ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS:-CLI default}, --force never passed)"
+  # Best-effort, exactly like the other boot steps: prune is an optimization,
+  # never a boot precondition. workspace_prune_run already swallows the status;
+  # the `|| true` is the belt to that suspenders, and says so at the call site.
+  workspace_prune_run boot || true
+  if [ "${CONTAINER_ROLE}" = "executor" ]; then
+    log "workspace prune: executor role runs the boot pass only — the interval loop belongs to the daemon's process chain, and this role 'exec's the bridge, leaving nothing here to tear a loop down"
+  fi
+fi
+
+# -----------------------------------------------------------------------------
 # 3d. EXECUTOR ROLE — hand the container over to `alissa bridge start`.
 #
 # This is the end of the shared path. `exec` replaces this shell, so tini's only
@@ -997,6 +1141,30 @@ if [ "${UI_ENABLED}" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# 4c. The periodic workspace prune (daemon role only — see 3e).
+#
+# Same in-container background pattern as the console monitor above: a subshell
+# child of this entrypoint, so tini reaps it, and a pid the shutdown handler
+# kills. `sleep` FIRST, so the interval measures from the boot pass that 3e
+# already ran rather than pruning twice in a row on every restart.
+#
+# The loop cannot die of a prune failure: workspace_prune_run returns 0 always
+# (a non-zero return under `set -e` would end the subshell, turning one failed
+# pass into no more passes until the next redeploy).
+# -----------------------------------------------------------------------------
+PRUNE_PID=""
+if [ "${PRUNE_ENABLED}" = "1" ]; then
+  log "starting the workspace prune loop (every ${PRUNE_INTERVAL_MINUTES} min = ${PRUNE_INTERVAL_SECONDS}s)"
+  (
+    while true; do
+      sleep "${PRUNE_INTERVAL_SECONDS}"
+      workspace_prune_run interval
+    done
+  ) &
+  PRUNE_PID=$!
+fi
+
+# -----------------------------------------------------------------------------
 # 5. Run the daemon in the foreground; stop the worker on shutdown.
 # -----------------------------------------------------------------------------
 DAEMON_PID=""
@@ -1005,6 +1173,10 @@ shutdown() {
   # Silence the console monitor FIRST so tearing the sidecar down below does not
   # trip its "EXITED" alarm during an orderly shutdown.
   [ -n "${UI_MONITOR_PID}" ] && kill "${UI_MONITOR_PID}" 2>/dev/null || true
+  # The prune loop goes down with it, and for the same reason: an orderly
+  # shutdown must not start a pass into a container that is being torn down
+  # (the CLI walks hubs and can run `git gc` — work worth not interrupting).
+  [ -n "${PRUNE_PID}" ] && kill "${PRUNE_PID}" 2>/dev/null || true
   [ -n "${UI_PID}" ] && kill "${UI_PID}" 2>/dev/null || true
   [ -n "${DAEMON_PID}" ] && kill "${DAEMON_PID}" 2>/dev/null || true
   alissa worker stop >/dev/null 2>&1 || true
