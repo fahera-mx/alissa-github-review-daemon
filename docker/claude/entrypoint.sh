@@ -967,18 +967,11 @@ workspace_prune_supported() {
 # a handler that finishes the in-flight git operation before exiting is exactly
 # what a careful implementation would install, so the bound would go missing at
 # the moment the CLI lands and the feature stops being a no-op. `-k` gives such a
-# handler PRUNE_KILL_AFTER_SECONDS to finish and then KILLs it; the exit status
-# stays 124 either way, so the WARN path below does not care which signal did it.
-#
-# `-k` IS PART OF THE BOUND, not a refinement of it. Plain `timeout` sends TERM
-# and then waits indefinitely, so a child that traps TERM is unbounded again —
-# the same boot-held-open failure, one step further along. That is not a
-# hypothetical for this subcommand: `workspace prune` is the destructive one, and
-# a handler that finishes the in-flight git operation before exiting is exactly
-# what a careful implementation would install, so the bound would go missing at
-# the moment the CLI lands and the feature stops being a no-op. `-k` gives such a
-# handler PRUNE_KILL_AFTER_SECONDS to finish and then KILLs it; the exit status
-# stays 124 either way, so the WARN path below does not care which signal did it.
+# handler PRUNE_KILL_AFTER_SECONDS to finish and then KILLs it — and that path
+# reports 137 (128+9), NOT 124, which is why the WARN below has a branch of its
+# own for it. Do not "simplify" the two into one: `timeout` normalises nothing
+# here (measured on coreutils 9.1), so a 124-only branch files the very case `-k`
+# exists for under the generic "exited N" message.
 #
 # A timed-out pass is just another non-zero exit into the WARN path below (124,
 # named there so the log says "timed out" instead of a bare number). This is
@@ -996,6 +989,12 @@ workspace_prune_supported() {
 # the few places that could echo a URL.
 workspace_prune_run() {
   local label="$1" out line rc=0
+  # When the pass started, so the 137 branch below can tell OUR kill from someone
+  # else's. `timeout` reports 128+signal for ANY signal death of the child, so
+  # 137 alone does not mean "we killed it after the grace" — an OOM kill looks
+  # identical, and on a memory-capped container a `git gc --auto` sweep over a
+  # never-pruned object store is the best OOM candidate the boot has (issue #74).
+  local started=${SECONDS}
   # Run from the workspace root: the workspace binding is cwd-based, exactly as
   # for the `workspace sync` above.
   out="$( cd "${WORKSPACE_ROOT}" \
@@ -1009,13 +1008,19 @@ workspace_prune_run() {
     log "workspace prune (${label}) finished"
   elif [ "${rc}" = "124" ]; then
     log "WARN: workspace prune (${label}) TIMED OUT after ${PRUNE_TIMEOUT_SECONDS}s and was terminated — the boot was not held open, and nothing was removed. A first pass over a never-pruned volume can legitimately need longer: raise ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS, but keep it (plus the grace) inside your platform's health-check window."
-  elif [ "${rc}" = "137" ]; then
-    # 124 is `timeout`'s own "I terminated it"; 137 (128+9) is what it reports
-    # when the child had to be KILLED after `-k`. Measured, not assumed: GNU
-    # timeout does NOT normalise the kill path to 124, so a 124-only branch would
-    # file exactly the case `-k` exists for under the generic "exited N" message.
-    # Worth its own line either way — a CLI that ignores SIGTERM is a fact about
-    # the CLI, not about this boot.
+  elif [ "${rc}" = "137" ] && [ $(( SECONDS - started )) -ge "${PRUNE_TIMEOUT_SECONDS}" ]; then
+    # 124 is `timeout`'s own "I terminated it" and needs no corroboration. 137 is
+    # NOT ours to claim: it is 128+9, which `timeout` reports for any SIGKILL
+    # death of the child — `timeout 100 bash -c 'kill -9 $$'` returns 137 with no
+    # `-k` involved at all. The elapsed check is the disambiguator: only a pass
+    # that actually ran out its bound can have been killed by our grace.
+    #
+    # An early 137 therefore falls through to the generic branch below, which
+    # says only what it knows. That matters because the realistic early cause is
+    # the OOM killer, and this branch's remedy — raise the timeout — would make
+    # an OOM strictly worse (the next pass runs longer and allocates more before
+    # dying), while pointing the investigation at the CLI instead of the memory
+    # ceiling.
     log "WARN: workspace prune (${label}) TIMED OUT after ${PRUNE_TIMEOUT_SECONDS}s and did NOT exit on SIGTERM, so it was KILLED after the ${PRUNE_KILL_AFTER_SECONDS}s grace — the boot was not held open, and nothing was removed. Raise ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS (keeping it plus the grace inside your health-check window); if this recurs, the CLI is trapping SIGTERM and the grace may need to be longer."
   else
     log "WARN: workspace prune (${label}) exited ${rc} — nothing was removed by this pass; the volume keeps what it holds until the next one. Check the verdict lines above."
@@ -1056,12 +1061,17 @@ if [ "${PRUNE_ENABLED}" = "1" ]; then
   # 240s, and the number is chosen against a specific window rather than being
   # "generously large": this pass runs at 3c-ii, while the console that serves
   # the documented `/healthz` deployment health check does not start until 4b —
-  # so the pass sits IN FRONT of the endpoint the platform probes. Railway's
-  # healthcheck timeout defaults to 300s (and the README's own Railway walkthrough
-  # tells the operator to point it at `/healthz`), so any default above that
-  # reproduces the restart loop this bound exists to prevent, under the shipped
-  # configuration. A bound whose default permits its own failure mode is not a
-  # bound.
+  # so the pass sits IN FRONT of the endpoint the platform probes, and Railway's
+  # healthcheck timeout defaults to 300s.
+  #
+  # BE PRECISE ABOUT WHAT THIS BUYS, because 240+30 < 300 is easy to misread as a
+  # guarantee that the boot fits the window. It is not one. This bounds the step
+  # this file's prune hook owns; the boot's TOTAL is bounded by nothing here —
+  # `3c` (`workspace sync`) is deliberately unbounded, for the reason argued 80
+  # lines up, and `2c`'s auth retry ceiling is 600s on its own. 240 is prune's
+  # SHARE of a window those steps also draw on, and it is chosen because 900 gave
+  # this one step more than the whole window on the platform the README walks
+  # through.
   #
   # The trade runs one way: a timed-out pass costs a warning and nothing else —
   # the volume simply keeps what it holds until the next tick — while an overrun
@@ -1078,10 +1088,11 @@ if [ "${PRUNE_ENABLED}" = "1" ]; then
     log "WARN: ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=${PRUNE_TIMEOUT_SECONDS} is not a positive whole number of seconds — falling back to 240"
     PRUNE_TIMEOUT_SECONDS=240
   fi
-  # Grace for a CLI that traps TERM, before KILL. Test-only override; a deploy
-  # leaves it unset. 30s is long enough for an in-flight git operation to finish
-  # and short enough that TIMEOUT+GRACE (270s) still lands inside that 300s
-  # window — the pair is what has to fit, not the timeout alone.
+  # Grace for a CLI that traps TERM, before KILL. Operator-tunable; see the env
+  # table in docker/claude/README.md (this is NOT one of the test-only overrides).
+  # 30s is long enough for an in-flight git operation to finish, and the pair —
+  # timeout PLUS grace — is what has to fit whatever window sits in front of this
+  # container, not the timeout alone.
   PRUNE_KILL_AFTER_SECONDS="${ALISSA_WORKSPACE_PRUNE_KILL_AFTER_SECONDS:-30}"
   if ! printf '%s' "${PRUNE_KILL_AFTER_SECONDS}" | grep -qE '^[1-9][0-9]*$'; then
     log "WARN: ALISSA_WORKSPACE_PRUNE_KILL_AFTER_SECONDS=${PRUNE_KILL_AFTER_SECONDS} is not a positive whole number of seconds — falling back to 30"

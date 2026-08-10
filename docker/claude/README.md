@@ -237,7 +237,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_FORCE_CHOWN` | `0` | `1`/`true`/`yes`/`on` forces the root phase's full `chown -R` of the volume for that boot; anything else (incl. unset) leaves the probe in charge. Off by default: the entrypoint probes ownership at depth 1 and walks only when it finds a foreign owner (see [Boot-time ownership](#boot-time-ownership-the-volume-walk-is-guarded)). Set it for **one** boot after a root shell wrote files deeper in the tree |
 | `ALISSA_WORKSPACE_PRUNE` | `1` (**on**) | volume hygiene: `1`/`true`/`yes`/`on` runs `alissa code workspace prune` at boot **and** on an interval; `0` opts out, after which nothing in the container reclaims anything. Default-on because this is the container whose volume grows (see [Volume hygiene](#volume-hygiene-finished-worktrees-are-pruned)). Skipped, with one loud warning, if the installed CLI predates the subcommand |
 | `ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES` | `360` | minutes between prune passes. Daemon role only — the executor gets the boot pass and no loop. A non-numeric or non-positive value warns and falls back to `360` |
-| `ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS` | `240` | how long ONE prune pass may run before it is killed, so a slow first sweep over a never-pruned volume cannot hold the boot open. The default is chosen to sit inside a 300s health-check window — the pass runs *before* `/healthz` exists (see below). A timed-out pass warns (exit 124) and changes nothing. Garbage falls back to `240` |
+| `ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS` | `240` | how long ONE prune pass may run before it is killed, so a slow first sweep over a never-pruned volume cannot hold the boot open. The default is chosen to sit inside a 300s health-check window — the pass runs *before* `/healthz` exists (see below). A timed-out pass warns (exit 124, or 137 if it had to be killed) and changes nothing. Garbage falls back to `240` |
 | `ALISSA_WORKSPACE_PRUNE_KILL_AFTER_SECONDS` | `30` | grace a `SIGTERM`-trapping prune gets before `SIGKILL` (`timeout -k`). Without it a CLI that traps `TERM` is unbounded again. **Timeout + grace** is what must fit your health-check window |
 | `ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS` | *(CLI default)* | passed straight through as `--min-age-hours`; **pass-through** — unset ⇒ the CLI's own age gate. A value that is not a whole number of hours **disables prune for that boot** instead of falling back (the CLI's default gate may be *shorter* than the one you asked for) |
 
@@ -367,13 +367,21 @@ The default of **240s** is picked against a window, not chosen for roundness. Th
 prune pass runs at step `3c-ii`; the console that serves `/healthz` — the health
 check [the Railway walkthrough above](#the-console-on-railway) tells you to
 configure — does not start until `4b`. The pass therefore sits *in front of* the
-endpoint the platform probes, and Railway's healthcheck timeout defaults to 300s,
-so a larger default would reproduce the restart loop the bound exists to prevent.
+endpoint the platform probes, and Railway's healthcheck timeout defaults to 300s.
 `ALISSA_WORKSPACE_PRUNE_KILL_AFTER_SECONDS` (30) is the grace a `SIGTERM`-trapping
-CLI gets before `SIGKILL`; **it is the sum that must fit the window**, not the
-timeout alone. Raising the timeout for a known-slow first sweep is fine — the
-warning tells you to — as long as timeout + grace stays inside whatever window
-sits in front of this container. The neighbouring `alissa code workspace sync` is deliberately *not*
+CLI gets before `SIGKILL`; **it is the sum that must fit**, not the timeout alone.
+
+**This bounds the prune step, not the boot.** 240 + 30 < 300 says prune alone fits
+the window; it does not say the boot does, and nothing here bounds the total. Two
+unbounded steps run in front of it: `alissa code workspace sync` at `3c` is
+deliberately unbounded (hubs are a precondition — without them the daemon reviews
+nothing, so blocking on it is correct), and the auth retry loop at `2c` backs off
+to a 600s ceiling, which exceeds the whole window on its own. So read 240 as
+prune's *share* of a window other steps also draw on — the reason to prefer it
+over 900 is that 900 gave this one step more than the entire window. If your
+deployment has a health check in front of it, budget across all three, and when
+you raise the timeout for a known-slow first sweep keep timeout + grace inside
+whatever is left. The neighbouring `alissa code workspace sync` is deliberately *not*
 bounded this way: hubs are a precondition for reviewing anything, while prune is
 an optimization, and only one of those may delay a boot.
 

@@ -45,6 +45,10 @@
 #  10. a prune that ECHOES A TOKEN -> the boot log carries the redacted marker and
 #                                   NOT the raw token (a one-sided assertion
 #                                   would pass on a log containing both)
+#  11. an EARLY external SIGKILL -> reported as a plain exit 137, NOT as our
+#                                   kill-after-grace: `timeout` returns 128+signal
+#                                   for any signal death, and an OOM kill is the
+#                                   realistic early cause
 #
 # Usage: bash docker/claude/tests-entrypoint-prune.sh
 # Needs: bash, python3, jq (the entrypoint's own bootstrap uses both).
@@ -73,7 +77,14 @@ FAKE_HOME="${TMPROOT}/home"; mkdir -p "${FAKE_HOME}/.config/alissa"
 WORKSPACE="${TMPROOT}/workspace"; mkdir -p "${WORKSPACE}"
 SPY="${TMPROOT}/spy"; mkdir -p "${SPY}"
 cp "${HERE}/agents.yaml" "${FAKE_HOME}/.config/alissa/agents.yaml"
-cleanup() { rm -rf "${TMPROOT}"; }
+# FIFO_HOLDER is case 9's blocking-stdin writer (see there). Reaped in cleanup so
+# an early `bad` or a `set -e` abort between its start and its kill cannot leave a
+# stray `sleep` behind — the success-path kill alone would not cover those.
+FIFO_HOLDER=""
+cleanup() {
+  [ -n "${FIFO_HOLDER}" ] && kill "${FIFO_HOLDER}" 2>/dev/null || true
+  rm -rf "${TMPROOT}"
+}
 trap cleanup EXIT
 
 cat > "${BIN}/gh" <<'STUB'
@@ -154,6 +165,10 @@ HELP
     # PRUNE_READ_STDIN models a CLI that prompts. With stdin closed it reads EOF
     # and carries on; with stdin inherited from the entrypoint it blocks.
     [ -n "${PRUNE_READ_STDIN:-}" ] && read -r _
+    # PRUNE_SIGKILL_SELF models an EXTERNAL SIGKILL arriving early — the OOM
+    # killer being the realistic one. `timeout` reports 137 for it exactly as it
+    # does for its own -k kill, which is why the entrypoint checks elapsed time.
+    [ -n "${PRUNE_SIGKILL_SELF:-}" ] && kill -9 $$
     # PRUNE_ECHO_TOKEN models `git remote prune origin` echoing an https remote
     # that carries a credential — the case redact_token() exists for.
     [ -n "${PRUNE_ECHO_TOKEN:-}" ] && echo "error: failed to fetch https://x-access-token:${PRUNE_ECHO_TOKEN}@github.com/fahera-mx/example-repo"
@@ -516,6 +531,29 @@ assert_contains "${LOG10}" "***REDACTED***" "the token is redacted in the re-emi
 # satisfy the assertion above on its own.
 assert_not_contains "${LOG10}" "stub-alissa-token" "and the raw token appears nowhere in the boot log"
 stop_entrypoint "${PID10}"
+
+# -----------------------------------------------------------------------------
+info ""
+info "11. an EARLY 137 is not claimed as our timeout kill"
+# -----------------------------------------------------------------------------
+reset_spies
+LOG11="${TMPROOT}/oom.log"
+# `timeout` reports 128+signal for ANY signal death of the child, so 137 does not
+# mean "killed by our -k grace" — an OOM kill of the prune pass looks identical,
+# and on this container that is the realistic cause (a `git gc --auto` sweep over
+# a never-pruned object store, under a memory cap). Reporting it as a timeout
+# would assert a duration that never elapsed and advise RAISING the timeout,
+# which makes an OOM worse. The elapsed check is what separates them.
+run_entrypoint "${LOG11}" PRUNE_SIGKILL_SELF=1 ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=20
+PID11="${EP_PID}"
+wait_for_log "${LOG11}" "${DAEMON_UP}" 40 || bad "entrypoint never reached the worker-up milestone (see ${LOG11})"
+assert_contains "${LOG11}" "workspace prune (boot) exited 137" \
+  "an early SIGKILL falls through to the generic branch, which claims only what it knows"
+assert_not_contains "${LOG11}" "did NOT exit on SIGTERM" \
+  "and is NOT reported as our kill-after-grace (no SIGTERM was ever sent)"
+assert_not_contains "${LOG11}" "TIMED OUT after 20s" \
+  "nor as a 20s timeout that never elapsed"
+stop_entrypoint "${PID11}"
 
 info ""
 if [ "${fail}" = "0" ]; then
