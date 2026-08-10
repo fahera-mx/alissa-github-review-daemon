@@ -7,7 +7,10 @@ in strict budget order:
    UI-1 reader), the spawn ledger, the escalation table and the ping ledger. No
    GitHub call: the daemon already wrote everything down.
 2. **Local process state** -- `alissa tmux ls --json` for the session list, and
-   a `/proc` walk (sysinfo) of each session's pane-PID tree for CPU%/RSS.
+   a `/proc` walk (sysinfo) of each session's pane-PID tree for CPU%/RSS, plus
+   the two container-wide reads the per-session sums cannot answer: the cgroup
+   memory charge split into resident vs reclaimable, and the top processes by
+   RSS across the whole host. One `/proc` scan serves both.
 3. **Two cached remote checks** -- `gh api rate_limit` (60s cache) for the rate
    meter, and the PyPI version JSON (10m cache) for the running-vs-latest drift
    chip. These are the *only* network calls, and both are cached so a room full
@@ -61,6 +64,10 @@ from . import sysinfo
 
 # How many recent snapshots feed the sparklines / pipeline board.
 SPARK_POINTS = 60
+# How many processes the host-wide top-by-RSS list carries. Five is the whole
+# point of the panel: it names what is holding a resident charge, it is not a
+# process browser, and every extra row is payload on a ~10s poll.
+TOP_PROCS = 5
 # Cache lifetimes for the remote checks (seconds).
 RATE_CACHE_TTL = 60.0
 VERSION_CACHE_TTL = 600.0
@@ -156,6 +163,7 @@ class Sources:
         run: "Callable[..., str]" = proc_run,
         http_get: "Callable[[str, float], bytes | None]" = _default_http_get,
         proc_root: str = "/proc",
+        cgroup_root: str = "/sys/fs/cgroup",
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -165,6 +173,7 @@ class Sources:
         self._run = run
         self._http_get = http_get
         self._proc_root = proc_root
+        self._cgroup_root = cgroup_root
         self._clock = clock
         self._wall = wall_clock
         self._rate_cache = _Cache(RATE_CACHE_TTL, clock)
@@ -283,7 +292,11 @@ class Sources:
         rows = self._read_state([], lambda st: st.read_spawns(sessions=names))
         return {row["session"]: row for row in rows}
 
-    def sessions(self, spawns: "list[dict] | None" = None) -> "list[dict]":
+    def sessions(
+        self,
+        spawns: "list[dict] | None" = None,
+        index: "tuple[dict[int, list[int]], dict[int, dict]] | None" = None,
+    ) -> "list[dict]":
         """The managed-session table: liveness from `alissa tmux ls`, footprint
         from /proc, and the PR round each session is reviewing.
 
@@ -296,6 +309,12 @@ class Sources:
         `spawns` supplies the ledger rows directly; when it is None (the
         dashboard's path) they are read here, keyed by the names tmux just
         returned -- which is why the session list is fetched first.
+
+        `index` supplies the `/proc` snapshot. The dashboard now needs one
+        anyway for the host-wide top-process list, so it builds the index once
+        and hands the same one here; passed None (a caller that only wants the
+        table) the old lazy build is unchanged and a table with no live pane
+        still never scans `/proc`.
         """
         raw = self._safe_json(["alissa", "tmux", "ls", "--json"]) or []
         if not isinstance(raw, list):
@@ -311,9 +330,8 @@ class Sources:
         out: list[dict] = []
         # ONE /proc snapshot for the whole table: the index is identical for
         # every session in this build, so rebuilding it per session would make
-        # the walk O(sessions x processes). Built lazily -- a table with no
-        # live pane never scans /proc at all.
-        index: "tuple[dict[int, list[int]], dict[int, dict]] | None" = None
+        # the walk O(sessions x processes). Built lazily when the caller did
+        # not supply one -- a table with no live pane never scans /proc at all.
         for entry in raw:
             if not isinstance(entry, dict):
                 continue
@@ -479,9 +497,18 @@ class Sources:
         snaps = self.snapshots(SPARK_POINTS)
         latest = snaps[0] if snaps else None
         ledgers = self.ledgers()
-        sessions = self.sessions()
+        # ONE /proc scan for this whole build: the session table walks pane
+        # trees out of it and the top-process list ranks the same snapshot, so
+        # the two panels can never disagree about a process that exited between
+        # them -- and the host pays for one walk per poll, not two.
+        proc_index = sysinfo.build_index(self._proc_root)
+        sessions = self.sessions(index=proc_index)
         rate = self.rate_limit()
         disk = sysinfo.disk_usage(self.config.workspace_root)
+        memory = sysinfo.cgroup_memory(self._cgroup_root)
+        top_procs = sysinfo.top_procs(
+            TOP_PROCS, proc_root=self._proc_root, index=proc_index
+        )
 
         # Sparklines want oldest -> newest for left-to-right drawing. "Active"
         # counts both buckets a live reviewer session sits in: a round enqueued
@@ -522,6 +549,11 @@ class Sources:
                 "live_sessions": sum(1 for s in sessions if s["live"]),
                 "rate": rate,
                 "volume": disk,
+                # The container's own charge, split three ways. Every field is
+                # None on a host without cgroup v2 (dev laptop, macOS) and the
+                # tile renders "unavailable" -- the console must not require
+                # Linux to load.
+                "memory": memory,
                 "queue_depth": latest["candidates"] if latest else 0,
             },
             "sparklines": sparklines,
@@ -533,6 +565,9 @@ class Sources:
             },
             "inbox": self._inbox(ledgers["escalations"], ledgers["pings"]),
             "sessions": sessions,
+            # Host-wide, not per session: when the memory tile says the charge
+            # IS resident, this is what names the holder.
+            "top_procs": top_procs,
             "log": self.log_tail(),
         }
 

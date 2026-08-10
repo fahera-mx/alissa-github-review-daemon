@@ -57,7 +57,7 @@ def seed(db_path):
 
 
 def make_sources(tmp_path, *, runner=None, http=None, clock=None, proc_root="/proc",
-                 log_path=None):
+                 cgroup_root="/sys/fs/cgroup", log_path=None):
     config = Config.build(tmp_path, {"repos": ["acme/widgets"]}, {})
     seed(config.state_db)
 
@@ -71,7 +71,8 @@ def make_sources(tmp_path, *, runner=None, http=None, clock=None, proc_root="/pr
     return Sources(
         config=config, running_version="0.14.0", log_path=log_path,
         run=runner or default_run, http_get=http or default_http,
-        proc_root=proc_root, clock=clk, wall_clock=lambda: 5000.0,
+        proc_root=proc_root, cgroup_root=cgroup_root, clock=clk,
+        wall_clock=lambda: 5000.0,
     )
 
 
@@ -404,7 +405,7 @@ def test_dashboard_shape(tmp_path):
     src = make_sources(tmp_path, runner=runner)
     d = src.dashboard()
     assert set(d) >= {"header", "config", "tiles", "sparklines", "pipeline",
-                      "inbox", "sessions", "log", "generated_at"}
+                      "inbox", "sessions", "top_procs", "log", "generated_at"}
     # reviewers create no tasks -- there is no worker-tasks panel
     assert "tasks" not in d
     assert d["header"]["round_cap"] == src.config.round_cap
@@ -675,3 +676,116 @@ def test_session_pairing_survives_an_old_spawn_row(tmp_path):
     # and the read is bounded by the names asked for, not by the ledger size
     assert set(src.spawn_pairs([SESSION])) == {SESSION}
     assert src.spawn_pairs([]) == {}
+
+
+# -- container memory tile + host-wide top processes ------------------------
+
+def write_proc_and_cgroup(tmp_path):
+    """A crafted /proc (one reviewer pane tree plus two processes OUTSIDE it)
+    and a cgroup v2 tree carrying the audited Railway plateau."""
+    proc = tmp_path / "proc"
+    for pid, ppid, rss, comm in ((77, 1, 10, "claude"), (78, 77, 20, "node"),
+                                 (900, 1, 5000, "postgres"), (901, 1, 30, "bash")):
+        (proc / str(pid)).mkdir(parents=True)
+        tail = ["S"] + ["0"] * 21
+        tail[1] = str(ppid)
+        tail[21] = str(rss)
+        (proc / str(pid) / "stat").write_text(f"{pid} ({comm}) " + " ".join(tail))
+    cg = tmp_path / "cgroup"
+    cg.mkdir()
+    (cg / "memory.current").write_text("6420496384\n")
+    (cg / "memory.stat").write_text(
+        "anon 75091968\nfile 2362232832\nshmem 0\ninactive_file 2000000000\n"
+        "slab_reclaimable 3983993651\nslab_unreclaimable 2065528\nslab 3986059179\n"
+    )
+    return proc, cg
+
+
+def _one_session_runner(argv, **kw):
+    if argv[:3] == ["alissa", "tmux", "ls"]:
+        return json.dumps([{"name": SESSION, "session": "s1",
+                            "status": "busy", "live": True}])
+    if argv[:2] == ["tmux", "list-panes"]:
+        return "77\n"
+    if argv[:3] == ["gh", "api", "rate_limit"]:
+        return "{}"
+    raise AssertionError(argv)
+
+
+def test_dashboard_splits_the_container_memory_charge(tmp_path):
+    """The tile the console was missing: a multi-GB plateau with no reviewer
+    sessions reads as a little real memory plus a lot of reclaimable cache,
+    without shelling into the container."""
+    proc, cg = write_proc_and_cgroup(tmp_path)
+    src = make_sources(tmp_path, runner=_one_session_runner,
+                       proc_root=str(proc), cgroup_root=str(cg))
+    mem = src.dashboard()["tiles"]["memory"]
+    assert mem["charged"] == 6420496384
+    assert mem["resident"] == 75091968
+    assert mem["reclaimable"] == 2362232832 + 3983993651
+    # and the per-session sums cannot answer it: the whole session table is
+    # two orders of magnitude smaller than the charge it sits inside
+    assert src.dashboard()["sessions"][0]["rss_bytes"] < mem["resident"]
+
+
+def test_memory_tile_is_unavailable_without_cgroup_v2(tmp_path):
+    """A dev laptop / macOS has no cgroup v2: the tile renders "unavailable"
+    and the rest of the dashboard is untouched -- never an exception."""
+    proc, _ = write_proc_and_cgroup(tmp_path)
+    src = make_sources(tmp_path, runner=_one_session_runner, proc_root=str(proc),
+                       cgroup_root=str(tmp_path / "no-such-cgroup"))
+    d = src.dashboard()
+    assert all(v is None for v in d["tiles"]["memory"].values())
+    assert d["tiles"]["volume"] is not None  # the neighbouring tile still works
+    assert d["sessions"][0]["pane_pid"] == 77
+
+
+def test_top_procs_are_host_wide_not_session_trees(tmp_path):
+    """The biggest process on the host is deliberately NOT in any reviewer's
+    pane tree -- that is the case the sessions panel cannot show."""
+    proc, cg = write_proc_and_cgroup(tmp_path)
+    src = make_sources(tmp_path, runner=_one_session_runner,
+                       proc_root=str(proc), cgroup_root=str(cg))
+    rows = src.dashboard()["top_procs"]
+    assert len(rows) == 4  # bounded by TOP_PROCS, here by the fixture's size
+    assert rows[0] == {"pid": 900, "comm": "postgres",
+                       "rss_bytes": 5000 * sources_mod.sysinfo._PAGE_SIZE}
+    assert [r["pid"] for r in rows] == [900, 901, 78, 77]
+
+
+def test_top_procs_are_bounded(tmp_path):
+    proc = tmp_path / "proc"
+    for pid in range(100, 120):
+        (proc / str(pid)).mkdir(parents=True)
+        tail = ["S"] + ["0"] * 21
+        tail[1] = "1"
+        tail[21] = str(pid)
+        (proc / str(pid) / "stat").write_text(f"{pid} (claude) " + " ".join(tail))
+
+    def runner(argv, **kw):
+        if argv[:3] == ["alissa", "tmux", "ls"]:
+            return "[]"
+        if argv[:3] == ["gh", "api", "rate_limit"]:
+            return "{}"
+        raise AssertionError(argv)
+
+    rows = make_sources(tmp_path, runner=runner,
+                        proc_root=str(proc)).dashboard()["top_procs"]
+    assert len(rows) == sources_mod.TOP_PROCS
+    assert rows[0]["pid"] == 119  # rss == pid in this fixture: largest first
+
+
+def test_dashboard_scans_proc_once_for_both_panels(tmp_path, monkeypatch):
+    """The session table and the top-process list rank the SAME snapshot: one
+    walk per build, and the two panels can never disagree about a process that
+    exited between them."""
+    proc, cg = write_proc_and_cgroup(tmp_path)
+    builds = []
+    real_build = sources_mod.sysinfo.build_index
+    monkeypatch.setattr(sources_mod.sysinfo, "build_index",
+                        lambda root: builds.append(root) or real_build(root))
+    src = make_sources(tmp_path, runner=_one_session_runner,
+                       proc_root=str(proc), cgroup_root=str(cg))
+    d = src.dashboard()
+    assert len(builds) == 1
+    assert d["sessions"][0]["rss_bytes"] is not None and d["top_procs"]

@@ -52,7 +52,7 @@ def test_gold_accent_is_spent_only_on_the_drift_chip():
 
 def test_dashboard_has_all_panel_containers():
     html = dashboard_page("c", "1.0.0")
-    for panel_id in ("tiles", "pipeline", "sessions", "inbox", "log",
+    for panel_id in ("tiles", "pipeline", "sessions", "topprocs", "inbox", "log",
                      "spark-duration", "spark-active", "drift", "state-banner"):
         assert f'id="{panel_id}"' in html
 
@@ -99,3 +99,35 @@ def test_kill_button_is_wired_by_index_not_by_name():
     assert "data-name=" not in html
     # and an unmanaged session is called out in the confirm prompt
     assert "NOT managed by this daemon" in html
+
+
+def test_dashboard_reads_a_container_memory_plateau_at_a_glance():
+    """The tile issue #74 exists for: the headline is what the container is
+    CHARGED, and the sub says how much of it is real vs cache the kernel would
+    drop -- otherwise a platform memory graph cannot be answered in-console."""
+    html = dashboard_page("c", "1.0.0")
+    assert "Container Memory" in html
+    assert "' resident \u00b7 '" in html
+    assert "' reclaimable'" in html
+    # a host without cgroup v2 says so instead of erroring
+    assert "'no cgroup v2'" in html
+    # the meter is the RESIDENT share of the charge -- the part a limit kills
+    # for -- so warn/crit mean the same thing here as on the other tiles
+    assert "100 * mem.resident / mem.charged" in html
+
+
+def test_dashboard_top_process_panel_is_read_only():
+    """Host-wide PIDs are unmanaged: the panel names what holds the memory,
+    and the sessions table above stays the only place to kill anything."""
+    html = dashboard_page("c", "1.0.0")
+    assert "by RSS, host-wide" in html
+    assert "renderTopProcs(d.top_procs)" in html
+    body = html.split("function renderTopProcs")[1].split("function renderLog")[0]
+    assert "action/kill" not in body and "btn" not in body
+
+
+def test_dashboard_tiles_grid_fits_five_tiles():
+    """Five tiles now; the narrow breakpoint must still win over the mid one."""
+    html = dashboard_page("c", "1.0.0")
+    assert "grid-template-columns: repeat(5, 1fr)" in html
+    assert html.index("max-width: 1100px") < html.index("max-width: 900px")
