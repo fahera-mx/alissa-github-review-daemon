@@ -12,6 +12,13 @@
 #   * node + the alissa CLI                          (worker, tmux queue, tasks)
 #   * claude-code                                    (the agent the worker spawns)
 #
+# ONE IMAGE, TWO ROLES (issue #73). `CONTAINER_ROLE=executor` boots the same
+# image as an Alissa Studio queue EXECUTOR (`alissa bridge start`) instead of the
+# review daemon — deployed as a SECOND service, never as a sidecar of the first.
+# Nothing below changes for it: the executor uses the same CLI, the same claude,
+# the same agents.yaml and the same entrypoint, which simply takes a different
+# branch. See "Bridge executor role" in README.md.
+#
 # Build context is this directory (docker/claude) — the image pulls the daemon
 # from PyPI, so no repo source is copied in.
 #
@@ -182,6 +189,22 @@ WORKDIR /workspace
 #     so it pairs with the passcode it is useless without.
 #   * ALISSA_UI_SECURE_COOKIE — TLS-posture flag read by the sidecar itself.
 # EXPOSE below documents the console port; the console is disabled by default.
+#
+# AND deliberately not here (runtime-only): every bridge-executor knob —
+# CONTAINER_ROLE, ALISSA_BRIDGE_EXECUTOR, ALISSA_BRIDGE_EXECUTOR_ID,
+# ALISSA_BRIDGE_LABEL, ALISSA_BRIDGE_MAX_CONCURRENT, ALISSA_BRIDGE_POLL_SECONDS,
+# ALISSA_BRIDGE_HANDOFF. Same reasoning as the console flags, plus one that is
+# specific to the role:
+#   * CONTAINER_ROLE is what makes ONE image serve TWO services. Baking a default
+#     other than `daemon` would make the artifact role-specific — the opposite of
+#     the "same image, no second Dockerfile" decision this role exists under.
+#   * ALISSA_BRIDGE_EXECUTOR is the arming gate, and an ARG default is a value
+#     every deploy inherits. It stays unset so the image ships DISARMED and the
+#     entrypoint's own `${…:-0}` is the only default there is.
+#   * the id / label / concurrency / interval / handoff knobs only mean anything
+#     on a service that already set the two above, and the entrypoint supplies
+#     their defaults (`revloop-executor`, `claude`, and CLI pass-through for the
+#     rest), so an ARG here would just be a second place for them to drift.
 
 # Allowlist of repos to watch, as a single string separated by "|" (a single
 # repo needs no separator). "|" is used because repo slugs contain "/".

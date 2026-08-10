@@ -13,7 +13,10 @@ on: [pull_request]
 #     docker/claude/tests-entrypoint-identity.sh;
 #   * the `alissa auth login` failure triage (missing CLI -> re-bootstrap,
 #     unreachable API / unwritable config -> capped backoff, genuine 401 ->
-#     fast FATAL), same way — docker/claude/tests-entrypoint-auth.sh.
+#     fast FATAL), same way — docker/claude/tests-entrypoint-auth.sh;
+#   * the bridge-executor role (CONTAINER_ROLE / ALISSA_BRIDGE_* gate, executor
+#     identity, and the guarantee that neither role starts the other's
+#     supervisor) — docker/claude/tests-entrypoint-executor.sh.
 jobs:
   entrypoint-config-check:
     name: Entrypoint config renderer + console wiring
@@ -68,6 +71,16 @@ jobs:
         # #62 exists for; only the genuine rejection may exit.
         timeout-minutes: 5
         run: bash docker/claude/tests-entrypoint-auth.sh
+      - name: Execute Entrypoint Bridge-Executor Role Tests
+        # Boots the entrypoint nine times across both roles. The load-bearing
+        # assertions are negative: an unarmed executor starts nothing, an armed
+        # one starts neither the worker nor alissa-revloop, and the daemon role
+        # never starts a bridge however the ALISSA_BRIDGE_* env is set — the
+        # two services must not share a process chain (issue #73). One case
+        # holds a config dir unwritable to prove the volume class still backs
+        # off instead of crash-looping, hence the timeout headroom.
+        timeout-minutes: 6
+        run: bash docker/claude/tests-entrypoint-executor.sh
       - name: Execute Entrypoint Console Wiring Tests
         # Boots the entrypoint four times (console off / enabled-without-passcode
         # / enabled / sidecar killed under it). No docker needed: the CLIs the
