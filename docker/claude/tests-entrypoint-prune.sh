@@ -35,6 +35,20 @@
 #                                   worker, and the warning names the knob. The
 #                                   boot hook runs BEFORE the worker starts, so
 #                                   an unbounded pass delays every boot
+#   8. a TERM-TRAPPING prune     -> `-k` KILLs it. Plain `timeout` waits forever
+#                                   on a child that traps TERM, so without the
+#                                   grace flag case 7's bound is not a bound
+#   9. a prune that READS STDIN  -> `</dev/null` gives it EOF and the pass
+#                                   SUCCEEDS; without it the pass would sit until
+#                                   the timeout, so the success line is what
+#                                   distinguishes the two
+#  10. a prune that ECHOES A TOKEN -> the boot log carries the redacted marker and
+#                                   NOT the raw token (a one-sided assertion
+#                                   would pass on a log containing both)
+#  11. an EARLY external SIGKILL -> reported as a plain exit 137, NOT as our
+#                                   kill-after-grace: `timeout` returns 128+signal
+#                                   for any signal death, and an OOM kill is the
+#                                   realistic early cause
 #
 # Usage: bash docker/claude/tests-entrypoint-prune.sh
 # Needs: bash, python3, jq (the entrypoint's own bootstrap uses both).
@@ -63,7 +77,14 @@ FAKE_HOME="${TMPROOT}/home"; mkdir -p "${FAKE_HOME}/.config/alissa"
 WORKSPACE="${TMPROOT}/workspace"; mkdir -p "${WORKSPACE}"
 SPY="${TMPROOT}/spy"; mkdir -p "${SPY}"
 cp "${HERE}/agents.yaml" "${FAKE_HOME}/.config/alissa/agents.yaml"
-cleanup() { rm -rf "${TMPROOT}"; }
+# FIFO_HOLDER is case 9's blocking-stdin writer (see there). Reaped in cleanup so
+# an early `bad` or a `set -e` abort between its start and its kill cannot leave a
+# stray `sleep` behind — the success-path kill alone would not cover those.
+FIFO_HOLDER=""
+cleanup() {
+  [ -n "${FIFO_HOLDER}" ] && kill "${FIFO_HOLDER}" 2>/dev/null || true
+  rm -rf "${TMPROOT}"
+}
 trap cleanup EXIT
 
 cat > "${BIN}/gh" <<'STUB'
@@ -131,9 +152,27 @@ HELP
       exit 0
     fi
     printf 'cwd=%s argv=%s\n' "${PWD}" "$*" >> "${SPY_DIR}/prune-argv"
-    # PRUNE_HANG models the slow first sweep (or a prompt on a tty-less
-    # container): the entrypoint's `timeout` is the only thing that ends it.
+    # PRUNE_HANG models the slow first sweep: the entrypoint's `timeout` is the
+    # only thing that ends it.
     [ -n "${PRUNE_HANG:-}" ] && sleep 120
+    # PRUNE_TRAP_TERM models a CLI that handles SIGTERM gracefully — finishing
+    # the in-flight git operation instead of dying. Plain `timeout` would wait
+    # for it forever; only `-k` ends this.
+    if [ -n "${PRUNE_TRAP_TERM:-}" ]; then
+      trap 'echo "caught TERM, still finishing" >&2' TERM
+      end=$((SECONDS+120)); while [ "${SECONDS}" -lt "${end}" ]; do sleep 1; done
+    fi
+    # PRUNE_READ_STDIN models a CLI that prompts. With stdin closed it reads EOF
+    # and carries on; with stdin inherited from the entrypoint it blocks.
+    [ -n "${PRUNE_READ_STDIN:-}" ] && read -r _
+    # PRUNE_SIGKILL_SELF models an EXTERNAL SIGKILL arriving early — the OOM
+    # killer being the realistic one. `timeout` reports 137 for it exactly as it
+    # does for its own -k kill, which is why the entrypoint checks elapsed time.
+    [ -n "${PRUNE_SIGKILL_SELF:-}" ] && kill -9 $$
+    # PRUNE_ECHO_TOKEN models `git remote prune origin` echoing an https remote
+    # that carries a credential — the case redact_token() exists for.
+    [ -n "${PRUNE_ECHO_TOKEN:-}" ] && echo "error: failed to fetch https://x-access-token:${PRUNE_ECHO_TOKEN}@github.com/fahera-mx/example-repo"
+    :
     n="$(wc -l < "${SPY_DIR}/prune-argv" | tr -d ' ')"
     echo "keep  main (never pruned)"
     echo "prune TASK-1-EXAMPLE (branch merged, PR closed)"
@@ -176,6 +215,12 @@ reset_spies() {
 
 prune_count() { [ -f "${SPY}/prune-argv" ] && wc -l < "${SPY}/prune-argv" | tr -d ' ' || echo 0; }
 
+# What the entrypoint's own stdin is. Defaults to /dev/null, which is also what a
+# backgrounded job gets for free — and that is exactly why case 9 overrides it: a
+# harness whose stdin is already EOF cannot tell `</dev/null` on the prune runner
+# from its absence. Case 9 points this at a FIFO held open by a writer that never
+# writes, so an inherited stdin BLOCKS and the missing redirect becomes visible.
+EP_STDIN="/dev/null"
 EP_PID=""
 run_entrypoint() {
   local log="$1"; shift
@@ -189,7 +234,7 @@ run_entrypoint() {
     ALISSA_REVIEW_REPOS="fahera-mx/example-repo" \
     SPY_DIR="${SPY}" \
     "$@" \
-    bash "${ENTRYPOINT}" > "${log}" 2>&1 &
+    bash "${ENTRYPOINT}" < "${EP_STDIN}" > "${log}" 2>&1 &
   EP_PID=$!
 }
 
@@ -410,6 +455,105 @@ kill -0 "${PID7}" 2>/dev/null \
   && pass "the container is alive after a timed-out pass" \
   || bad "a timed-out prune killed the container"
 stop_entrypoint "${PID7}"
+
+# -----------------------------------------------------------------------------
+info ""
+info "8. a TERM-TRAPPING prune is KILLED, not waited on"
+# -----------------------------------------------------------------------------
+reset_spies
+LOG8="${TMPROOT}/trap.log"
+# `timeout` without -k sends TERM and then waits INDEFINITELY, so a CLI that
+# traps TERM is unbounded again — the same held-open boot case 7 covers, one step
+# further along. `workspace prune` is the destructive subcommand in the set, and
+# a handler that finishes the in-flight git operation is exactly what it would
+# plausibly install, so this is the bound that has to survive the CLI landing.
+run_entrypoint "${LOG8}" PRUNE_TRAP_TERM=1 \
+  ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=2 ALISSA_WORKSPACE_PRUNE_KILL_AFTER_SECONDS=2
+PID8="${EP_PID}"
+if wait_for_log "${LOG8}" "${DAEMON_UP}" 40; then
+  pass "the boot reaches the worker even though the prune pass ignores SIGTERM"
+else
+  bad "a TERM-trapping prune pass held the boot open — is -k missing? (see ${LOG8})"
+fi
+# GNU `timeout` reports 137 (128+9), NOT 124, when the child had to be KILLED
+# after -k — measured on this harness, and the reason the entrypoint has a
+# separate branch for it. Assert the KILL wording specifically: a 124-only branch
+# would file this case under the generic "exited N" message, which is precisely
+# the case -k exists for.
+assert_contains "${LOG8}" "did NOT exit on SIGTERM, so it was KILLED after the 2s grace" \
+  "the kill path is reported as a timeout+kill, not as a generic non-zero exit"
+assert_not_contains "${LOG8}" "workspace prune (boot) exited 137" \
+  "and does not fall through to the generic exit-code branch"
+stop_entrypoint "${PID8}"
+
+# -----------------------------------------------------------------------------
+info ""
+info "9. a prune that reads stdin gets EOF, not the entrypoint's stdin"
+# -----------------------------------------------------------------------------
+reset_spies
+LOG9="${TMPROOT}/stdin.log"
+# Command substitution inherits stdin, so without `</dev/null` a prompting CLI
+# would sit until the timeout fires. The assertion is therefore the SUCCESS line,
+# not the timeout WARN: both leave the boot alive, and only the success line
+# distinguishes "got EOF and carried on" from "was cut off".
+STDIN_FIFO="${TMPROOT}/blocking-stdin.fifo"
+mkfifo "${STDIN_FIFO}"
+# A writer that never writes: opening the read end then yields no data and no
+# EOF, so a child inheriting it blocks. Backgrounded because opening a FIFO for
+# writing blocks until a reader arrives.
+sleep 120 > "${STDIN_FIFO}" &
+FIFO_HOLDER=$!
+EP_STDIN="${STDIN_FIFO}"
+run_entrypoint "${LOG9}" PRUNE_READ_STDIN=1 ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=20
+PID9="${EP_PID}"
+EP_STDIN="/dev/null"
+wait_for_log "${LOG9}" "${DAEMON_UP}" 40 || bad "entrypoint never reached the worker-up milestone (see ${LOG9})"
+assert_contains "${LOG9}" "workspace prune (boot) finished" \
+  "the pass completes promptly on EOF (stdin is closed, not inherited)"
+assert_not_contains "${LOG9}" "TIMED OUT" "and is not merely cut off by the bound"
+stop_entrypoint "${PID9}"
+kill "${FIFO_HOLDER}" 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
+info ""
+info "10. a token echoed by prune is REDACTED in the boot log"
+# -----------------------------------------------------------------------------
+reset_spies
+LOG10="${TMPROOT}/redact.log"
+# Modelled on the real shape: `git remote prune origin` failing and echoing an
+# https remote, on a hub whose credential helper `gh auth setup-git` wired in at
+# step 1. The stub echoes the API token the sandbox injects.
+run_entrypoint "${LOG10}" PRUNE_ECHO_TOKEN=stub-alissa-token
+PID10="${EP_PID}"
+wait_for_log "${LOG10}" "${DAEMON_UP}" 40 || bad "entrypoint never reached the worker-up milestone (see ${LOG10})"
+assert_contains "${LOG10}" "***REDACTED***" "the token is redacted in the re-emitted prune output"
+# Two-sided on purpose: a log containing BOTH the marker and the raw token would
+# satisfy the assertion above on its own.
+assert_not_contains "${LOG10}" "stub-alissa-token" "and the raw token appears nowhere in the boot log"
+stop_entrypoint "${PID10}"
+
+# -----------------------------------------------------------------------------
+info ""
+info "11. an EARLY 137 is not claimed as our timeout kill"
+# -----------------------------------------------------------------------------
+reset_spies
+LOG11="${TMPROOT}/oom.log"
+# `timeout` reports 128+signal for ANY signal death of the child, so 137 does not
+# mean "killed by our -k grace" — an OOM kill of the prune pass looks identical,
+# and on this container that is the realistic cause (a `git gc --auto` sweep over
+# a never-pruned object store, under a memory cap). Reporting it as a timeout
+# would assert a duration that never elapsed and advise RAISING the timeout,
+# which makes an OOM worse. The elapsed check is what separates them.
+run_entrypoint "${LOG11}" PRUNE_SIGKILL_SELF=1 ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS=20
+PID11="${EP_PID}"
+wait_for_log "${LOG11}" "${DAEMON_UP}" 40 || bad "entrypoint never reached the worker-up milestone (see ${LOG11})"
+assert_contains "${LOG11}" "workspace prune (boot) exited 137" \
+  "an early SIGKILL falls through to the generic branch, which claims only what it knows"
+assert_not_contains "${LOG11}" "did NOT exit on SIGTERM" \
+  "and is NOT reported as our kill-after-grace (no SIGTERM was ever sent)"
+assert_not_contains "${LOG11}" "TIMED OUT after 20s" \
+  "nor as a 20s timeout that never elapsed"
+stop_entrypoint "${PID11}"
 
 info ""
 if [ "${fail}" = "0" ]; then
