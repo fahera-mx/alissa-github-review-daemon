@@ -235,6 +235,10 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |
 | `ALISSA_FIREWALL_EXTRA` | *(empty)* | extra firewall allowlist hosts, space-separated |
 | `ALISSA_FORCE_CHOWN` | `0` | `1`/`true`/`yes`/`on` forces the root phase's full `chown -R` of the volume for that boot; anything else (incl. unset) leaves the probe in charge. Off by default: the entrypoint probes ownership at depth 1 and walks only when it finds a foreign owner (see [Boot-time ownership](#boot-time-ownership-the-volume-walk-is-guarded)). Set it for **one** boot after a root shell wrote files deeper in the tree |
+| `ALISSA_WORKSPACE_PRUNE` | `1` (**on**) | volume hygiene: `1`/`true`/`yes`/`on` runs `alissa code workspace prune` at boot **and** on an interval; `0` opts out, after which nothing in the container reclaims anything. Default-on because this is the container whose volume grows (see [Volume hygiene](#volume-hygiene-finished-worktrees-are-pruned)). Skipped, with one loud warning, if the installed CLI predates the subcommand |
+| `ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES` | `360` | minutes between prune passes. Daemon role only — the executor gets the boot pass and no loop. A non-numeric or non-positive value warns and falls back to `360` |
+| `ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS` | `900` | how long ONE prune pass may run before it is killed, so a slow first sweep over a never-pruned volume cannot hold the boot open. A timed-out pass warns (exit 124) and changes nothing. Garbage falls back to `900` |
+| `ALISSA_WORKSPACE_PRUNE_MIN_AGE_HOURS` | *(CLI default)* | passed straight through as `--min-age-hours`; **pass-through** — unset ⇒ the CLI's own age gate. A value that is not a whole number of hours **disables prune for that boot** instead of falling back (the CLI's default gate may be *shorter* than the one you asked for) |
 
 #### Config precedence: env var > daemon library default
 
@@ -302,6 +306,75 @@ Reclaiming the cache after the fact is not an option on Railway: `/sys/fs/cgroup
 is mounted read-only inside the container, so writing `memory.reclaim` fails with
 `EROFS` even as root (verified 2026-08-09). Avoidance is the only lever, which is
 why the entrypoint has no reclaim call.
+
+#### Volume hygiene: finished worktrees are pruned
+
+**The diagnosis.** Until issue #81 this container removed *nothing*, ever. Every
+review round materializes a per-PR worktree inside a hub (`<repo>/TASK-…`), plus
+whatever a session's build or test run leaves in it; a merged or closed PR left
+its worktree exactly where it was; and the bare `.source` object store behind
+each hub only ever grew, because nothing pruned the remote-tracking refs the
+deleted branches left behind. There was no cleanup path anywhere in the image —
+not at boot, not on merge, not on a timer — so the only bound on the volume was
+the volume's size, and the only remedy was a human with a shell.
+
+**The remediation** is the CLI's own primitive, `alissa code workspace prune`,
+which removes finished-branch worktrees behind its safety rails (never `main/`,
+never a dirty tree without `--force`, an age gate, a live-tmux-session guard,
+never a worktree whose PR is still open, and a lookup failure *keeps* the
+worktree) and then runs the hub-level `git worktree prune` /
+`git remote prune origin` / `git gc --auto` sequence. The entrypoint calls it in
+two places:
+
+- **at boot**, right after the hub sync, best-effort — a failure logs a warning
+  and the boot continues, exactly like the other best-effort boot steps. Prune
+  is an optimization, never a boot precondition;
+- **on an interval** (`ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES`, default 360), as
+  a supervised background loop that the shutdown handler kills alongside the
+  console sidecar. A failing pass warns and the loop waits for the next tick; it
+  never takes the container down.
+
+Three properties are worth stating explicitly, because they are what make this
+safe to leave on by default:
+
+- **`--force` is never passed, and there is no env knob that adds it.** In a
+  review container a dirty worktree is *evidence* — a session that died
+  mid-round with work someone may still want. The rail that keeps it is the one
+  this container needs most.
+- **It is capability-gated, not version-pinned.** The image installs the alissa
+  CLI from its install channel, which may predate the subcommand. The entrypoint
+  probes once at boot and, if the subcommand is missing, logs exactly one loud
+  `WARN: this alissa CLI predates 'alissa code workspace prune' …` and skips
+  *both* hooks. Nothing here needs to change when the CLI catches up. (The probe
+  reads the help *output*, not its exit status: commander answers an unknown
+  subcommand by printing the parent command's help and exiting `0`, so an
+  exit-status probe would call every old CLI capable.)
+- **The interval loop is daemon-only.** The [executor role](#bridge-executor-role-a-second-service-from-this-same-image)
+  gets the boot pass — it grows the same volume the same way — but not the loop:
+  that role `exec`s `alissa bridge start`, which replaces the shell, so a loop
+  started there would outlive the only code that knows how to stop it.
+
+**A pass cannot hold the boot open.** The boot hook runs before `alissa worker`
+starts, and the first pass after the CLI lands sweeps `git gc --auto` across hubs
+on a volume that has never had anything reclaimed — minutes of work on a large
+object store, and on a platform with a startup health-check window a slow enough
+boot is a *dead* boot. So a pass runs under `timeout`
+(`ALISSA_WORKSPACE_PRUNE_TIMEOUT_SECONDS`, default 900) with **stdin closed**, and
+a pass that hits either bound lands in the same warning path as any other
+failure. The neighbouring `alissa code workspace sync` is deliberately *not*
+bounded this way: hubs are a precondition for reviewing anything, while prune is
+an optimization, and only one of those may delay a boot.
+
+> **`ALISSA_WORKSPACE_PRUNE_INTERVAL_SECONDS` is test-only — do not set it in a
+> deploy.** `docker/claude/tests-entrypoint-prune.sh` has to watch the loop tick
+> more than once, and the smallest cadence the supported knob can express is a
+> minute. It silently overrides
+> `ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES`, and the boot log then reads
+> `starting the workspace prune loop (every 360 min = 3s)` — which is what you
+> will find first if it is ever set by accident.
+
+If you turn this off (`ALISSA_WORKSPACE_PRUNE=0`), nothing else reclaims the
+volume; plan on pruning by hand.
 
 ### Reviewer console (runtime env only — `ALISSA_UI_ENABLED`, `ALISSA_UI_PASSCODE`, `PORT`)
 
@@ -462,6 +535,12 @@ ephemeral home and are gone on restart, so a persisted "round N in-flight" would
 otherwise be stale and stall re-enqueue for 90 min. A fresh container has no
 reviewer running by definition, so clearing them is safe and the daemon
 re-enqueues any still-pending round on its first poll.
+
+The volume is also the thing that **grows**: reviewer worktrees accumulate in
+the hubs and nothing used to remove them. The entrypoint now prunes finished-branch
+worktrees at boot and every `ALISSA_WORKSPACE_PRUNE_INTERVAL_MINUTES` (default
+360) — see [Volume hygiene](#volume-hygiene-finished-worktrees-are-pruned) for the
+rails it runs behind and `ALISSA_WORKSPACE_PRUNE=0` for the opt-out.
 
 Nothing else needs a volume: the gh/alissa/claude auth is re-established from the
 env tokens on every boot, and tmux sockets are deliberately ephemeral.
@@ -724,6 +803,13 @@ volumes:
    daemon's on-demand `alissa code workspace add` no-ops on a repo already listed
    in the manifest, leaving an empty folder and looping forever hub-ifying a hub
    that never completes.
+3c-ii. **`alissa code workspace prune`** — best-effort volume hygiene, on the path
+   both roles share: remove finished-branch worktrees (never `main/`, never
+   dirty, never an open PR, never `--force`) and run the hub-level git prune/gc.
+   Skipped with one loud warning if the CLI predates the subcommand, or if
+   `ALISSA_WORKSPACE_PRUNE=0`, and bounded by `timeout` with stdin closed so a
+   slow or prompting pass cannot hold the boot open. A failure here is a warning, never a dead boot
+   ([why](#volume-hygiene-finished-worktrees-are-pruned)).
 3d. **Executor role only, and the end of the shared path**: drop this executor's
    stale lockfile, then `exec alissa bridge
    start …`. `exec`, so the container's only process is the executor — steps 4
