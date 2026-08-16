@@ -459,6 +459,51 @@ def test_the_checks_hold_records_when_and_on_what(ledger, monkeypatch):
     assert row["checks_held_state"] == "pending" and row["checks_pending_at"] == 9000
 
 
+def test_the_spawn_checks_hold_keeps_its_first_stamp_per_head(ledger, monkeypatch):
+    """The pre-spawn gate re-decides every poll off a freshly-read rollup, so a
+    stamp that moved with the re-read would push the bound out by one poll
+    interval every poll and never reach it. Keyed by head as well: a push
+    mid-wait is a new question, and inheriting the old commit's clock would
+    queue the round against a rollup nobody waited on."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
+
+    assert ledger.note_spawn_checks_hold(REPO, 7, 1, "abc123") == 1000
+    clock["t"] = 5000.0
+    assert ledger.note_spawn_checks_hold(REPO, 7, 1, "abc123") == 1000, "frozen"
+    assert ledger.note_spawn_checks_hold(REPO, 7, 1, "pushed99") == 5000, "new head"
+    assert ledger.note_spawn_checks_hold(REPO, 7, 2, "abc123") == 5000, "new round"
+
+
+def test_clearing_a_spawn_checks_hold_ends_the_wait_it_bounded(ledger, monkeypatch):
+    """The stamp means "a wait is in progress", so the round starting has to
+    remove it — otherwise the NEXT wait on the same (round, head) is born past
+    its bound. Idempotent, because most rounds never wait at all."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
+    ledger.note_spawn_checks_hold(REPO, 7, 1, "abc123")
+
+    ledger.clear_spawn_checks_hold(REPO, 7, 1, "abc123")
+    ledger.clear_spawn_checks_hold(REPO, 7, 1, "abc123")  # nothing to clear
+
+    clock["t"] = 5000.0
+    assert ledger.note_spawn_checks_hold(REPO, 7, 1, "abc123") == 5000, (
+        "the next wait on the same round and head starts from now"
+    )
+
+
+def test_the_spawn_checks_hold_table_is_added_to_an_older_database(tmp_path):
+    """CREATE TABLE IF NOT EXISTS is the whole migration, exactly as it was for
+    `grants`: an existing daemon's state.db gains the table on the next open and
+    every other ledger is untouched."""
+    path = tmp_path / "state.db"
+    _legacy_db(path)
+
+    with State(path) as st:
+        assert st.get_spawn(REPO, 7, 1) is not None      # legacy data intact
+        assert st.note_spawn_checks_hold(REPO, 7, 1, "abc123") > 0
+
+
 def test_an_abandoned_verdict_post_is_terminal(ledger):
     """The exit for a post that can never succeed — the head it was pinned to
     is gone from the PR. Without it the round is held open forever and the PR

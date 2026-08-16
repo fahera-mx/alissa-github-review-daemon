@@ -280,6 +280,15 @@ ARG ALISSA_MAX_CONCURRENT_SESSIONS=""
 # and it REQUIRES REVLOOP_VERSION >= 0.16.7 for the same reason the two keys
 # above it do: an older library rejects the unknown config key at load.
 ARG ALISSA_CHECKS_WAIT_SECONDS=""
+# How long an owed round waits for the head's checks to CONCLUDE before its
+# reviewer is queued at all (issue #84). The knob above gates the verdict the
+# DAEMON posts; this one is the only structural gate on the verdict a reviewer
+# SESSION posts, which is the ordinary path -- a session that has not started
+# cannot approve ahead of its evidence. A RED or unreadable rollup never waits:
+# the round is queued at once, forbidden to approve. Pass-through, and it
+# REQUIRES REVLOOP_VERSION >= 0.17.0 for the same reason the keys above it do:
+# an older library rejects the unknown config key at load.
+ARG ALISSA_CHECKS_SPAWN_WAIT_SECONDS=""
 # STRUCTURAL container constants (not pass-through): agent_profile must name a
 # profile the baked agents.yaml ships (`claude`); on_missing_hub must be `add`
 # for the self-contained hub-ify-on-demand model (the library default `skip`
@@ -315,6 +324,7 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_REAP_SESSION_CAP=${ALISSA_REAP_SESSION_CAP} \
     ALISSA_MAX_CONCURRENT_SESSIONS=${ALISSA_MAX_CONCURRENT_SESSIONS} \
     ALISSA_CHECKS_WAIT_SECONDS=${ALISSA_CHECKS_WAIT_SECONDS} \
+    ALISSA_CHECKS_SPAWN_WAIT_SECONDS=${ALISSA_CHECKS_SPAWN_WAIT_SECONDS} \
     ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} \
     ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \

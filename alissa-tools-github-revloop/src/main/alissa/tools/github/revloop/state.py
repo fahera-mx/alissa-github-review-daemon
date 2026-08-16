@@ -171,6 +171,38 @@ CREATE TABLE IF NOT EXISTS review_tasks (
     PRIMARY KEY (repo, number)
 );
 
+-- One row per (PR, round, head) whose reviewer the pre-spawn CI gate has held
+-- back, stamped when the wait BEGAN (issue #84). That stamp is the only thing
+-- the gate needs to remember: everything else about the decision -- what is
+-- running, whether it has gone red -- is re-read from GitHub every poll, and a
+-- stamp that moved with it would push the bound out forever.
+--
+-- Deliberately NOT the `verdict_posts.checks_held_at` stamp the verdict gate
+-- uses. The two waits are about the same PR and often the same round, but they
+-- bound different things at different times (before the reviewer starts vs.
+-- after its verdict exists), and sharing one row would let a spawn that waited
+-- ten minutes for CI spend the verdict's bound before the reviewer had written
+-- a word.
+--
+-- Keyed by head too, so a push mid-wait starts a fresh wait: the new commit's
+-- checks are a new question, and inheriting the old commit's clock would queue
+-- the round against a rollup nobody waited on.
+--
+-- NOT an audit trail, unlike verdict_posts and grants: a row means "a pre-spawn
+-- wait is IN PROGRESS", and `clear_spawn_checks_hold` deletes it the moment the
+-- round starts (see loop._end_checks_wait for why leaving it would make the NEXT
+-- wait on the same round and head read as already run out). So the table holds
+-- the waits currently in flight, plus the residue of waits whose round never
+-- started -- never one row per round that ever waited.
+CREATE TABLE IF NOT EXISTS spawn_checks_holds (
+    repo     TEXT    NOT NULL,
+    number   INTEGER NOT NULL,
+    round    INTEGER NOT NULL,
+    head_sha TEXT    NOT NULL,
+    first_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, number, round, head_sha)
+);
+
 CREATE TABLE IF NOT EXISTS poll_snapshots (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                INTEGER NOT NULL,
@@ -819,6 +851,55 @@ class State:
             )
         self._db.commit()
         return now
+
+    # -- the pre-spawn CI hold ---------------------------------------------
+
+    def note_spawn_checks_hold(
+        self, repo: str, number: int, round_: int, head_sha: str
+    ) -> int:
+        """Record that this round's SPAWN is waiting on `head_sha`'s checks;
+        return the stamp its bound is measured from.
+
+        OR IGNORE keeps the FIRST observation, which is the whole contract: the
+        gate re-decides every poll off a freshly-read rollup, so a stamp that
+        moved with the re-read would extend the wait by one poll interval every
+        poll and the bound would never be reached. A round that has waited past
+        it is queued anyway -- see loop._gate_spawn_on_checks -- so this stamp is
+        what makes an unreachable CI system cost 15 minutes instead of forever.
+        """
+        self._db.execute(
+            "INSERT OR IGNORE INTO spawn_checks_holds "
+            "(repo, number, round, head_sha, first_at) VALUES (?,?,?,?,?)",
+            (repo, number, round_, head_sha, int(time.time())),
+        )
+        self._db.commit()
+        row = self._db.execute(
+            "SELECT first_at FROM spawn_checks_holds "
+            "WHERE repo=? AND number=? AND round=? AND head_sha=?",
+            (repo, number, round_, head_sha),
+        ).fetchone()
+        assert row is not None  # just inserted, or already there
+        return int(row["first_at"])
+
+    def clear_spawn_checks_hold(
+        self, repo: str, number: int, round_: int, head_sha: str
+    ) -> None:
+        """Forget this round's wait stamp, because the wait is over.
+
+        The row means "a pre-spawn wait is IN PROGRESS for this (round, head)",
+        and the stamp is frozen for exactly as long as that holds. Leaving it
+        behind after the round starts would make the NEXT wait on the same
+        (round, head) -- a stale-round re-enqueue onto a re-run rollup -- read as
+        having already run out; see loop._end_checks_wait for the walk-through.
+        Idempotent: clearing a row that is not there is the normal case (most
+        rounds never wait at all).
+        """
+        self._db.execute(
+            "DELETE FROM spawn_checks_holds "
+            "WHERE repo=? AND number=? AND round=? AND head_sha=?",
+            (repo, number, round_, head_sha),
+        )
+        self._db.commit()
 
     def record_verdict_post_abandoned(
         self, repo: str, number: int, round_: int, why: str
