@@ -44,7 +44,7 @@ echo "== pass-through: optional knobs omitted when env unset =="
 out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
         -u ALISSA_REAP_GRACE_SECONDS -u ALISSA_REAP_SESSION_CAP \
         -u ALISSA_MAX_CONCURRENT_SESSIONS \
-        -u ALISSA_CHECKS_WAIT_SECONDS \
+        -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
         bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
 assert_key_absent "${out}" poll_interval "poll_interval omitted when ALISSA_POLL_INTERVAL unset"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP unset"
@@ -52,6 +52,8 @@ assert_key_absent "${out}" reap_grace_seconds "reap_grace_seconds omitted when A
 assert_key_absent "${out}" reap_session_cap   "reap_session_cap omitted when ALISSA_REAP_SESSION_CAP unset"
 assert_key_absent "${out}" checks_wait_seconds \
   "checks_wait_seconds omitted when ALISSA_CHECKS_WAIT_SECONDS unset"
+assert_key_absent "${out}" checks_spawn_wait_seconds \
+  "checks_spawn_wait_seconds omitted when ALISSA_CHECKS_SPAWN_WAIT_SECONDS unset"
 assert_key_absent "${out}" max_concurrent_sessions \
   "max_concurrent_sessions omitted when ALISSA_MAX_CONCURRENT_SESSIONS unset"
 assert_eq "${out}" '.on_missing_hub' '"add"'    "on_missing_hub always emitted (structural: add)"
@@ -91,6 +93,13 @@ assert_eq "${out}" '.reap_grace_seconds' '900' "reap_grace_seconds override pres
 assert_eq "${out}" '.reap_session_cap'   '3'   "reap_session_cap override present as number"
 out="$(ALISSA_CHECKS_WAIT_SECONDS=600 render_revloop_config "${REPOS}")"
 assert_eq "${out}" '.checks_wait_seconds' '600' "checks_wait_seconds override present as number"
+# The PRE-SPAWN bound (issue #84) is a separate knob from the verdict-side one
+# above: it is paid as latency on every round whose head is still building,
+# while that one is paid only by a round that has finished reviewing. Both are
+# properties of the watched repos' CI, so both pass through.
+out="$(ALISSA_CHECKS_SPAWN_WAIT_SECONDS=300 render_revloop_config "${REPOS}")"
+assert_eq "${out}" '.checks_spawn_wait_seconds' '300' \
+  "checks_spawn_wait_seconds override present as number"
 # The spawn gate. Rendered alongside a coherent reap_session_cap on purpose: the
 # daemon refuses a config whose ALARM sits below its spawn LIMIT, so an operator
 # lowering one has to look at the other, and the pair is what the container ships.
@@ -107,13 +116,15 @@ assert_eq "${out}" '.agent_profile'  '"custom"' "agent_profile override wins"
 
 echo "== cross-check: omitted keys resolve to the LIBRARY default =="
 if python3 -c 'import alissa.tools.github.revloop.config' 2>/dev/null; then
-  # ALISSA_CHECKS_WAIT_SECONDS and ALISSA_MAX_CONCURRENT_SESSIONS are unset here
+  # ALISSA_CHECKS_WAIT_SECONDS, ALISSA_CHECKS_SPAWN_WAIT_SECONDS and
+  # ALISSA_MAX_CONCURRENT_SESSIONS are unset here
   # too: the library this cross-check imports is the Dockerfile-PINNED release,
   # which predates those keys and would reject them as unknown. Rendering either
   # into the config would then fail the cross-check for a version skew rather
   # than for a default drift.
   out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
-          -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_MAX_CONCURRENT_SESSIONS \
+          -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
+          -u ALISSA_MAX_CONCURRENT_SESSIONS \
           bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
   # Pass the rendered JSON via an env var (not a pipe) so the heredoc can own
   # stdin as the python program.
