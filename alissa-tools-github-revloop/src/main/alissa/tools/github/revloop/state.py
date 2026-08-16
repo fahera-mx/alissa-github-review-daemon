@@ -171,6 +171,33 @@ CREATE TABLE IF NOT EXISTS review_tasks (
     PRIMARY KEY (repo, number)
 );
 
+-- The NEGATIVE half of the mapping above: PRs a completed search found NO open
+-- review task for (issue #87). The table above can only remember an answer that
+-- exists, so a PR without one missed the cache on every single pass and paid the
+-- full corpus fetch for it -- 1,440 whole-corpus reads a day from one unmapped
+-- PR, forever, because nothing about "there is no review task" ever changes on
+-- its own. That is the widest read this daemon makes, on the path that repeats
+-- most often.
+--
+-- `polls_left` is a COUNTDOWN, not a deadline: each pass that consults the row
+-- burns one and the row is deleted at zero, so the suppression is measured in
+-- polls of THIS PR (the unit the knob is written in) rather than in wall-clock
+-- or in global passes -- a PR nobody is requesting a review on burns nothing.
+-- It also makes the row self-cleaning, which matters because a negative answer
+-- must never outlive its own re-check.
+--
+-- Best-effort like `review_tasks`, and fail-open in the same direction: a row
+-- that cannot be written or decremented simply does not suppress anything, and
+-- the pass pays the fetch it always paid. The one thing this table may never do
+-- is answer "no review task" for longer than it was asked to.
+CREATE TABLE IF NOT EXISTS review_task_misses (
+    repo       TEXT    NOT NULL,
+    number     INTEGER NOT NULL,
+    polls_left INTEGER NOT NULL,
+    first_at   INTEGER NOT NULL,
+    PRIMARY KEY (repo, number)
+);
+
 -- One row per (PR, round, head) whose reviewer the pre-spawn CI gate has held
 -- back, stamped when the wait BEGAN (issue #84). That stamp is the only thing
 -- the gate needs to remember: everything else about the decision -- what is
@@ -1019,7 +1046,146 @@ class State:
             "(repo, number, task_ref, resolved_at) VALUES (?,?,?,?)",
             (repo, number, task_ref, int(time.time())),
         )
+        # A mapping DISPROVES an outstanding negative answer, so the two tables
+        # can never both speak for one PR. Dropped in the same transaction as
+        # the mapping rather than by a separate call: a negative row that
+        # survived a recorded mapping would keep the suppression running against
+        # a PR the daemon can now resolve by ref -- which is not a wasted fetch
+        # (the cached path skips the corpus anyway) but a stale claim in the
+        # ledger, and it is the "mapping recorded mid-TTL re-arms" contract.
+        self._db.execute(
+            "DELETE FROM review_task_misses WHERE repo=? AND number=?",
+            (repo, number),
+        )
         self._db.commit()
+
+    # -- the NEGATIVE half: PRs with no review task at all (issue #87) ------
+
+    def record_review_task_miss(self, repo: str, number: int, polls: int) -> bool:
+        """Remember that a COMPLETED search found no review task for this PR.
+
+        `polls` is how many later passes may take that answer on trust before
+        the search is re-armed. REPLACE, not IGNORE: every fresh disproof
+        restarts the countdown, which is what makes a run of misses cost one
+        fetch per window rather than one per pass.
+
+        Only ever called on a search that RAN and found nothing -- never on a
+        failed one. A miss recorded because the CLI hiccuped would suppress the
+        retry that was supposed to correct it, which is the one way this table
+        could cost a review instead of a read.
+
+        Best-effort, like every write in this class's optimization half: a
+        `polls < 1` request records nothing (there is no window to remember),
+        and a database error records nothing either. Both mean the next pass
+        searches, which is what the daemon did before this table existed.
+        """
+        if polls < 1:
+            return False
+        return self._write_telemetry(
+            lambda: self._replace_review_task_miss(repo, number, polls),
+            "review-task miss write",
+        )
+
+    def _replace_review_task_miss(self, repo: str, number: int, polls: int) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO review_task_misses "
+            "(repo, number, polls_left, first_at) VALUES (?,?,?,?)",
+            (repo, number, int(polls), int(time.time())),
+        )
+        self._db.commit()
+
+    def consume_review_task_miss(self, repo: str, number: int) -> bool:
+        """Spend one poll of this PR's negative answer. True = skip the search.
+
+        True is the ONLY answer that suppresses a corpus fetch, and it is
+        returned only when a live row was read AND its countdown was
+        successfully decremented. That coupling is the read-only-ledger
+        contract: on a volume that flips read-only after a row was written, the
+        row is still readable and would otherwise say "skip" forever, because
+        nothing could ever burn it down. Requiring the write means such a ledger
+        answers False every pass -- one fetch per pass, exactly today's
+        behaviour -- rather than silently answering "no review task" until
+        someone restarts the daemon.
+
+        False therefore means all of: no row, an exhausted row, an unreadable
+        database, and a decrement that would not persist. The caller may
+        conclude nothing from it beyond "search for it", which is what it did
+        unconditionally before this table existed.
+        """
+        try:
+            row = self._db.execute(
+                "SELECT polls_left FROM review_task_misses WHERE repo=? AND number=?",
+                (repo, number),
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            log.warning(
+                "state: review-task miss cache unreadable (%s: %s) — this pass "
+                "resolves %s#%d by searching, as it did before the cache",
+                type(exc).__name__, exc, repo, number,
+            )
+            return False
+        if row is None or int(row["polls_left"]) < 1:
+            # An exhausted row cannot occur through this method (the decrement
+            # deletes at zero) but can through a hand-edited ledger; treat it as
+            # the re-armed state it describes and clear it.
+            if row is not None:
+                self.forget_review_task_miss(repo, number)
+            return False
+        return self._write_telemetry(
+            lambda: self._burn_review_task_miss(repo, number),
+            "review-task miss decrement",
+        )
+
+    def _burn_review_task_miss(self, repo: str, number: int) -> None:
+        """One poll off the countdown, and the row goes when it runs out.
+
+        Both statements in one transaction so a row can never be left claiming a
+        window it has already spent.
+        """
+        self._db.execute(
+            "UPDATE review_task_misses SET polls_left = polls_left - 1 "
+            "WHERE repo=? AND number=?",
+            (repo, number),
+        )
+        self._db.execute(
+            "DELETE FROM review_task_misses WHERE repo=? AND number=? AND polls_left < 1",
+            (repo, number),
+        )
+        self._db.commit()
+
+    def forget_review_task_miss(self, repo: str, number: int) -> bool:
+        """Re-arm the search for this PR now. Best-effort.
+
+        The manual counterpart to the countdown: `--pr` runs it so a one-shot
+        diagnostic always reports what a search would find, never what a
+        suppressed one was told to assume.
+        """
+        return self._write_telemetry(
+            lambda: self._delete_review_task_miss(repo, number),
+            "review-task miss invalidation",
+        )
+
+    def _delete_review_task_miss(self, repo: str, number: int) -> None:
+        self._db.execute(
+            "DELETE FROM review_task_misses WHERE repo=? AND number=?", (repo, number)
+        )
+        self._db.commit()
+
+    def review_task_miss(self, repo: str, number: int) -> "int | None":
+        """Polls left on this PR's negative answer, or None when it has none.
+
+        A read for tests and for an operator poking at the ledger; the decide
+        path uses `consume_review_task_miss`, which is the only caller allowed
+        to act on the answer (it burns a poll for the pass it grants).
+        """
+        try:
+            row = self._db.execute(
+                "SELECT polls_left FROM review_task_misses WHERE repo=? AND number=?",
+                (repo, number),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        return None if row is None else int(row["polls_left"])
 
     def forget_review_task(self, repo: str, number: int) -> bool:
         """Drop a mapping that has been DISPROVED. Best-effort.

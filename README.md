@@ -23,7 +23,9 @@ One poll pass:
 ```
 gh api search/issues            →  PRs awaiting my review (draft:false → CR1)
   ↓
-alissa task list                →  find the review task (CR2 dedupe)
+alissa task list                →  find the review task (CR2 dedupe) — cached,
+                                   memoized and negative-cached, so this is the
+                                   rare path (Bounding the task-list read)
   ↓
 alissa task get  (its verdicts) →  how many rounds are done? → round k
   ↓
@@ -124,6 +126,8 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `max_concurrent_sessions` | `4` | **spawn gate**: at this many live reviewer sessions of this daemon's own grammar, an owed round *waits* instead of spawning and is retried next poll. Deferral burns no round number and no attempt, trips no stale-round respawn, and pages nobody. Must be **≤ `reap_session_cap`**, which the loader enforces — the cap is the alarm, this is the limit |
 | `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead. Applies **per condition waited on**: an unreadable hold that becomes a genuine *pending* one restarts the clock once, so the worst-case hold is **twice** this. A **red** rollup never waits and never approves — see *Never approve a red head* |
 | `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the *hold* and relies on the directive alone. **It also bounds the reviewer session's own in-round wait**: the same number is written into every directive as how long a session may wait for a running check before submitting, floored at 5 minutes so a `0` here cannot read as "do not wait at all" — see *Never approve a red head* |
+| `review_task_miss_ttl_polls` | `10` | how many polls a PR with **no** review task is taken on trust before the task corpus is searched for one again. Trades **latency** for reads: a review task created mid-window is picked up at the re-arm rather than the next poll. Floor `1` — there is no value that turns it off — see *Bounding the task-list read* |
+| `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
 
 ### Config file discovery
 
@@ -606,6 +610,69 @@ The gate bounds what the *daemon* starts. Hand-spawned sessions can still push
 the live count past `reap_session_cap`, and that is exactly when the alarm should
 fire.
 
+### Bounding the task-list read
+
+`alissa task list` is the widest query this daemon issues — the calling actor's
+entire live task corpus, sponsor-union scoped, several hundred rows — and it is
+the *only* way to FIND a review task, because the mapping is by title. Between
+2026-08-12 and 08-16 this loop was the largest single contributor to the Alissa
+deployment's top database-I/O endpoint. Three mechanisms bound it, innermost
+first:
+
+| mechanism | what it removes |
+| --- | --- |
+| the PR → review-task **mapping** (`review_tasks`) | the fetch, for every PR whose review task is known: the task is read back by ref instead |
+| the per-pass **memo** | duplicate fetches inside one pass — every PR that misses the cache shares one list |
+| the **negative cache** (`review_task_misses`) | the fetch, for a PR that has *no* review task, for `review_task_miss_ttl_polls` polls |
+| the **narrowed call** | rows and columns on the wire, wherever the installed CLI can filter server-side |
+
+The negative cache is the one that closed the hole. The mapping table can only
+remember an answer that exists, so a PR with no review task — a third-party PR,
+or one whose task was validated or retitled — missed every pass and re-fetched
+the whole corpus for the same answer, 1,440 times a day at a 60-second poll,
+indefinitely. Now a search that *completes and finds nothing* is recorded, and
+the next `review_task_miss_ttl_polls` polls of that PR skip the fetch and answer
+from the ledger.
+
+What that trades is latency, not correctness:
+
+- a review task created mid-window is picked up at the **re-arm**, not the next
+  poll (10 polls ≈ 10 minutes at the default cadence);
+- recording a mapping clears the negative row immediately, so the two can never
+  both speak for one PR;
+- only a search that **ran** may record one — a search that raised propagates,
+  and the pass turns it into that PR's `skipped` decision as before;
+- a ledger that cannot record or spend the answer suppresses **nothing**: the
+  daemon searches every pass, exactly as it did before the table existed. A
+  suppression is granted only when the countdown's decrement actually persisted,
+  which is what keeps a volume that flips read-only from answering "no review
+  task" forever;
+- `alissa-revloop --pr OWNER/REPO#N` re-arms the PR before deciding, so the
+  one-shot diagnostic always reports what a search finds.
+
+The **narrowing** is probe-gated. At boot the daemon reads `alissa task list
+--help` and sends only what that output advertises as an option — an issue's (or
+a docs page's) claim about a flag is not evidence, and a non-zero `alissa` exit
+becomes a skipped review, not a slower one. Today's CLI (0.1.0) offers only
+`--self`, so the call the daemon makes is the same one it always made:
+
+- **status filter** — sent as exactly the daemon's own open-status set, so it
+  cannot change which task resolves; adopted automatically when the CLI grows a
+  `--status`;
+- **`--view digest`** — a lean projection of each row; the daemon keeps only
+  `taskNumber`/`title`/`status`, so it is adopted automatically too, with no key;
+- **`--self`** — off unless `task_list_self_scope` says otherwise. On the live
+  fleet corpus it removes 4% of the payload, and 3 of the 371 review tasks in
+  that corpus are among the rows it removes: they are owned by another actor, not
+  by the agent actor whose sessions write the rest. A review task the list cannot
+  see is a round the daemon cannot count. Turn it on only where every review task
+  is created by this daemon's own reviewer sessions.
+
+A narrowed call that fails, or that answers with an *empty* corpus, is retried
+once unnarrowed and the narrowing is dropped for the rest of the process — both
+are how a CLI that advertises a flag its API does not serve would present, and
+either would otherwise read as "this actor has no review tasks".
+
 ### Poll snapshots (console exhaust)
 
 Every poll pass persists one row to a `poll_snapshots` table in the same SQLite
@@ -823,9 +890,12 @@ bash docker/claude/tests-entrypoint-executor.sh  # bridge-executor role + gates
 bash docker/claude/tests-entrypoint-ui.sh        # reviewer-console wiring
 ```
 
-706 tests cover the decision state machine, the config layering, the two CI
+770 tests cover the decision state machine, the config layering, the two CI
 gates (pre-spawn hold, verdict hold — pending→green, pending→red, both
-timeouts, a head that moves under either), the
+timeouts, a head that moves under either), the task-list bounds (the negative
+cache's window, its re-arm, its per-PR countdown and every way it fails open;
+the CLI flag probe against the real help text of each CLI generation, and the
+runtime disproof of a flag the API does not serve), the
 `poll_snapshots` exhaust buffer (record/read round-trip, retention pruning,
 in-place migration, one-snapshot-per-poll, dry-run capture), the
 `alissa-pr-review` round/verdict/timeout logic, and the reviewer console (auth

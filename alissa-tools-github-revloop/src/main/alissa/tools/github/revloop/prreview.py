@@ -74,11 +74,17 @@ def _review_task_ref(alissa: Alissa, owner: str, repo: str, number: int) -> str 
 
     Deliberately not `Alissa.find_review_task` (which filters to open tasks): we
     still want the ref just after the task is validated, to read its verdict.
+    `narrow_status=False` says the same thing to the LIST call for the same
+    reason -- the daemon's server-side status filter is exactly its `is_open`
+    set, and narrowing by it here would re-impose the filter this function
+    exists to avoid.
     """
     pattern = re.compile(
         rf"^Review PR\s+{re.escape(owner)}/{re.escape(repo)}#{number}\b", re.IGNORECASE
     )
-    matches = [t for t in alissa.list_tasks() if pattern.match(t.title)]
+    matches = [
+        t for t in alissa.list_tasks(narrow_status=False) if pattern.match(t.title)
+    ]
     return matches[0].ref if matches else None
 
 

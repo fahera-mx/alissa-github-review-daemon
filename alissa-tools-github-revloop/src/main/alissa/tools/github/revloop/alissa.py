@@ -16,6 +16,72 @@ log = logging.getLogger(__name__)
 # A review task is "open" while it can still receive a verdict.
 OPEN_STATUSES = {"committed", "in_progress", "pending_validation", "todo"}
 
+# -- narrowing the `alissa task list` call (issue #87) ------------------------
+#
+# `list_tasks` is the widest query this daemon issues -- no query string at all,
+# the actor's entire non-terminal corpus, sponsor-union scoped -- and it was the
+# single largest contributor to the Alissa deployment's #1 Database-I/O offender
+# over 2026-08-12..16. Everything below is applied ONLY when the installed CLI
+# advertises it (see Alissa.probe_task_list): an issue's claim about a flag is
+# not evidence, and this daemon turns a non-zero `alissa` exit into a SKIPPED
+# decision, so sending a flag the CLI does not have costs a review.
+
+# Statuses a LIVE review task can hold. Deliberately OPEN_STATUSES itself and
+# not a hand-written list: `is_review_task_for` already rejects every other
+# status client-side, so filtering server-side on exactly this set cannot change
+# which task the daemon resolves -- it only stops shipping the rows over the
+# wire. Any status added to `is_open` is added here by construction.
+TASK_LIST_STATUS_FLAG = "--status"
+TASK_LIST_STATUS_FILTER = ",".join(sorted(OPEN_STATUSES))
+
+# `--self` drops the SPONSOR's corpus and keeps only the calling actor's rows.
+#
+# NOT enabled by default, and the reason is measured rather than cautious. On
+# the live fleet corpus (2026-08-16, 932 non-terminal rows) `--self` removes 36
+# rows, 4% of the payload -- and 3 of the 371 `Review PR ...` tasks in it are
+# among the rows it removes: they are owned by another actor, not by the agent
+# actor whose sessions write the other 368. Review tasks are therefore
+# PREDOMINANTLY actor-owned but not exclusively so, and a review task this call
+# cannot see is a round the daemon cannot count. 4% of the wire is not worth
+# that, so the flag is opt-in per deployment (`task_list_self_scope`).
+TASK_LIST_SELF_FLAG = "--self"
+
+# A lean projection of each row. The daemon keeps only taskNumber/title/status
+# (see `_task_from_row`), so a digest view is pure saving with no semantics --
+# which is why it is adopted whenever it exists and has no knob. It ships in the
+# studio repo separately; until then the probe simply does not find it.
+TASK_LIST_VIEW_FLAG = "--view"
+TASK_LIST_DIGEST_VIEW = "digest"
+
+
+@dataclass(frozen=True)
+class TaskListFlags:
+    """What the installed `alissa task list` advertises in its own help.
+
+    All-False is both the "old CLI" answer and the "the probe could not run"
+    answer, and they are deliberately the same value: each means "make the call
+    the daemon has always made".
+    """
+
+    status: bool = False
+    self_scope: bool = False
+    digest: bool = False
+
+
+def _advertises(helptext: str, flag: str) -> bool:
+    """Whether `flag` appears as an OPTION in a CLI help listing.
+
+    Anchored to the start of a help line (allowing a short alias in front, as in
+    `-h, --help`) so a flag merely NAMED in some other option's prose -- "Pair
+    with --include-shared" is in this very help text -- is not read as an offer
+    of that flag. The trailing guard rejects a longer flag that merely starts
+    with this one (`--self-only` is not `--self`).
+    """
+    return re.search(
+        rf"(?m)^\s*(?:-\w,\s+)?{re.escape(flag)}(?![\w-])", helptext
+    ) is not None
+
+
 # CR6 verdict envelope outcomes.
 VERDICT_APPROVE = "approve"
 VERDICT_REQUEST_CHANGES = "request_changes"
@@ -213,19 +279,156 @@ class TaskDetail:
 
 
 class Alissa:
-    def list_tasks(self) -> list[Task]:
-        """EVERY non-terminal task owned by this actor -- the expensive call.
+    def __init__(self, *, task_list_self_scope: bool = False) -> None:
+        """`task_list_self_scope` opts the list call into `--self`.
 
-        `alissa task list` (CLI 0.1.0) exposes no server-side narrowing at all:
-        its only flags are `--json` and `--include-terminal`. Omitting the
-        latter is therefore the whole of the available filtering, and it is
-        already the default here -- validated and cancelled tasks never come
-        back. What remains is the actor's live corpus (hundreds of tasks,
-        ~250 KB), so the daemon's job is to call this RARELY rather than to
-        call it narrowly: see loop._review_task (persisted PR -> task mapping)
-        and loop._pass_task_list (at most one fetch per poll pass).
+        Default OFF, and that default is evidence, not caution -- see
+        TASK_LIST_SELF_FLAG. It is still a knob because ownership is a property
+        of a DEPLOYMENT (who creates its review tasks), not of this code, and an
+        operator who knows their review tasks are all actor-owned should be able
+        to say so.
         """
-        data = run_json(["alissa", "task", "list", "--json"], timeout=90) or []
+        self._task_list_self_scope = bool(task_list_self_scope)
+        # The probe's answer, memoized for the process; None = not probed yet.
+        # A probe that FAILS is deliberately not memoized (see probe_task_list).
+        self._task_list_flags: "TaskListFlags | None" = None
+        # Set when a narrowed call has been disproved at RUNTIME -- the CLI
+        # advertised a flag whose call then failed or came back empty. From then
+        # on this process makes the plain call, because a list that answers
+        # wrongly is worse than a list that is large: `find_review_task` reads an
+        # empty corpus as "this PR has no review task".
+        self._task_list_narrowing_disabled = False
+
+    # -- the `alissa task list` narrowing probe -----------------------------
+
+    def probe_task_list(self) -> "TaskListFlags":
+        """Which narrowing flags the INSTALLED `alissa task list` advertises.
+
+        Read off the CLI's own `--help`, which is local, tokenless and free.
+        The alternative -- send the flag and fall back when the call fails --
+        cannot tell an unknown flag from an auth hiccup, and this daemon turns a
+        non-zero `alissa` exit into a SKIPPED decision, so a mis-sent flag does
+        not cost a slower call, it costs a REVIEW.
+
+        Probed off the help OUTPUT rather than the exit status on purpose: this
+        CLI is commander-based and answers an unknown *subcommand* by printing
+        the parent help and exiting 0, so "it exited 0" reports every old CLI as
+        capable. (Flags are stricter than subcommands here, but the rule is the
+        same one and there is no reason to keep two.)
+
+        A probe that ANSWERS is memoized for the process -- the CLI cannot
+        change under a running daemon. A probe that FAILS is not: a transient
+        `alissa` failure then degrades one pass instead of pinning the daemon to
+        the widest call until someone restarts it.
+        """
+        if self._task_list_flags is not None:
+            return self._task_list_flags
+        try:
+            helptext = run(["alissa", "task", "list", "--help"], timeout=20)
+        except CommandError as exc:
+            log.warning(
+                "could not probe `alissa task list --help` (%s) — this pass "
+                "lists tasks unnarrowed, as the daemon always did", exc,
+            )
+            return TaskListFlags()
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("unexpected failure probing `alissa task list --help`")
+            return TaskListFlags()
+
+        flags = TaskListFlags(
+            status=_advertises(helptext, TASK_LIST_STATUS_FLAG),
+            self_scope=_advertises(helptext, TASK_LIST_SELF_FLAG),
+            digest=_advertises(helptext, TASK_LIST_VIEW_FLAG),
+        )
+        self._task_list_flags = flags
+        return flags
+
+    def task_list_argv(self, *, narrow_status: bool = True) -> list[str]:
+        """The narrowest `alissa task list` this CLI actually supports.
+
+        Every addition is probe-gated, so an older CLI -- today's, which offers
+        none of them -- produces exactly the call the daemon has always made.
+        """
+        argv = ["alissa", "task", "list", "--json"]
+        if self._task_list_narrowing_disabled:
+            return argv
+        flags = self.probe_task_list()
+        if flags.status and narrow_status:
+            argv += [TASK_LIST_STATUS_FLAG, TASK_LIST_STATUS_FILTER]
+        if flags.self_scope and self._task_list_self_scope:
+            argv.append(TASK_LIST_SELF_FLAG)
+        if flags.digest:
+            argv += [TASK_LIST_VIEW_FLAG, TASK_LIST_DIGEST_VIEW]
+        return argv
+
+    def list_tasks(self, *, narrow_status: bool = True) -> list[Task]:
+        """This actor's live task corpus -- the expensive call.
+
+        `alissa task list` (CLI 0.1.0) exposed no server-side narrowing at all:
+        its only flags were `--json` and `--include-terminal`, and omitting the
+        latter -- already the default -- was the whole of the available
+        filtering. Newer CLIs offer more, so the call is now assembled from a
+        boot-time probe of the installed CLI's help (`task_list_argv`): a status
+        filter covering exactly the statuses a live review task can hold, a lean
+        `--view digest`, and `--self` when the deployment says its review tasks
+        are actor-owned. None of it is required; an absent flag is simply not
+        sent.
+
+        Narrowing is still the SECOND line of defence, not the first. Even a
+        perfectly narrowed call is the actor's whole review-task corpus, so the
+        daemon's job remains to call this RARELY: see loop._review_task (the
+        persisted PR -> task mapping), loop._pass_task_list (at most one fetch
+        per poll pass) and the negative cache behind them (state's
+        `review_task_misses`, which bounds the ONE case where none of those
+        help -- a PR that has no review task at all).
+
+        `narrow_status=False` is for callers that must see review tasks the
+        daemon's own `is_open` predicate would reject (prreview reads a task's
+        verdict envelope after the round is over). It suppresses only the status
+        filter; every other narrowing still applies.
+
+        A narrowed call that FAILS, or that answers with an empty corpus, is
+        retried once unnarrowed and turns the narrowing off for the rest of the
+        process. Both are how a CLI that advertises a flag its API does not
+        serve would present, and either would otherwise read as "this actor has
+        no review tasks" -- which is a skipped review, not a slower one.
+        """
+        argv = self.task_list_argv(narrow_status=narrow_status)
+        plain = ["alissa", "task", "list", "--json"]
+        try:
+            data = run_json(argv, timeout=90) or []
+        except CommandError:
+            if argv == plain:
+                raise
+            log.warning(
+                "`%s` failed — retrying the plain task list and dropping the "
+                "narrowing for this process", " ".join(argv),
+            )
+            self._task_list_narrowing_disabled = True
+            data = run_json(plain, timeout=90) or []
+
+        tasks = self._tasks_from(data)
+        if tasks or argv == plain:
+            return tasks
+
+        # An empty answer from a narrowed call. A genuinely empty corpus is
+        # possible and costs one extra list; a filter the API does not serve
+        # would cost every review this actor owns.
+        log.warning(
+            "`%s` returned no tasks — retrying the plain task list to tell an "
+            "empty corpus from a filter this API does not serve", " ".join(argv),
+        )
+        tasks = self._tasks_from(run_json(plain, timeout=90) or [])
+        if tasks:
+            self._task_list_narrowing_disabled = True
+            log.warning(
+                "the plain task list returned %d task(s) — the narrowed call is "
+                "dropping rows, so this process stops narrowing", len(tasks),
+            )
+        return tasks
+
+    @staticmethod
+    def _tasks_from(data: object) -> list[Task]:
         tasks = []
         for row in data if isinstance(data, list) else []:
             task = _task_from_row(row)

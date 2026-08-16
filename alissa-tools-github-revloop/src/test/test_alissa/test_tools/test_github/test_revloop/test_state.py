@@ -640,3 +640,156 @@ def test_an_unreadable_cache_reads_as_a_miss(ledger, caplog):
     with caplog.at_level("WARNING"):
         assert ledger.review_task(REPO, 7) is None
     assert "review-task cache unreadable" in caplog.text
+
+
+# -- the negative half of the cache: PRs with no review task (issue #87) ----
+#
+# The mapping table above can only remember an answer that EXISTS. These pin the
+# countdown that bounds the other case: a completed search that found nothing is
+# taken on trust for a fixed number of polls of THAT PR, self-cleans when it runs
+# out, and -- the property the whole table lives or dies by -- never suppresses a
+# search it could not prove it was allowed to suppress.
+
+
+def test_a_recorded_miss_is_spent_one_poll_at_a_time(ledger):
+    ledger.record_review_task_miss(REPO, 7, 3)
+
+    assert [ledger.consume_review_task_miss(REPO, 7) for _ in range(3)] == [True] * 3
+    assert ledger.review_task_miss(REPO, 7) is None, "the row self-cleans at zero"
+    assert ledger.consume_review_task_miss(REPO, 7) is False, "and the search re-arms"
+
+
+def test_an_unrecorded_pr_suppresses_nothing(ledger):
+    assert ledger.consume_review_task_miss(REPO, 7) is False
+
+
+def test_a_fresh_miss_restarts_the_countdown(ledger):
+    """Every re-armed pass that searches and again finds nothing buys another
+    full window -- otherwise a permanently unmapped PR would drift back to one
+    fetch per pass as the first window's remainder ran out."""
+    ledger.record_review_task_miss(REPO, 7, 2)
+    ledger.consume_review_task_miss(REPO, 7)
+    ledger.record_review_task_miss(REPO, 7, 2)
+
+    assert ledger.review_task_miss(REPO, 7) == 2
+
+
+def test_a_zero_window_records_nothing(ledger):
+    """There is no window to remember, and a row nothing consults is a lie in
+    the ledger."""
+    assert ledger.record_review_task_miss(REPO, 7, 0) is False
+    assert ledger.review_task_miss(REPO, 7) is None
+
+
+def test_recording_a_mapping_clears_the_miss(ledger):
+    """The two tables can never both speak for one PR: a review task that now
+    exists disproves the answer that said it did not."""
+    ledger.record_review_task_miss(REPO, 7, 10)
+    ledger.record_review_task(REPO, 7, "TASK-500")
+
+    assert ledger.review_task_miss(REPO, 7) is None
+    assert ledger.consume_review_task_miss(REPO, 7) is False
+
+
+def test_misses_are_kept_per_pr(ledger):
+    ledger.record_review_task_miss(REPO, 7, 1)
+
+    assert ledger.consume_review_task_miss(REPO, 8) is False
+    assert ledger.review_task_miss(REPO, 7) == 1
+
+
+def test_a_miss_outlives_the_process(tmp_path):
+    """A restart must not hand every unmapped PR a fresh corpus fetch -- that is
+    the read this table exists to stop paying."""
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st.record_review_task_miss(REPO, 7, 5)
+
+    with State(path) as st:
+        assert st.consume_review_task_miss(REPO, 7) is True
+        assert st.review_task_miss(REPO, 7) == 4
+
+
+def test_migrates_a_pre_miss_cache_db_in_place(tmp_path):
+    path = tmp_path / "state.db"
+    _legacy_db(path)
+
+    with State(path) as st:
+        assert st.review_task_miss(REPO, 7) is None
+        st.record_review_task_miss(REPO, 7, 4)
+        assert st.review_task_miss(REPO, 7) == 4
+
+
+def test_a_read_only_ledger_never_suppresses_a_search(tmp_path, caplog):
+    """THE fail-open case, and the one that needs a write to prove it.
+
+    A volume that flips read-only AFTER the row was written can still READ it,
+    so a countdown nobody can decrement would say "skip the search" on every
+    pass, forever, and answer "this PR has no review task" without ever looking
+    again. Requiring the decrement to persist is what makes such a ledger
+    degrade to one fetch per pass -- exactly what the daemon did before this
+    table existed.
+    """
+    caplog.set_level("WARNING")
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st.record_review_task_miss(REPO, 7, 10)
+        path.chmod(0o444)
+        path.parent.chmod(0o555)
+        try:
+            suppressed = [st.consume_review_task_miss(REPO, 7) for _ in range(3)]
+        finally:
+            path.parent.chmod(0o755)
+            path.chmod(0o644)
+
+    assert suppressed == [False, False, False]
+    assert "review-task miss decrement failed" in caplog.text
+
+
+def test_an_unwritable_ledger_records_no_miss(tmp_path):
+    """The other half of failing open: with nothing recorded there is nothing
+    to suppress, so every pass searches."""
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        path.chmod(0o444)
+        path.parent.chmod(0o555)
+        try:
+            wrote = st.record_review_task_miss(REPO, 7, 10)
+        finally:
+            path.parent.chmod(0o755)
+            path.chmod(0o644)
+        assert wrote is False
+        assert st.consume_review_task_miss(REPO, 7) is False
+
+
+def test_an_unreadable_miss_table_reads_as_no_miss(ledger, caplog):
+    ledger.record_review_task_miss(REPO, 7, 10)
+    ledger._db.execute("DROP TABLE review_task_misses")
+
+    with caplog.at_level("WARNING"):
+        assert ledger.consume_review_task_miss(REPO, 7) is False
+    assert "review-task miss cache unreadable" in caplog.text
+    assert ledger.review_task_miss(REPO, 7) is None
+
+
+def test_a_hand_edited_exhausted_row_re_arms_and_is_cleared(ledger):
+    """`_burn_review_task_miss` deletes at zero, so this shape can only come
+    from outside the daemon. It must read as the re-armed state it describes."""
+    ledger.record_review_task_miss(REPO, 7, 1)
+    ledger._db.execute(
+        "UPDATE review_task_misses SET polls_left = 0 WHERE repo=? AND number=?",
+        (REPO, 7),
+    )
+    ledger._db.commit()
+
+    assert ledger.consume_review_task_miss(REPO, 7) is False
+    assert ledger.review_task_miss(REPO, 7) is None
+
+
+def test_forgetting_a_miss_re_arms_the_search_now(ledger):
+    """What `--pr` runs: a hand-driven diagnostic must report what a search
+    finds, never what a suppressed pass was told to assume."""
+    ledger.record_review_task_miss(REPO, 7, 10)
+
+    assert ledger.forget_review_task_miss(REPO, 7) is True
+    assert ledger.consume_review_task_miss(REPO, 7) is False

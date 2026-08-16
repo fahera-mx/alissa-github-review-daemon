@@ -22,6 +22,7 @@ from alissa.tools.github.revloop.config import (
     DEFAULT_MAX_CONCURRENT_SESSIONS,
     DEFAULT_REAP_GRACE_SECONDS,
     DEFAULT_REAP_SESSION_CAP,
+    DEFAULT_REVIEW_TASK_MISS_TTL_POLLS,
     HUB_ADD,
     ON_MISSING_SKIP,
     Config,
@@ -34,6 +35,7 @@ from alissa.tools.github.revloop.alissa import (
     SessionRef,
     Task,
     TaskDetail,
+    TaskListFlags,
     is_review_task_for,
     parse_session_name,
     session_repo_slug,
@@ -82,6 +84,7 @@ from alissa.tools.github.revloop.loop import (
     VERDICT_POST_GRACE_SECONDS,
     Action,
     Decision,
+    ResolvedTask,
     ReviewWatcher,
     checks_hold_kind,
     checks_unsettled_kind,
@@ -294,9 +297,17 @@ class FakeAlissa:
         # Tasks this actor owns besides the PR's review task; see `corpus`.
         self.others: list = []
 
-    def list_tasks(self):
+    def list_tasks(self, *, narrow_status=True):
         self.list_calls += 1
         return self.corpus
+
+    def probe_task_list(self):
+        """No installed CLI behind the fake, so it advertises nothing -- the
+        degraded answer, which is also today's real one."""
+        return TaskListFlags()
+
+    def task_list_argv(self, *, narrow_status=True):
+        return ["alissa", "task", "list", "--json"]
 
     def find_review_task(self, owner, repo, number, *, tasks=None):
         # Mirrors the real client's contract on BOTH counts: a caller that
@@ -6080,11 +6091,19 @@ def test_every_pr_missing_the_cache_shares_one_corpus_fetch(config):
 
 def test_a_pass_never_inherits_the_previous_pass_corpus(config):
     """The memo is a within-pass de-duplication. A corpus carried into the next
-    pass would answer it from titles and statuses that have since moved."""
+    pass would answer it from titles and statuses that have since moved.
+
+    The negative cache is re-armed between the passes so this stays a test of
+    the MEMO: with the miss still standing the second pass would skip the fetch
+    for a different and correct reason, and the memo could be deleted without
+    anything here noticing. What the negative cache does on its own is pinned
+    below (`test_an_unmapped_pr_costs_one_corpus_fetch_per_ttl_window`).
+    """
     w, _, al = watcher(config, make_pr(), [], state=State(config.state_db))
     al.task = None  # nothing ever caches, so every pass must search
 
     w.poll_once()
+    w.state.forget_review_task_miss(SLUG, NUMBER)
     w.poll_once()
 
     assert al.list_calls == 2, "one fetch per pass, and the memo is reset"
@@ -6238,6 +6257,241 @@ def test_the_cached_round_count_comes_from_the_same_read(config):
     assert resolved.verdict == VERDICT_APPROVE, "and so is the newest verdict"
     assert resolved.verdict_read is True
     assert al.get_calls == [FakeTask.ref], "one read on the cached path"
+
+
+# -- the negative half: a PR with no review task at all (issue #87) ---------
+#
+# Everything above bounds the cost of a PR whose review task EXISTS. A PR that
+# has none -- a third-party PR, one whose task was validated or retitled --
+# missed every one of those paths on every pass and paid the widest read this
+# daemon makes for the same answer each time: at a 60s poll, 1,440 whole-corpus
+# reads a day, from one unmapped PR, forever. These pin the countdown that
+# bounds it, and every way it is required to fail open.
+
+
+def _unmapped(config, ttl=3, state=None):
+    """A watcher for a PR that has no review task, with a short TTL."""
+    cfg = dataclasses.replace(config, review_task_miss_ttl_polls=ttl)
+    st = state or State(cfg.state_db)
+    w, _, al = watcher(cfg, make_pr(), [], state=st)
+    al.task = None  # nothing to find, on this pass or any other
+    return w, al, st
+
+
+def _pass(w, times=1):
+    """Run `times` fresh passes of the review-task resolution for the PR."""
+    resolved = None
+    for _ in range(times):
+        w._pass_tasks = None
+        resolved = w._review_task(make_pr())
+    return resolved
+
+
+def test_an_unmapped_pr_costs_one_corpus_fetch_per_ttl_window(config):
+    """The whole point: one fetch, then silence for the window, then one more.
+
+    Five passes at a TTL of three is deliberately a window and a half -- it
+    pins the re-arm as well as the suppression, and a cache that never expired
+    would pass a test that stopped at four.
+    """
+    w, al, state = _unmapped(config, ttl=3)
+
+    _pass(w)
+    assert al.list_calls == 1, "the first sighting searches, and finds nothing"
+    assert state.review_task_miss(SLUG, NUMBER) == 3, "and records the answer"
+
+    _pass(w, 3)
+    assert al.list_calls == 1, "three polls answered from the ledger"
+
+    _pass(w)
+    assert al.list_calls == 2, "the window ran out, so the search re-armed"
+    assert state.review_task_miss(SLUG, NUMBER) == 3, "and bought another window"
+
+
+def test_a_suppressed_pass_answers_exactly_what_the_search_answered(config):
+    """The suppression may bound a READ; it may never invent a decision. Both
+    passes must produce the value a completed search produced -- `evaluate`
+    then falls back to the GitHub review count, as it always did."""
+    w, _, _ = _unmapped(config, ttl=3)
+
+    searched = _pass(w)
+    suppressed = _pass(w)
+
+    assert searched == ResolvedTask(task=None)
+    assert suppressed == searched
+
+
+def test_a_review_task_that_appears_is_picked_up_when_the_window_re_arms(config):
+    """The cost of the bound, stated honestly: a task created mid-window waits
+    for the re-arm rather than the next poll. After that the mapping takes over
+    and the negative row is gone -- the two can never both speak for one PR."""
+    w, al, state = _unmapped(config, ttl=2)
+
+    _pass(w)
+    al.task = FakeTask()  # the reviewer session creates it mid-window
+    _pass(w, 2)
+    assert al.list_calls == 1, "still inside the window: not looked for yet"
+
+    _pass(w)
+    assert al.list_calls == 2, "the re-armed pass searches and finds it"
+    assert state.review_task(SLUG, NUMBER) == FakeTask.ref
+    assert state.review_task_miss(SLUG, NUMBER) is None, "the miss is disproved"
+
+    _pass(w, 3)
+    assert al.list_calls == 2, "and from here it is the cached ref, every pass"
+
+
+def test_a_cached_mapping_is_never_answered_by_a_stale_miss(config):
+    """The negative answer is consulted ONLY where there is no mapping. A row
+    left behind by a hand-edited ledger must not make the daemon report 'no
+    review task' for a PR it can resolve by ref."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    state.record_review_task(SLUG, NUMBER, FakeTask.ref)
+    state._replace_review_task_miss(SLUG, NUMBER, 10)  # not reachable in production
+
+    resolved = _pass(w)
+
+    assert resolved.task is al.task, "resolved by ref, as the mapping says"
+    assert state.review_task_miss(SLUG, NUMBER) == 10, "and the row is not even read"
+
+
+def test_a_disproved_mapping_still_searches_despite_an_outstanding_miss(config):
+    """A fresh disproof is new information and outranks an old negative answer:
+    the pass that drops a mapping must look for a replacement."""
+    state = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=state)
+    state.record_review_task(SLUG, NUMBER, FakeTask.ref)
+    state._replace_review_task_miss(SLUG, NUMBER, 10)
+    al.task = Validated()  # readable by ref, no longer this PR's open task
+
+    resolved = _pass(w)
+
+    assert resolved.task is None
+    assert al.list_calls == 1, "the disproof searched rather than trusting the row"
+
+
+def test_a_read_only_ledger_falls_back_to_a_fetch_every_pass(config, tmp_path):
+    """AC 1's fail-open clause, end to end. A ledger that cannot record the
+    answer cannot suppress anything, so the daemon pays exactly what it paid
+    before the negative cache existed -- one corpus fetch per pass. Never the
+    other way round: a suppression nothing can expire would answer 'no review
+    task' forever."""
+    w, al, _ = _unmapped(config, ttl=10)
+    path = config.state_db
+
+    path.chmod(0o444)
+    path.parent.chmod(0o555)
+    try:
+        _pass(w, 3)
+    finally:
+        path.parent.chmod(0o755)
+        path.chmod(0o644)
+
+    assert al.list_calls == 3, "one fetch per pass, as before the cache"
+
+
+def test_a_search_that_raises_buys_no_silence(config, monkeypatch):
+    """A miss is recorded only from a search that RAN. A CLI failure records
+    one and the retry that was supposed to correct it never happens."""
+    w, _, state = _unmapped(config, ttl=10)
+
+    def boom():
+        raise CommandError(["alissa", "task", "list"], 1, "API 503")
+
+    monkeypatch.setattr(w, "_pass_task_list", boom)
+
+    with pytest.raises(CommandError):
+        _pass(w)
+
+    assert state.review_task_miss(SLUG, NUMBER) is None
+
+
+def test_the_negative_cache_is_kept_per_pr(config):
+    """One unmapped PR's window must not answer for another's -- they are
+    different questions, and the corpus fetch is shared by the pass memo
+    anyway."""
+    w, al, state = _unmapped(config, ttl=5)
+
+    w._review_task(make_pr())
+    w._review_task(dataclasses.replace(make_pr(), number=8))
+
+    assert al.list_calls == 1, "one pass, one fetch, two PRs — the memo's job"
+    assert state.review_task_miss(SLUG, NUMBER) == 5
+    assert state.review_task_miss(SLUG, 8) == 5
+
+
+# -- its config knob --------------------------------------------------------
+
+
+def test_the_default_miss_window_is_short_enough_to_be_a_latency(tmp_path):
+    """Ten polls is ten minutes at the default cadence: long enough to cut the
+    reads by 90%, short enough that a review task created after its PR is not
+    left waiting for a working day."""
+    assert 1 <= DEFAULT_REVIEW_TASK_MISS_TTL_POLLS <= 60
+    assert (
+        Config(workspace_root=".").review_task_miss_ttl_polls
+        == DEFAULT_REVIEW_TASK_MISS_TTL_POLLS
+    )
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_a_miss_window_below_one_poll_is_rejected(tmp_path, value):
+    """Refused rather than clamped: 0 reads as 'turn the cache off', and there
+    is no off -- it would write ledger rows nothing consults."""
+    with pytest.raises(ValueError, match="review_task_miss_ttl_polls"):
+        Config.build(tmp_path, {"review_task_miss_ttl_polls": value})
+
+
+def test_the_miss_window_and_the_self_scope_reach_the_config(tmp_path, monkeypatch):
+    from alissa.tools.github.revloop.__main__ import resolve_config
+
+    monkeypatch.chdir(tmp_path)
+
+    cfg = resolve_config(cli("--review-task-miss-ttl-polls", "4", "--task-list-self-scope"))
+    assert cfg.review_task_miss_ttl_polls == 4
+    assert cfg.task_list_self_scope is True
+
+    import json
+
+    (tmp_path / CONFIG_FILENAME).write_text(json.dumps({"task_list_self_scope": True}))
+    assert resolve_config(cli("--no-task-list-self-scope")).task_list_self_scope is False
+    assert resolve_config(cli()).task_list_self_scope is True
+
+
+def test_the_self_scope_flags_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        cli("--task-list-self-scope", "--no-task-list-self-scope")
+
+
+def test_the_pr_diagnostic_re_arms_the_search_before_deciding(tmp_path, monkeypatch, capsys):
+    """`--pr` exists to tell 'the search did not find it' apart from 'the
+    decision was no'. A suppressed pass would answer it without looking."""
+    from alissa.tools.github.revloop import __main__ as main_module
+
+    forgotten: list[tuple] = []
+
+    class FakeState:
+        def forget_review_task_miss(self, repo, number):
+            forgotten.append((repo, number))
+            return True
+
+    class FakeWatcher:
+        def __init__(self, config):
+            self.state = FakeState()
+
+        def preflight(self):
+            return []
+
+        def evaluate(self, owner, repo, number):
+            assert forgotten == [(f"{owner}/{repo}", number)], "re-armed FIRST"
+            return Decision(Action.SPAWNED, "ok", round=1)
+
+    monkeypatch.setattr(main_module, "ReviewWatcher", FakeWatcher)
+    monkeypatch.chdir(tmp_path)
+
+    assert main_module.main(["--pr", f"{SLUG}#{NUMBER}"]) == 0
+    assert forgotten == [(SLUG, NUMBER)]
 
 
 # -- the client's half of it ------------------------------------------------

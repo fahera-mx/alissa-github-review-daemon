@@ -38,7 +38,10 @@ def review_task(status: str = "pending_validation") -> Task:
 
 def test_review_task_ref_matches_cr2_title():
     class A:
-        def list_tasks(self):
+        def list_tasks(self, *, narrow_status=True):
+            # The implementer-side driver must see a review task whatever its
+            # status, so it opts OUT of the daemon's open-status narrowing.
+            assert narrow_status is False
             return [
                 Task(ref="TASK-1", title="Do the thing", status="in_progress"),
                 review_task(),
@@ -49,7 +52,8 @@ def test_review_task_ref_matches_cr2_title():
 
 def test_review_task_ref_none_when_absent():
     class A:
-        def list_tasks(self):
+        def list_tasks(self, *, narrow_status=True):
+            assert narrow_status is False
             return [Task(ref="TASK-1", title="Review PR other/repo#1", status="todo")]
 
     assert prreview._review_task_ref(A(), OWNER, REPO, NUMBER) is None
@@ -89,7 +93,7 @@ def wiring(monkeypatch):
             return val
 
     class FakeAlissa:
-        def list_tasks(self):
+        def list_tasks(self, *, narrow_status=True):
             return state["tasks"]
 
         def latest_verdict(self, ref):

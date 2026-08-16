@@ -1381,7 +1381,9 @@ class ReviewWatcher:
         self.github = github or GitHub(
             config.reviewer_login, token_env=config.reviewer_token_env
         )
-        self.alissa = alissa or Alissa()
+        self.alissa = alissa or Alissa(
+            task_list_self_scope=config.task_list_self_scope
+        )
         self.state = state or State(config.state_db)
         # (repo, number, comment id) of every re-entry directive already
         # refused in this process -- see _log_ignored_ack.
@@ -1507,9 +1509,29 @@ class ReviewWatcher:
           unreadable task is NOT a disproof, so the row survives a transient
           CLI failure and the pass just degrades to the old behaviour.
 
+        ...and a FOURTH outcome that is none of those (issue #87): no cached ref
+        and a recent search that already found nothing. The three above bound
+        the cost of a PR whose review task EXISTS; a PR that has none missed
+        every one of them on every pass and paid the corpus fetch for the same
+        answer forever -- 1,440 whole-corpus reads a day, per unmapped PR, at a
+        60s poll. So a completed search that finds nothing is recorded as such
+        and taken on trust for `review_task_miss_ttl_polls` further polls.
+
+        That negative answer is consulted ONLY when there is no cached ref at
+        all, which is what keeps it from ever competing with the three outcomes
+        above: a cached ref that reads and matches never reaches it, a cached
+        ref that is DISPROVED must re-search on the strength of that fresh
+        disproof (and only records a miss if that search also comes up empty),
+        and a cached ref that could not be READ must fall back to the search,
+        because an unreadable task is not a wrong one.
+
         Fail-open is the whole contract: every degradation here lands on "do
         what the daemon did before the cache existed", and none of them can
-        answer "no review task" unless a successful search actually said so.
+        answer "no review task" unless a successful search actually said so --
+        including the negative cache, which is written only from a search that
+        RAN and returned nothing, and which suppresses a pass only when the
+        ledger accepted the write that spends it (see
+        State.consume_review_task_miss).
 
         TWO consequences of resolving from cache, both accepted rather than
         overlooked (PR #68 round 1):
@@ -1548,6 +1570,12 @@ class ReviewWatcher:
                     "an unreadable task is not a wrong one)",
                     pr.slug, cached,
                 )
+        elif self.state.consume_review_task_miss(pr.full_name, pr.number):
+            log.debug(
+                "%s: a recent search found no review task and the answer has "
+                "polls left — skipping the corpus fetch this pass", pr.slug,
+            )
+            return ResolvedTask(task=None)
 
         task = self.alissa.find_review_task(
             pr.owner, pr.repo, pr.number, tasks=self._pass_task_list()
@@ -1557,6 +1585,16 @@ class ReviewWatcher:
             # no open review task for this PR, whatever the cache said.
             if cached is not None:
                 self.state.forget_review_task(pr.full_name, pr.number)
+            # ...and it is the ONLY thing this daemon may record a negative
+            # answer from. Recorded here rather than at the call sites because
+            # this is the one place that knows the search RAN: a search that
+            # raised never reaches this line at all (it propagates out of
+            # `_pass_task_list` and the pass turns it into one PR's SKIPPED),
+            # so a transient CLI failure can never buy itself a window of
+            # silence.
+            self.state.record_review_task_miss(
+                pr.full_name, pr.number, self.config.review_task_miss_ttl_polls
+            )
             return ResolvedTask(task=None)
 
         self.state.record_review_task(pr.full_name, pr.number, task.ref)
@@ -3894,6 +3932,19 @@ class ReviewWatcher:
                 f"not an Alissa Code Workspace yet (`alissa code workspace init`)"
             )
 
+        # The task-list narrowing probe (issue #87), run at BOOT so the answer
+        # is memoized before the first pass and, more usefully, so the call the
+        # daemon will actually make is in the startup log next to the config
+        # that shaped it. Nothing here can fail the daemon: an unprobeable CLI
+        # degrades to the unnarrowed call and says so.
+        log.info("task list: %s", " ".join(self.alissa.task_list_argv()))
+        if self.config.task_list_self_scope and not self.alissa.probe_task_list().self_scope:
+            warnings.append(
+                "task_list_self_scope is set but the installed `alissa` CLI "
+                "does not advertise `task list --self` — the task list is not "
+                "actor-scoped; upgrade the CLI or drop the key"
+            )
+
         if not self.config.dry_run and not self.alissa.worker_running():
             warnings.append(
                 "`alissa worker` does not appear to be running — queued reviewer "
@@ -4103,14 +4154,14 @@ class ReviewWatcher:
         # effect AND every correctness write (`_spawn` skips record_spawn, the
         # reaper logs instead of killing, the drift/cap-out/deferral paths
         # return before both their comment and their record). The ledger writes
-        # it may still take are the snapshot and the review-task cache
-        # (`_review_task` runs in dry-run and both records and forgets
-        # mappings) -- both classified by this module as best-effort telemetry,
-        # both absorbed by _write_telemetry, and neither a decision the daemon
-        # has to remember. Writing the cache in dry-run is deliberate: a
-        # dry-run pass that learns a mapping hands it to the next production
-        # pass, and suppressing it would make the two disagree about ledger
-        # contents for no correctness reason. The cost on a read-only volume is
+        # it may still take are the snapshot and the review-task cache, both
+        # halves (`_review_task` runs in dry-run and records, forgets and spends
+        # both mappings and misses) -- all classified by this module as
+        # best-effort telemetry, all absorbed by _write_telemetry, and none a
+        # decision the daemon has to remember. Writing the cache in dry-run is
+        # deliberate: a dry-run pass that learns a mapping hands it to the next
+        # production pass, and suppressing it would make the two disagree about
+        # ledger contents for no correctness reason. The cost on a read-only volume is
         # a reconnect attempt on the first failure of the streak plus
         # streak-limited warnings, which is the same best-effort behaviour the
         # snapshot has always had there.
