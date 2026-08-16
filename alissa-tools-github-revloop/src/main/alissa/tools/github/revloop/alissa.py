@@ -68,17 +68,39 @@ class TaskListFlags:
     digest: bool = False
 
 
+# How deeply an OPTION may be indented in a commander help listing. Commander
+# puts option names in a fixed left column (two spaces) and wraps each
+# description onto continuation lines indented to the DESCRIPTION column, which
+# is much further right -- 22 in the CLI this daemon ships against. So a small
+# bounded indent is what separates an option from a wrapped description, without
+# depending on the exact description-column width, which varies with the longest
+# option name in the listing.
+#
+# Anchoring merely to line START is not enough, and that was the round-1 finding
+# on PR #88: a description that wraps such that its second line BEGINS with
+# `--status` reads as an offer of `--status`, and 0.1.0's own help already wraps
+# `--self`'s description onto its own line, so the shape is not hypothetical.
+MAX_OPTION_INDENT = 3
+
+
 def _advertises(helptext: str, flag: str) -> bool:
     """Whether `flag` appears as an OPTION in a CLI help listing.
 
-    Anchored to the start of a help line (allowing a short alias in front, as in
-    `-h, --help`) so a flag merely NAMED in some other option's prose -- "Pair
-    with --include-shared" is in this very help text -- is not read as an offer
-    of that flag. The trailing guard rejects a longer flag that merely starts
-    with this one (`--self-only` is not `--self`).
+    Anchored to the option COLUMN (see MAX_OPTION_INDENT), allowing a short alias
+    in front as in `-h, --help`, so a flag merely NAMED in another option's
+    description is not read as an offer of that flag -- whether it is named
+    mid-line ("Pair with --include-shared" is in this very help text) or at the
+    start of a wrapped continuation line. The trailing guard rejects a longer
+    flag that merely starts with this one (`--self-only` is not `--self`).
+
+    The consequence of a false positive is bounded rather than silent -- the flag
+    is sent, `alissa` exits non-zero, and `list_tasks` retries plain -- but it
+    costs a whole-corpus fetch, which is the thing this module is here to stop
+    spending.
     """
     return re.search(
-        rf"(?m)^\s*(?:-\w,\s+)?{re.escape(flag)}(?![\w-])", helptext
+        rf"(?m)^[ \t]{{0,{MAX_OPTION_INDENT}}}(?:-\w,\s+)?{re.escape(flag)}(?![\w-])",
+        helptext,
     ) is not None
 
 
@@ -408,7 +430,14 @@ class Alissa:
             data = run_json(plain, timeout=90) or []
 
         tasks = self._tasks_from(data)
-        if tasks or argv == plain:
+        if tasks or argv == plain or self._task_list_narrowing_disabled:
+            # The third clause is the `except` branch above having already
+            # retried `plain`: without it, a retry that legitimately answers an
+            # EMPTY corpus falls into the cross-check below and calls `plain` a
+            # second time -- three subprocess calls where two happened, inside
+            # the change whose purpose is removing whole-corpus fetches -- and
+            # warns about a narrowed call that in fact errored and never
+            # answered (PR #88 round 1).
             return tasks
 
         # An empty answer from a narrowed call. A genuinely empty corpus is

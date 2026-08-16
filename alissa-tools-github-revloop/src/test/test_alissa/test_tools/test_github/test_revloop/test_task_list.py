@@ -155,6 +155,36 @@ def test_a_flag_named_only_in_prose_is_not_an_offer(cli):
     assert Alissa().probe_task_list().status is False
 
 
+def test_a_flag_starting_a_wrapped_description_line_is_not_an_offer(cli):
+    """The boundary the line-start anchor alone did not hold (PR #88 round 1).
+
+    Commander wraps a long description onto continuation lines indented to the
+    DESCRIPTION column, so a wrapped line can BEGIN with something that looks
+    like an option. 0.1.0's own help already wraps `--self`'s description, so
+    this is the shipped shape rather than a hypothetical one -- and the flag
+    being wrongly offered here is `--status`, the one whose argument syntax the
+    daemon would be guessing at.
+    """
+    cli.help = HELP_0_1_0.replace(
+        "  --include-shared    Also list tasks shared with you\n",
+        "  --include-shared    Also list tasks shared with you; combine\n"
+        "                      --status with it to filter\n",
+    )
+
+    flags = Alissa().probe_task_list()
+
+    assert flags.status is False, "a wrapped description line is not an offer"
+    assert flags.self_scope is True, "and the real options are still found"
+
+
+def test_an_option_is_found_however_the_listing_indents_its_column(cli):
+    """The guard is the option COLUMN, not one hardcoded width: a listing whose
+    longest option name pushes the description column out must still work."""
+    cli.help = HELP_FULL.replace("  --status", "   --status")
+
+    assert Alissa().probe_task_list().status is True
+
+
 def test_a_longer_flag_starting_with_the_same_letters_is_not_the_flag(cli):
     cli.help = HELP_OLD.replace(
         "  --json              Output raw JSON",
@@ -263,6 +293,20 @@ def test_a_narrowed_call_that_fails_retries_plain_and_stops_narrowing(cli):
 
     client.list_tasks()
     assert cli.calls[-1] == PLAIN, "and this process does not narrow again"
+
+
+def test_a_failed_narrowed_call_does_not_also_pay_the_empty_cross_check(cli):
+    """The retry above already made the plain call. If it legitimately answers an
+    EMPTY corpus, the empty-answer cross-check must not fire a THIRD list --
+    inside the change whose purpose is removing whole-corpus fetches (PR #88
+    round 1)."""
+    cli.help = HELP_FULL
+    narrowed = tuple(PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"])
+    cli.answers[narrowed] = CommandError(list(narrowed), 1, "unknown option")
+    cli.answers[tuple(PLAIN)] = []
+
+    assert Alissa().list_tasks() == []
+    assert cli.calls == [list(narrowed), PLAIN], "two calls, not three"
 
 
 def test_a_plain_call_that_fails_still_raises(cli):
