@@ -146,6 +146,32 @@ def build_parser() -> argparse.ArgumentParser:
         "evidence; 0 queues immediately and relies on the directive alone",
     )
 
+    over.add_argument(
+        "--review-task-miss-ttl-polls",
+        type=int,
+        metavar="N",
+        help="how many polls a PR with NO review task is taken on trust before "
+        "the task corpus is searched for one again; must be >= 1",
+    )
+
+    scope = over.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--task-list-self-scope",
+        dest="task_list_self_scope",
+        action="store_true",
+        default=None,
+        help="narrow `alissa task list` to this actor's own rows (--self), "
+        "dropping the sponsor's corpus. Only for deployments where EVERY "
+        "review task is created by this daemon's own sessions: a review task "
+        "the list cannot see is a round the daemon cannot count",
+    )
+    scope.add_argument(
+        "--no-task-list-self-scope",
+        dest="task_list_self_scope",
+        action="store_false",
+        help="list the sponsor-union corpus even if the config narrows it",
+    )
+
     dry = over.add_mutually_exclusive_group()
     dry.add_argument(
         "--dry-run",
@@ -183,6 +209,8 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "max_concurrent_sessions": args.max_concurrent_sessions,
         "checks_wait_seconds": args.checks_wait_seconds,
         "checks_spawn_wait_seconds": args.checks_spawn_wait_seconds,
+        "review_task_miss_ttl_polls": args.review_task_miss_ttl_polls,
+        "task_list_self_scope": args.task_list_self_scope,
         "dry_run": args.dry_run,
     }
 
@@ -226,6 +254,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.pr:
             owner, repo, number = parse_pr_ref(args.pr)
+            # This mode exists to tell "the search did not find it" apart from
+            # "the decision was no", so it must never be answered by the
+            # negative cache -- a suppressed pass would report "no review task"
+            # without looking, which is precisely the confusion the flag is for.
+            # Re-arming here (rather than plumbing a bypass through `evaluate`)
+            # keeps the poll path with exactly one way in, and costs the daemon
+            # one corpus fetch on a hand-run diagnostic.
+            watcher.state.forget_review_task_miss(f"{owner}/{repo}", number)
             decision = watcher.evaluate(owner, repo, number)
             print(f"\n{args.pr} → {decision.action.value}")
             print(f"  round:  {decision.round}")

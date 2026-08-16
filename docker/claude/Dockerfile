@@ -289,6 +289,25 @@ ARG ALISSA_CHECKS_WAIT_SECONDS=""
 # REQUIRES REVLOOP_VERSION >= 0.17.0 for the same reason the keys above it do:
 # an older library rejects the unknown config key at load.
 ARG ALISSA_CHECKS_SPAWN_WAIT_SECONDS=""
+# How many polls a PR with NO Alissa review task is taken on trust before the
+# daemon searches the actor's task corpus for one again (issue #87). That search
+# is the widest read this daemon makes, and the PR -> review-task mapping can
+# only cache an answer that EXISTS -- so an unmapped PR paid the whole corpus on
+# every poll, forever. Trades LATENCY for reads: a review task created inside the
+# window is picked up at the re-arm, not the next poll. Floor 1; there is no
+# value that disables it. Pass-through, and it REQUIRES REVLOOP_VERSION >= 0.18.0
+# for the same reason the keys above it do: an older library rejects the unknown
+# config key at load.
+ARG ALISSA_REVIEW_TASK_MISS_TTL_POLLS=""
+# Narrow `alissa task list` to this actor's OWN rows (`--self`), dropping the
+# sponsor's corpus. Off unless set, on measured evidence rather than caution: on
+# the live fleet corpus it saves 4% of the payload, and a small minority of review
+# tasks are owned by another actor -- one the list could not see would be a round
+# the daemon could not count. Set it to 1 only where every review task is created
+# by this daemon's own reviewer sessions. The other narrowings (status filter,
+# digest view) are adopted automatically wherever the installed CLI offers them
+# and need no variable. Pass-through, REQUIRES REVLOOP_VERSION >= 0.18.0.
+ARG ALISSA_TASK_LIST_SELF_SCOPE=""
 # STRUCTURAL container constants (not pass-through): agent_profile must name a
 # profile the baked agents.yaml ships (`claude`); on_missing_hub must be `add`
 # for the self-contained hub-ify-on-demand model (the library default `skip`
@@ -325,6 +344,8 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_MAX_CONCURRENT_SESSIONS=${ALISSA_MAX_CONCURRENT_SESSIONS} \
     ALISSA_CHECKS_WAIT_SECONDS=${ALISSA_CHECKS_WAIT_SECONDS} \
     ALISSA_CHECKS_SPAWN_WAIT_SECONDS=${ALISSA_CHECKS_SPAWN_WAIT_SECONDS} \
+    ALISSA_REVIEW_TASK_MISS_TTL_POLLS=${ALISSA_REVIEW_TASK_MISS_TTL_POLLS} \
+    ALISSA_TASK_LIST_SELF_SCOPE=${ALISSA_TASK_LIST_SELF_SCOPE} \
     ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} \
     ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \

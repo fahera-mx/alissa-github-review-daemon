@@ -20,7 +20,15 @@
 #     of the watched repos' CI, not of the image), checks_spawn_wait_seconds (how
 #     long an owed round waits for the head's checks to conclude before its
 #     reviewer is queued at all -- the same property of the same CI, one stage
-#     earlier), operators (an EMPTY operator
+#     earlier), review_task_miss_ttl_polls (how many polls a PR with no review
+#     task is taken on trust before the task corpus is searched again -- a
+#     latency-for-reads trade that depends on how a deployment creates its review
+#     tasks, not on the image), task_list_self_scope (whether this actor owns
+#     EVERY review task it has to find -- a property of the deployment's actor
+#     layout; the only BOOLEAN pass-through here, accepted as 1/0, true/false,
+#     yes/no or on/off and REFUSED as anything else, because a silently-false
+#     typo would be indistinguishable from the default it is trying to change),
+#     operators (an EMPTY operator
 #     allowlist is the library's fail-closed default -- emitting `[]` would say
 #     the same thing, but omitting it keeps "unset means the library decides"
 #     true for every optional key without exception).
@@ -80,6 +88,8 @@ render_revloop_config() {
     --arg     gate   "${ALISSA_MAX_CONCURRENT_SESSIONS:-}" \
     --arg     cwait  "${ALISSA_CHECKS_WAIT_SECONDS:-}" \
     --arg     swait  "${ALISSA_CHECKS_SPAWN_WAIT_SECONDS:-}" \
+    --arg     missttl "${ALISSA_REVIEW_TASK_MISS_TTL_POLLS:-}" \
+    --arg     selfsc  "${ALISSA_TASK_LIST_SELF_SCOPE:-}" \
     --arg     rlogin "${ALISSA_REVIEWER_LOGIN:-}" \
     --arg     rtoken "${ALISSA_REVIEWER_TOKEN_ENV:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
@@ -90,6 +100,12 @@ render_revloop_config() {
      + (if $gate  == "" then {} else { max_concurrent_sessions: ($gate  | tonumber) } end)
      + (if $cwait == "" then {} else { checks_wait_seconds: ($cwait | tonumber) } end)
      + (if $swait == "" then {} else { checks_spawn_wait_seconds: ($swait | tonumber) } end)
+     + (if $missttl == "" then {} else { review_task_miss_ttl_polls: ($missttl | tonumber) } end)
+     + (if $selfsc == "" then {} else { task_list_self_scope: ($selfsc | ascii_downcase |
+         if . == "1" or . == "true" or . == "yes" or . == "on" then true
+         elif . == "0" or . == "false" or . == "no" or . == "off" then false
+         else error("ALISSA_TASK_LIST_SELF_SCOPE must be a boolean (1/0, true/false, yes/no, on/off)")
+         end) } end)
      + (if $rlogin == "" then {} else { reviewer_login:     $rlogin } end)
      + (if $rtoken == "" then {} else { reviewer_token_env: $rtoken } end)
      + (if ($operators | length) == 0 then {} else { operators: $operators } end)'

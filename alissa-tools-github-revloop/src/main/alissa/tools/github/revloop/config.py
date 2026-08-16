@@ -132,6 +132,8 @@ CONFIG_KEYS = (
     "max_concurrent_sessions",
     "checks_wait_seconds",
     "checks_spawn_wait_seconds",
+    "review_task_miss_ttl_polls",
+    "task_list_self_scope",
     "dry_run",
 )
 
@@ -223,6 +225,26 @@ DEFAULT_CHECKS_WAIT_SECONDS = 30 * 60
 # still-running rollup, which is the directive-only posture.
 DEFAULT_CHECKS_SPAWN_WAIT_SECONDS = 15 * 60
 
+# How many polls a PR with NO review task may be taken on trust before the
+# daemon searches the task corpus for one again (issue #87).
+#
+# The review-task cache can only remember an answer that EXISTS, so a PR with no
+# review task -- a third-party PR, one whose task was validated or retitled --
+# missed it on every pass and paid the widest read this daemon makes for the
+# same answer every time: at a 60s poll, 1,440 full-corpus reads a day from one
+# unmapped PR, forever.
+#
+# 10 is the trade, and the thing being traded is LATENCY, not correctness: a
+# review task created while the window is open is picked up on the next search
+# rather than the next poll, so the cost of the default is up to ten minutes
+# before that PR's round 1 is queued -- against a 99% cut in the reads. Tune it
+# down on a deployment where review tasks appear after their PR does and the
+# wait is felt; tune it up on one where they are created up front.
+#
+# There is no "off" value: the floor is 1 (suppress one poll), because 0 would
+# not disable a cache, it would write rows nothing ever reads.
+DEFAULT_REVIEW_TASK_MISS_TTL_POLLS = 10
+
 
 def default_state_path(workspace_root: Path) -> Path:
     return Path(workspace_root) / ".revloop" / "state.db"
@@ -290,6 +312,20 @@ class Config:
     # re-decided by the poll like every other owed round, so there is no second
     # timer to configure.
     checks_spawn_wait_seconds: int = DEFAULT_CHECKS_SPAWN_WAIT_SECONDS
+
+    # How many polls a PR with no review task is taken on trust before the
+    # corpus is searched again; see DEFAULT_REVIEW_TASK_MISS_TTL_POLLS. Floor 1
+    # -- there is no value that turns the negative cache off.
+    review_task_miss_ttl_polls: int = DEFAULT_REVIEW_TASK_MISS_TTL_POLLS
+
+    # Whether `alissa task list` may be narrowed to THIS actor's own rows
+    # (`--self`), dropping the sponsor's corpus. Off by default because on the
+    # live fleet a small minority of review tasks are NOT owned by the actor the
+    # daemon runs as, and a review task it cannot see is a round it cannot count
+    # -- see alissa.TASK_LIST_SELF_FLAG for the measurement. Turn it on only
+    # where every review task is created by this daemon's own sessions. Ignored
+    # when the installed CLI does not advertise the flag.
+    task_list_self_scope: bool = False
 
     dry_run: bool = False
 
@@ -443,6 +479,22 @@ class Config:
                 f"checks_spawn_wait_seconds must be >= 0, got {spawn_wait}"
             )
 
+        miss_ttl = int(
+            raw.get("review_task_miss_ttl_polls", cls.review_task_miss_ttl_polls)
+        )
+        if miss_ttl < 1:
+            # Refused rather than clamped: 0 reads as "turn the negative cache
+            # off", but the cache is what bounds the widest read this daemon
+            # makes, and a 0 would keep writing ledger rows nothing consults. An
+            # operator who means "search every poll" has said something the
+            # daemon cannot do, and should hear that at load rather than
+            # discover it in the I/O bill.
+            raise ValueError(
+                f"review_task_miss_ttl_polls must be >= 1 (it is a number of "
+                f"polls to suppress, and there is no value that disables the "
+                f"negative cache), got {miss_ttl}"
+            )
+
         token_env = raw.get("reviewer_token_env")
         if token_env is not None:
             token_env = str(token_env).strip()
@@ -489,6 +541,8 @@ class Config:
             max_concurrent_sessions=max_sessions,
             checks_wait_seconds=checks_wait,
             checks_spawn_wait_seconds=spawn_wait,
+            review_task_miss_ttl_polls=miss_ttl,
+            task_list_self_scope=bool(raw.get("task_list_self_scope", False)),
             dry_run=bool(raw.get("dry_run", False)),
         )
 
