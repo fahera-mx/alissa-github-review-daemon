@@ -621,9 +621,24 @@ MIN_SESSION_CHECKS_WAIT_SECONDS = 5 * 60
 # contexts x item, leaving the character cap as the backstop for a pathological
 # item rather than the thing that decides how many jobs a reviewer hears about.
 # 200 fits a GitHub Actions run URL (~105) plus a generous name and conclusion.
+# The marker an item cut to fit carries. Defined here, next to the caps, because
+# the derived budget below has to count it: it is part of what a full list of
+# capped items actually measures (PR #85 round-3 nit).
+DIRECTIVE_ITEM_TRUNCATED = "…"
+
 MAX_DIRECTIVE_ITEM_CHARS = 200
 MAX_DIRECTIVE_CONTEXTS = 10
-MAX_DIRECTIVE_DATA_CHARS = MAX_DIRECTIVE_CONTEXTS * MAX_DIRECTIVE_ITEM_CHARS
+# The widest list the COUNT cap can pass, exactly: every item at its cap, every
+# one of them carrying the cut marker, joined by "; ". The naive
+# contexts x item was 28 characters short of that, so ten items at the item cap
+# tripped the character backstop and nine were kept -- the character budget
+# deciding how many jobs a reviewer hears about, which is the inversion the
+# round-2 major was about, surviving at an input no real rollup produces. Stated
+# as arithmetic so it stays true if either cap is retuned.
+MAX_DIRECTIVE_DATA_CHARS = (
+    MAX_DIRECTIVE_CONTEXTS * (MAX_DIRECTIVE_ITEM_CHARS + len(DIRECTIVE_ITEM_TRUNCATED))
+    + (MAX_DIRECTIVE_CONTEXTS - 1) * len("; ")
+)
 
 # The fence around interpolated data. A lead-in alone says where the data starts
 # and nothing says where it stops -- and in all three clauses the span is
@@ -642,7 +657,24 @@ DATA_CLOSE = "⟦end data⟧"
 # (PR #85 round-2 minor, with a working repro). Newlines and control characters
 # go for the same reason -- a fresh line reads as fresh prose -- and the fence's
 # own brackets go so the END marker cannot be forged.
-_DIRECTIVE_STRIP_RE = re.compile("[`\x00-\x1f\x7f" + re.escape("⟦⟧") + "]")
+#
+# The class is deliberately NOT ASCII-only, because the input is not: the first
+# version stripped C0 and left U+0085, U+2028 and U+2029, every one of which
+# renders as a line break, so the mitigation applied to one ENCODING of "start a
+# fresh line" rather than to the effect (PR #85 round-3 minor). C1 goes with
+# them, and so do the bidi controls -- U+202A-E and U+2066-9 reorder the rendered
+# run, which is the same class of "what is displayed is not what the string
+# says".
+# Written as escapes, never as the characters themselves: every one of them
+# is invisible or reorders its neighbours in an editor, which is precisely
+# why they are stripped.
+_DIRECTIVE_STRIP_RE = re.compile(
+    "[`\\x00-\\x1f\\x7f-\\x9f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069"
+    # The fence's BRACKETS only -- putting the whole markers in a character
+    # class would strip their letters out of every check name too.
+    + re.escape("⟦⟧")
+    + "]"
+)
 
 # Says out loud that what follows is data, and exactly where it ends. A session
 # reading its directive has no other way to tell the daemon's instructions from a
@@ -711,12 +743,11 @@ CHECKS_AT_SPAWN_UNREADABLE = (
 # quotes mean something. Inside ⟦data⟧ the fence is the boundary.
 CHECKS_AT_SPAWN_FAILING = "{name} ({conclusion}){url}"
 
-# What the list becomes once the count cap has bitten, and what one over-long
-# item becomes. Both are visible on purpose: every truncation in this module has
+# What the list becomes once the count cap has bitten. Visible on purpose, like
+# the per-item marker beside the caps above: every truncation in this module has
 # to be readable in the directive, or a reviewer session cannot tell "these are
 # the failing checks" from "these are some of them".
 DIRECTIVE_DATA_TRUNCATED = " …(truncated: {dropped} more)"
-DIRECTIVE_ITEM_TRUNCATED = "…"
 
 
 def directive_text(value: str) -> str:
