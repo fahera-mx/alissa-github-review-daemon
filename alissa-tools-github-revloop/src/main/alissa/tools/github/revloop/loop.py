@@ -547,6 +547,77 @@ _RECORD_THE_CAP = (
     "from a stale template default. "
 )
 
+# -- the reviewer session's own CI gate (issue #84) ---------------------------
+#
+# _gate_on_checks (issue #58) gates the verdict the DAEMON posts. It cannot gate the
+# verdict the reviewer SESSION posts, which is the normal path: the daemon's
+# native post exists precisely for the rounds where the session did not submit
+# one. So the session gets the same rule as an instruction, in every directive.
+#
+# studio #560 (2026-08-15) is what it is for: the worker pushed at 20:04:53, CI
+# started six seconds later, the round approved at 20:07:22, and the `test` job
+# on that same sha failed at 20:07:51. Nothing was wrong with the review -- the
+# verdict simply preceded the evidence, and the red PR carried a green approval
+# for two hours because an approve from this identity reads as "ready to merge".
+#
+# The order of the two confirmations matters: a head that has moved makes the
+# rollup question moot (it would be about the wrong commit), so the head is
+# settled first.
+_CHECKS_BEFORE_VERDICT = (
+    "CI GATE — before you submit ANY verdict, in this order: "
+    "(1) HEAD — re-read `gh api repos/<org>/<repo>/pulls/<n> --jq .head.sha` and "
+    "confirm it is still the sha you reviewed. If it moved, the worker pushed "
+    "mid-review: review the new head and submit against THAT, never a verdict on "
+    "the sha you started from. "
+    "(2) CHECKS — read the rollup OF THAT SHA, never 'the PR's checks': "
+    "`gh api repos/<org>/<repo>/commits/<sha>/check-runs --jq "
+    "'.check_runs[]|[.name,.status,.conclusion,.html_url]|@tsv'` (and "
+    "`.../commits/<sha>/status` for legacy contexts). APPROVE only when every "
+    "context has CONCLUDED and none failed — `skipped` and `neutral` pass, and a "
+    "commit with no checks at all is green. While any context is still running, "
+    "WAIT and re-read it (every {poll}s, up to {wait} min) rather than "
+    "submitting: an approve on a sha whose checks have not finished is a verdict "
+    "on evidence that does not exist yet. If a context has FAILED, your verdict "
+    "is request_changes and the finding names the job and links its run. If they "
+    "never conclude within that bound, do NOT approve either — request_changes, "
+    "saying plainly that the checks at that sha never settled; the next round can "
+    "approve the same code on a green head. "
+)
+
+# What the daemon OBSERVED at queue time, appended to the rule above so the
+# session starts from the same rollup the gate decided on. Four shapes, one per
+# rollup state; each is a value passed into the directive's {checks} slot, so
+# its own braces (there are none) would never be re-formatted.
+CHECKS_AT_SPAWN_GREEN = (
+    "At queue time the rollup at `{sha}` was green ({total} context(s)) — "
+    "re-read it before you submit anyway: a check can go red while you review. "
+)
+CHECKS_AT_SPAWN_RED = (
+    "AT QUEUE TIME `{sha}` WAS RED: {failing}. Do NOT approve this round. Fold "
+    "the failure into your review as a blocking finding — name the job, link the "
+    "run — and verdict request_changes, whatever the diff itself deserves; say so "
+    "explicitly if the failure looks unrelated to the diff, but still withhold "
+    "the approve. A green re-run of the same code can approve in the next round. "
+)
+CHECKS_AT_SPAWN_UNSETTLED = (
+    "AT QUEUE TIME the checks on `{sha}` had not concluded after {waited} min of "
+    "waiting ({detail}) — this round was queued anyway so the review itself is "
+    "not blocked on CI. Do NOT approve unless you re-read the rollup yourself and "
+    "find it settled and green; if it is still running, verdict request_changes "
+    "naming the checks that never concluded. "
+)
+CHECKS_AT_SPAWN_UNREADABLE = (
+    "AT QUEUE TIME the rollup at `{sha}` could not be read (`{why}`), so the "
+    "daemon has nothing to tell you about this head's CI and did not wait for it. "
+    "An unreadable rollup is not a green one: read it yourself before you "
+    "approve, and if you cannot either, say so in your verdict and do not "
+    "approve. "
+)
+
+# One bullet per failing context in the red clause above — the same shape the
+# verdict gate's lead uses, so the two paths name a failure identically.
+CHECKS_AT_SPAWN_FAILING = "`{name}` ({conclusion}){url}"
+
 ROUND_1_DIRECTIVE = (
     "You are a PR REVIEWER, not an implementer. {assignment} "
     "Load the alissa-code-review skill and follow procedures/review-a-pr.md: "
@@ -555,6 +626,8 @@ ROUND_1_DIRECTIVE = (
     "move the task to pending_validation. "
     + _RECORD_THE_CAP
     + "{credential}"
+    + _CHECKS_BEFORE_VERDICT
+    + "{checks}"
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions. "
@@ -570,6 +643,8 @@ ROUND_K_DIRECTIVE = (
     "round-{round} verdict envelope, move the task to pending_validation. "
     + _RECORD_THE_CAP
     + "{credential}"
+    + _CHECKS_BEFORE_VERDICT
+    + "{checks}"
     + _CLOSE_THE_ROUND +
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions. "
@@ -965,6 +1040,13 @@ class Decision:
     task_ref: str | None = None
     deferred: bool = False
     reenqueued: bool = False
+    # `checks_held` marks a QUEUED that is waiting on the head's CI rollup
+    # rather than on a session slot (issue #84). Both are "owed, not started,
+    # retried next poll" -- which is why they share the action and the snapshot
+    # column -- but only the slot kind is back-pressure, so the gate's own
+    # summary line must not claim a full container for a round that is waiting
+    # on a test suite.
+    checks_held: bool = False
 
 
 @dataclass(frozen=True)
@@ -1043,6 +1125,28 @@ class ChecksGate:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class SpawnChecks:
+    """What the head's CI rollup does to a round that is about to be QUEUED.
+
+    Two shapes, and they are exclusive:
+
+    * `hold` set -- the head's checks are still running and the wait bound has
+      not run out, so the reviewer is not queued at all this poll. A session
+      that has not started cannot approve ahead of its evidence, which is the
+      only structural guarantee available on the path where the SESSION submits
+      the verdict.
+    * `clause` -- the round is queued, and this is what the directive tells it
+      about the rollup the daemon saw. Non-empty in every non-held case,
+      including green: a session that is told the head was green still has to
+      re-read it (a check can go red mid-review), and telling it what was
+      observed is what makes "re-read it" a comparison rather than a chore.
+    """
+
+    hold: Decision | None = None
+    clause: str = ""
+
+
 def session_name(pr: PullRequest, round_: int) -> str:
     """A tmux-safe reviewer session name, unique per spawn.
 
@@ -1101,6 +1205,14 @@ class ReviewWatcher:
         # rollup (two API calls) on every poll, forever, for every PR with an
         # owed approve. In-memory for the same reason _dry_run_drift is.
         self._dry_run_rollups: dict[tuple[str, int, int, str], str] = {}
+        # (repo slug, number, round, head) -> when the PRE-SPAWN CI wait for it
+        # began, in DRY-RUN. Same argument as the two above: a dry-run pass
+        # writes no ledger row, so the bound it reports has to be measured from
+        # somewhere, and it must be this process's own memory rather than a
+        # stamp a production pass wrote (or, worse, `now` every poll -- a wait
+        # that resets each pass never reaches its bound and the diagnostic would
+        # report an eternal hold production never takes).
+        self._dry_run_check_waits: dict[tuple[str, int, int, str], float] = {}
         # The task corpus THIS poll pass already fetched, or None until some
         # PR in it misses the review-task cache. `alissa task list` returns
         # every non-terminal task this actor owns (hundreds of rows, ~250 KB)
@@ -1379,6 +1491,20 @@ class ReviewWatcher:
         if held is not None:
             return held
 
+        # THE CI GATE, immediately after it (issue #84) and deliberately in this
+        # order: the session census is a local read the pass has already paid
+        # for, while this costs two GitHub calls, so a round that cannot start
+        # for want of a slot never buys a rollup it would not use.
+        checks = self._gate_spawn_on_checks(pr, round_)
+        if checks.hold is not None:
+            # The round is not waiting on a SLOT, so it must not hold a place in
+            # the slot queue -- the FIFO is what hands the next freed session to
+            # the oldest waiter, and a round blocked on CI would take that slot
+            # and not use it. It rejoins the queue on the pass that lets it
+            # through.
+            self._waiting.pop((pr.full_name, pr.number), None)
+            return checks.hold
+
         if age is not None:
             # Logged only once the gate has let the respawn through, so the
             # line cannot claim a re-enqueue that back-pressure then deferred.
@@ -1391,7 +1517,9 @@ class ReviewWatcher:
                 age / 60,
             )
 
-        return self._spawn(pr, round_, task, cap, reenqueued=age is not None)
+        return self._spawn(
+            pr, round_, task, cap, reenqueued=age is not None, checks=checks.clause
+        )
 
     # -- the spawn gate ----------------------------------------------------
 
@@ -1443,6 +1571,144 @@ class ReviewWatcher:
             f"round {round_} deferred — {live}/{limit} reviewer sessions live "
             f"(waiting {int(time.monotonic() - wait.since)}s)",
             round_,
+        )
+
+    # -- the pre-spawn CI gate (issue #84) ---------------------------------
+
+    def _gate_spawn_on_checks(self, pr: PullRequest, round_: int) -> SpawnChecks:
+        """Hold an owed round back while the head's checks are still running,
+        and tell the round that does start what the rollup said.
+
+        The rule this keeps is the same one _gate_on_checks keeps -- an approve
+        from the reviewer identity means *reviewed AND green* -- for the path
+        that one cannot reach. _gate_on_checks gates the verdict the DAEMON
+        posts; the daemon posts only for rounds whose session did not submit
+        their own, so the ordinary round's approve goes to GitHub straight from
+        an agent and no daemon-side check sits between it and the API. studio
+        #560: the session approved 29 seconds before that head's `test` job
+        failed. A session that has not been queued cannot do that, so the wait
+        moves to the spawn.
+
+        What each rollup state does, and why:
+
+        * PENDING -> hold, up to `checks_spawn_wait_seconds` measured from the
+          first observation (the ledger stamp; see note_spawn_checks_hold), then
+          queue anyway with the unsettled clause. Bounded because a CI system
+          that never reports must delay a review, never cancel it.
+        * RED -> queue NOW with the failing contexts and their run URLs, and a
+          directive that forbids the approve. Waiting would be pointless (the
+          answer cannot improve without a push or a re-run) and the round has
+          real work to do: the failure belongs in it as a blocking finding.
+        * GREEN -> queue, with what was seen.
+        * UNKNOWN -> queue, saying the rollup was unreadable. Deliberately NOT a
+          hold, which is where this gate parts company with the verdict one: an
+          unreadable rollup there blocks one already-finished verdict, while
+          here it would delay EVERY round of EVERY PR by the full bound for as
+          long as a credential lacks `checks: read` -- turning a permissions gap
+          into a fleet-wide review slowdown. The verdict gate still refuses to
+          approve on it, and the directive tells the session the same.
+
+        Read against the PR's CURRENT head, which is the commit the round about
+        to be queued will review -- unlike the verdict gate, which reads the head
+        its verdict is pinned to. A push mid-wait therefore starts a fresh wait
+        against the new commit (the ledger key carries the head), because the old
+        commit's checks say nothing about the code the reviewer will open.
+        """
+        rollup = self.github.check_rollup(pr.owner, pr.repo, pr.head_sha)
+        sha = pr.head_sha[:8]
+
+        if rollup.state == CHECKS_RED:
+            failing = "; ".join(
+                CHECKS_AT_SPAWN_FAILING.format(
+                    name=c.name,
+                    conclusion=c.conclusion or "no conclusion",
+                    url=f" — {c.url}" if c.url else "",
+                )
+                for c in rollup.failing
+            )
+            log.info(
+                "%s round %d: queuing with a NO-APPROVE directive — the rollup "
+                "at %s is %s",
+                pr.slug, round_, sha, rollup.summary,
+            )
+            return SpawnChecks(
+                clause=CHECKS_AT_SPAWN_RED.format(sha=sha, failing=failing)
+            )
+
+        if rollup.state == CHECKS_UNKNOWN:
+            log.warning(
+                "%s round %d: the rollup at %s could not be read (%s) — queuing "
+                "the round anyway and telling the reviewer to read it itself; an "
+                "unreadable rollup must not become a fleet-wide spawn stall",
+                pr.slug, round_, sha, rollup.unreadable or "no reason recorded",
+            )
+            return SpawnChecks(
+                clause=CHECKS_AT_SPAWN_UNREADABLE.format(
+                    sha=sha, why=rollup.unreadable or "no reason recorded"
+                )
+            )
+
+        if rollup.state == CHECKS_GREEN:
+            return SpawnChecks(
+                clause=CHECKS_AT_SPAWN_GREEN.format(sha=sha, total=rollup.total)
+            )
+
+        bound = self.config.checks_spawn_wait_seconds
+        detail = CHECKS_STILL_RUNNING.format(
+            names=", ".join(f"`{c.name}`" for c in rollup.running) or "none"
+        )
+        if bound <= 0:
+            # The gate is off. No ledger row, no wait, no log line of its own --
+            # the round is queued exactly as it was before this gate existed,
+            # and the directive still carries what the rollup said.
+            return SpawnChecks(
+                clause=CHECKS_AT_SPAWN_UNSETTLED.format(
+                    sha=sha, waited=0, detail=detail
+                )
+            )
+
+        waited = time.time() - self._checks_wait_since(pr, round_)
+        if waited < bound:
+            log.info(
+                "%s round %d: not queuing yet — the rollup at %s is %s (%dm of a "
+                "%dm bound). An approve is the operator's merge cue, so the round "
+                "waits for its evidence; nothing is spent while it does.",
+                pr.slug, round_, sha, rollup.summary, waited // 60, bound // 60,
+            )
+            return SpawnChecks(
+                hold=Decision(
+                    Action.QUEUED,
+                    f"round {round_} waits for CI — the rollup at {sha} is "
+                    f"{rollup.summary} ({int(waited)}s of {bound}s)",
+                    round_,
+                    checks_held=True,
+                )
+            )
+
+        log.warning(
+            "%s round %d: the rollup at %s is still %s after %dm (bound %dm) — "
+            "queuing the round with a NO-APPROVE directive rather than waiting "
+            "longer; a CI system that never reports must delay a review, not "
+            "cancel it",
+            pr.slug, round_, sha, rollup.summary, waited // 60, bound // 60,
+        )
+        return SpawnChecks(
+            clause=CHECKS_AT_SPAWN_UNSETTLED.format(
+                sha=sha, waited=int(waited // 60), detail=detail
+            )
+        )
+
+    def _checks_wait_since(self, pr: PullRequest, round_: int) -> float:
+        """When this round's pre-spawn CI wait began -- the stamp its bound is
+        measured from. Durable in production, per-process in dry-run (which
+        writes no ledger row at all; see _dry_run_check_waits)."""
+        key = (pr.full_name, pr.number, round_, pr.head_sha)
+        if self.config.dry_run:
+            return self._dry_run_check_waits.setdefault(key, time.time())
+        return float(
+            self.state.note_spawn_checks_hold(
+                pr.full_name, pr.number, round_, pr.head_sha
+            )
         )
 
     def _live_session_count(self) -> int | None:
@@ -1534,7 +1800,16 @@ class ReviewWatcher:
         poll, which is the spam the summary exists to avoid.
         """
         now = time.monotonic()
-        held = [(slug, d) for slug, d in results if d.action is Action.QUEUED]
+        # CI holds are excluded: they share the action (see Decision.checks_held)
+        # but not the diagnosis. Counting them here would report "4/4 sessions
+        # live" for rounds that are waiting on a test suite, and -- worse -- feed
+        # the stall escalation, which pages when nothing spawns for half an hour.
+        # A fleet whose CI is slow would then page as a review outage.
+        held = [
+            (slug, d)
+            for slug, d in results
+            if d.action is Action.QUEUED and not d.checks_held
+        ]
         if not held:
             self._gate_stall.clear()
             ended = self._gate_streak.resolve(now)
@@ -3134,6 +3409,7 @@ class ReviewWatcher:
         cap: int,
         *,
         reenqueued: bool = False,
+        checks: str = "",
     ) -> Decision:
         if task is None:
             if self.config.on_missing_review_task == ON_MISSING_SKIP:
@@ -3161,6 +3437,9 @@ class ReviewWatcher:
             cap=cap,
             session=name,
             credential=self._credential_clause(),
+            poll=self.config.poll_interval,
+            wait=self.config.checks_wait_seconds // 60,
+            checks=checks,
         )
 
         hub, problem = self._ensure_hub(pr)
@@ -3647,6 +3926,12 @@ class ReviewWatcher:
             stage = "stale-re-enqueued"
         elif decision.deferred:
             stage = "deferred"
+        elif decision.checks_held:
+            # Shares the `queued` COLUMN with the slot gate (both are "owed,
+            # nothing started"), but not the per-item stage: an operator looking
+            # at a waiting PR needs to know whether to free a session or look at
+            # CI, and those are opposite actions.
+            stage = "checks-held"
         return {
             "slug": slug,
             "number": int(tail),
@@ -3690,6 +3975,10 @@ class ReviewWatcher:
             if d.action is Action.IN_FLIGHT and d.deferred
         )
         self.state.record_snapshot(
+            # Both kinds of QUEUED -- waiting for a session slot and waiting for
+            # the head's CI (issue #84). One column, because the console reads it
+            # as "owed, nothing started, no session consumed", which is true of
+            # both; the per-item stage tells them apart.
             queued=counts[Action.QUEUED],
             duration_ms=duration_ms,
             candidates=len(results),

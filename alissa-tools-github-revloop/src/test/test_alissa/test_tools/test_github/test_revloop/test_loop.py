@@ -17,6 +17,7 @@ import pytest
 
 from alissa.tools.github.revloop.config import (
     CONFIG_FILENAME,
+    DEFAULT_CHECKS_SPAWN_WAIT_SECONDS,
     DEFAULT_CHECKS_WAIT_SECONDS,
     DEFAULT_MAX_CONCURRENT_SESSIONS,
     DEFAULT_REAP_GRACE_SECONDS,
@@ -3715,7 +3716,13 @@ def test_a_held_round_notes_the_wait_once_and_posts_no_comment(config, no_post_g
 def test_a_rollup_that_never_concludes_degrades_to_a_comment(config, no_post_grace):
     """Past the bound the verdict is recorded, but never as an approve."""
     st = State(config.state_db)
-    impatient = dataclasses.replace(config, checks_wait_seconds=0)
+    # The PRE-SPAWN gate is off here as well as the verdict one: the rollup
+    # stays pending for the whole test, so otherwise the round-2 assertion at
+    # the end would be answered by the spawn gate holding it (which has its own
+    # tests) instead of by the verdict path this test is about.
+    impatient = dataclasses.replace(
+        config, checks_wait_seconds=0, checks_spawn_wait_seconds=0
+    )
     w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE, state=st)
     gh.default_rollup = rollup_of([running_check("test")])
 
@@ -3941,6 +3948,262 @@ def test_the_wait_bound_default_is_pinned():
 def test_a_negative_wait_bound_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="checks_wait_seconds"):
         Config.build(tmp_path, {"checks_wait_seconds": -1})
+
+
+# -- the pre-spawn CI gate: the SESSION's own verdict (issue #84) ------------
+#
+# The gate above protects the verdict the DAEMON posts, which it only posts for
+# rounds whose session did not submit one. The ordinary round's approve goes
+# straight from the reviewer session to the API with nothing in between --
+# studio #560, 2026-08-15: the worker pushed at 20:04:53, CI started at
+# 20:04:59, the round APPROVED at 20:07:22, and that head's `test` job failed at
+# 20:07:51. A session that has not been queued cannot approve ahead of its
+# evidence, so the wait moves to the spawn.
+
+
+def _clock(monkeypatch, start=1_000_000.0):
+    """A movable wall clock for both modules that stamp with it."""
+    now = {"t": start}
+    monkeypatch.setattr(loop_module.time, "time", lambda: now["t"])
+    monkeypatch.setattr(state_module.time, "time", lambda: now["t"])
+    return now
+
+
+def test_a_running_rollup_holds_the_round_before_its_reviewer_starts(config):
+    """AC1, and the whole point: no reviewer exists to approve a head whose
+    checks have not finished."""
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    gh.default_rollup = rollup_of([running_check("test"), CheckContext("lint", "success")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED
+    assert d.checks_held is True
+    assert d.round == 1
+    assert "test" in d.reason and "pending" in d.reason
+    assert al.enqueued == [], "no reviewer is started"
+    assert gh.rollup_reads == ["abc123"], "the rollup of the head it would review"
+    # A held round spends nothing: no ledger row, so the round number is
+    # untouched and the stale-round probe cannot see a round that never began.
+    assert st.get_spawn(SLUG, NUMBER, 1) is None
+    assert st.spawn_age(SLUG, NUMBER, 1) is None
+    assert gh.comments == [], "and it pages nobody"
+
+
+def test_a_held_round_spawns_once_the_checks_go_green(config):
+    """pending -> green: the round runs, and its directive carries what was
+    seen so 're-read the rollup' is a comparison rather than a chore."""
+    w, gh, al = watcher(config, make_pr(), [])
+    gh.default_rollup = rollup_of([running_check("test")])
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.QUEUED
+
+    gh.default_rollup = rollup_of([CheckContext("test", "success")])
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 1, "the wait burned no round number"
+    directive = al.enqueued[0]["directive"]
+    assert "was green" in directive
+    assert "CI GATE" in directive, "and the pre-submit rule rides along"
+
+
+def test_a_red_head_queues_the_round_with_a_no_approve_directive(config):
+    """AC2. Waiting on red would be waiting for an answer that cannot improve
+    without a push or a re-run, and the failure is real review material: it goes
+    into the round as a blocking finding instead."""
+    w, gh, al = watcher(config, make_pr(), [])
+    gh.default_rollup = rollup_of([running_check("test")])
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.QUEUED
+
+    gh.default_rollup = rollup_of(
+        [failing_check("test", "https://github.com/acme/widgets/runs/9"), CheckContext("lint", "success")]
+    )
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED, "the review itself is not blocked on CI"
+    directive = al.enqueued[0]["directive"]
+    assert "Do NOT approve this round" in directive
+    assert "`test`" in directive, "names the failing job"
+    assert "runs/9" in directive, "and links its run"
+    assert "request_changes" in directive
+
+
+def test_the_pre_spawn_wait_is_bounded(config, monkeypatch):
+    """AC3's timeout path: a CI system that never reports must delay a review,
+    not cancel it -- so the round starts, told plainly that it may not approve."""
+    now = _clock(monkeypatch)
+    w, gh, al = watcher(config, make_pr(), [])
+    gh.default_rollup = rollup_of([running_check("test")])
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.QUEUED
+
+    now["t"] += config.checks_spawn_wait_seconds - 1
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.QUEUED, "still inside it"
+
+    now["t"] += 2
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    directive = al.enqueued[0]["directive"]
+    assert "had not concluded after 15 min" in directive
+    assert "Do NOT approve unless you re-read" in directive
+    assert "`test`" in directive
+
+
+def test_a_push_during_the_wait_starts_a_fresh_wait_on_the_new_head(config, monkeypatch):
+    """AC4, gate side. The old commit's checks say nothing about the code the
+    reviewer will now open, so inheriting its clock would queue the round
+    against a rollup nobody ever waited on."""
+    now = _clock(monkeypatch)
+    w, gh, _ = watcher(config, make_pr(), [])
+    gh.default_rollup = rollup_of([running_check("test")])
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    now["t"] += config.checks_spawn_wait_seconds + 60  # the first wait ran out
+    gh._pr = make_pr(sha="pushed99")                   # ...but the head moved
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED, "the new head's checks have their own bound"
+    assert gh.rollup_reads[-1] == "pushed99", "and it is the new head that is read"
+
+
+def test_a_verdict_on_a_moved_head_owes_a_round_gated_on_the_new_head(
+    config, no_post_grace
+):
+    """AC4 end to end: the worker pushes while round 1 is in flight, so round
+    1's verdict is about code that is no longer the head. It converges nothing
+    (that is the #227 bind, already in place), and the round it owes is gated on
+    the NEW head's checks rather than the reviewed one's."""
+    st = State(config.state_db)
+    w, gh, _ = watcher(
+        config,
+        make_pr(sha="pushed99"),
+        [review(state="APPROVED", sha="abc123")],  # approved the head it saw
+        state=st,
+        verdict=VERDICT_APPROVE,
+    )
+    gh.rollups = {"abc123": rollup_of([CheckContext("test", "success")])}
+    gh.default_rollup = rollup_of([running_check("test")])  # the new head: running
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED, "round 2 is owed, and waits for the new head"
+    assert d.checks_held is True
+    assert gh.rollup_reads == ["pushed99"]
+
+
+def test_an_unreadable_rollup_queues_the_round_rather_than_stalling_every_review(
+    config, caplog
+):
+    """Where this gate parts company with the verdict one. There an unreadable
+    rollup holds ONE finished verdict; here it would delay every round of every
+    PR by the full bound for as long as a credential lacks `checks: read` --
+    a permissions gap turned into a fleet-wide review slowdown."""
+    w, gh, al = watcher(config, make_pr(), [])
+    gh.default_rollup = CheckRollup(CHECKS_UNKNOWN, unreadable="CommandError: 403")
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert "could not be read" in al.enqueued[0]["directive"]
+    assert "403" in al.enqueued[0]["directive"], "says why"
+    assert "not a green one" in al.enqueued[0]["directive"]
+    assert "could not be read" in caplog.text
+
+
+def test_a_zero_bound_queues_immediately_and_still_tells_the_reviewer(config):
+    """The escape hatch: the wait is off, the directive is not. A deployment
+    that cannot afford the latency still gets the session-side rule."""
+    impatient = dataclasses.replace(config, checks_spawn_wait_seconds=0)
+    st = State(impatient.state_db)
+    w, gh, al = watcher(impatient, make_pr(), [], state=st)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert "had not concluded after 0 min" in al.enqueued[0]["directive"]
+    rows = st._db.execute("SELECT COUNT(*) c FROM spawn_checks_holds").fetchone()
+    assert rows["c"] == 0, "a disabled gate stamps nothing: there is no wait to bound"
+
+
+def test_a_ci_hold_is_not_reported_as_spawn_gate_back_pressure(config, caplog):
+    """The two share an action and a snapshot column, never a diagnosis: one
+    says 'free a session', the other says 'look at CI'. Counting CI holds in the
+    gate summary would also feed its stall escalation, which pages when nothing
+    spawns for half an hour -- so a fleet with slow CI would page as an outage."""
+    w, gh, _ = watcher(config, make_pr(), [])
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    with caplog.at_level(logging.INFO):
+        results = w.poll_once()
+
+    assert [d.action for _, d in results] == [Action.QUEUED]
+    assert "spawn gate:" not in caplog.text
+    assert "not queuing yet" in caplog.text, "it is not silent either"
+
+
+def test_a_ci_held_round_is_named_in_the_poll_snapshot(config):
+    st = State(config.state_db)
+    w, gh, _ = watcher(config, make_pr(), [], state=st)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    w.poll_once()
+
+    snap = st.read_snapshots(1)[0]
+    assert snap["queued"] == 1, "owed, nothing started, no session consumed"
+    assert snap["spawned"] == 0 and snap["deferred"] == 0
+    assert snap["stages"][0]["stage"] == "checks-held"
+
+
+def test_dry_run_holds_the_round_without_writing_the_ledger(config):
+    dry = dataclasses.replace(config, dry_run=True)
+    st = State(dry.state_db)
+    w, gh, al = watcher(dry, make_pr(), [], state=st)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED, "the diagnostic reports what production does"
+    assert al.enqueued == []
+    rows = st._db.execute("SELECT COUNT(*) c FROM spawn_checks_holds").fetchone()
+    assert rows["c"] == 0, "and writes nothing durable while doing it"
+
+
+def test_the_gate_reads_no_rollup_when_no_round_is_owed(config):
+    """Two API calls per PR per poll is worth paying only for a round that is
+    about to start. A converged PR returns long before the gate."""
+    w, gh, _ = watcher(
+        config, make_pr(), [review(state="APPROVED")], verdict=VERDICT_APPROVE
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert gh.rollup_reads == []
+
+
+def test_the_spawn_wait_default_is_pinned():
+    """Several times the fleet's 3-5 minute CI, and bounded well inside one
+    review round -- this bound is paid as latency on every round, unlike the
+    verdict-side one."""
+    assert DEFAULT_CHECKS_SPAWN_WAIT_SECONDS == 15 * 60
+    assert (
+        Config(workspace_root=".").checks_spawn_wait_seconds
+        == DEFAULT_CHECKS_SPAWN_WAIT_SECONDS
+    )
+
+
+def test_a_negative_spawn_wait_bound_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="checks_spawn_wait_seconds"):
+        Config.build(tmp_path, {"checks_spawn_wait_seconds": -1})
+
+
+def test_the_spawn_wait_layers_like_every_other_key(tmp_path):
+    cfg = Config.build(
+        tmp_path, {"checks_spawn_wait_seconds": 60}, {"checks_spawn_wait_seconds": 120}
+    )
+    assert cfg.checks_spawn_wait_seconds == 120
 
 
 # -- rollup reading: what counts as red, running, green ---------------------
@@ -6385,6 +6648,12 @@ class _MultiPR:
 
     def comment(self, owner, repo, number, body):
         self.comments.append(body)
+
+    def check_rollup(self, owner, repo, sha):
+        """Green for every PR in the wave: these tests are about the SLOT gate,
+        and a rollup that held a spawn would be a second reason for the same
+        deferral."""
+        return CheckRollup(CHECKS_GREEN)
 
     def update_comment(self, owner, repo, comment_id, body):  # pragma: no cover
         raise AssertionError("the gate must not touch PR comments")

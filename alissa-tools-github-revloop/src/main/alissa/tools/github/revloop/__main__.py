@@ -137,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
         "rollup is still running (or unreadable) before recording the verdict "
         "as a comment instead; a red rollup never waits and never approves",
     )
+    over.add_argument(
+        "--checks-spawn-wait-seconds",
+        type=int,
+        metavar="SECONDS",
+        help="how long an owed round waits for the head's CI to conclude before "
+        "its reviewer is queued at all, so a session cannot approve ahead of the "
+        "evidence; 0 queues immediately and relies on the directive alone",
+    )
 
     dry = over.add_mutually_exclusive_group()
     dry.add_argument(
@@ -174,6 +182,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "reap_session_cap": args.reap_session_cap,
         "max_concurrent_sessions": args.max_concurrent_sessions,
         "checks_wait_seconds": args.checks_wait_seconds,
+        "checks_spawn_wait_seconds": args.checks_spawn_wait_seconds,
         "dry_run": args.dry_run,
     }
 

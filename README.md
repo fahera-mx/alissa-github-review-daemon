@@ -123,6 +123,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `reap_session_cap` | `6` | more live reviewer sessions than this after a sweep and the daemon logs page-worthy; an alarm threshold, not a capacity limit |
 | `max_concurrent_sessions` | `4` | **spawn gate**: at this many live reviewer sessions of this daemon's own grammar, an owed round *waits* instead of spawning and is retried next poll. Deferral burns no round number and no attempt, trips no stale-round respawn, and pages nobody. Must be **≤ `reap_session_cap`**, which the loader enforces — the cap is the alarm, this is the limit |
 | `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead. Applies **per condition waited on**: an unreadable hold that becomes a genuine *pending* one restarts the clock once, so the worst-case hold is **twice** this. A **red** rollup never waits and never approves — see *Never approve a red head* |
+| `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the wait and relies on the directive alone — see *Never approve a red head* |
 
 ### Config file discovery
 
@@ -253,6 +254,51 @@ Three consequences worth stating:
   operator/devloop concern — and `REQUEST_CHANGES` verdicts are not gated at
   all, since they are already a "not ready" signal.
 
+#### The other half: the round that has not started yet
+
+Everything above gates the verdict **the daemon posts** — and the daemon posts
+one only for a round whose reviewer session did *not* submit its own. On the
+ordinary round the session submits, and that approve travels from an agent
+straight to the reviews API with no daemon-side check between it and GitHub.
+
+studio #560, 2026-08-15, is what that costs: the worker pushed at 20:04:53, CI
+started six seconds later, the round **approved** at 20:07:22, and that same
+head's `test` job **failed** at 20:07:51. Nothing was wrong with the review — the
+verdict simply preceded the evidence, and the red PR carried a green approval for
+two hours. (The failure happened to be an unrelated flake. Irrelevant: the
+approve was written before any outcome existed.)
+
+A session that has not been queued cannot do that, so the wait moves to the
+spawn. Before an owed round is enqueued the daemon reads the rollup **of the PR's
+current head** — the commit that round will actually review:
+
+| rollup at the head about to be reviewed | what the daemon does |
+| --- | --- |
+| still running | **does not queue the round**, re-checking each poll up to `checks_spawn_wait_seconds`. It writes no ledger row: the round burns no round number, no attempt, and the stale-round probe cannot see it |
+| green | queues it, and the directive says what was seen — a round told "the head was green" still has to re-read it, which makes that a comparison rather than a chore |
+| red | queues it **now**, with the failing jobs and their run URLs and a directive that forbids the approve. Waiting would be pointless (only a push or a re-run can change the answer) and the failure is real review material — it belongs in the round as a blocking finding |
+| unreadable | queues it, saying so. Deliberately **not** a hold, which is where this gate parts company with the verdict one: an unreadable rollup there blocks one finished verdict, while here it would delay *every* round of *every* PR for as long as a credential lacks `checks: read` |
+| still running at the bound | queues it anyway, with a directive that forbids the approve and names the checks that never settled — a CI system that never reports must delay a review, never cancel it |
+
+A push mid-wait starts a fresh wait against the new commit: the old commit's
+checks say nothing about the code the reviewer will now open.
+
+And because the daemon cannot intercept what a session submits, every directive
+also carries the rule itself: **confirm the head you reviewed is still the head**
+(`.head.sha`), then read that sha's rollup, and approve only once every context
+has concluded and none failed — running, red or never-settled is
+`request_changes`, naming the job and linking the run. The gate makes the common
+case impossible to get wrong; the clause covers a check that goes red *while* the
+review is running.
+
+> **Two waiting states, one column.** A round waiting for a session slot and a
+> round waiting for CI are both `queued` in the poll snapshot — owed, nothing
+> started, no session consumed — but the console's per-PR stage tells them apart
+> (`queued` vs `checks-held`), because "free a session" and "look at CI" are
+> opposite actions. The spawn gate's own summary line and its stall escalation
+> ignore CI holds entirely: a fleet with slow CI must not page as a review
+> outage.
+
 > **Version floor.** `ALISSA_REVIEWER_LOGIN` and `ALISSA_REVIEWER_TOKEN_ENV`
 > need `REVLOOP_VERSION >= 0.16.3` in the image. The entrypoint renders them
 > into `revloop.config.json` and the daemon rejects unknown config keys, so
@@ -287,6 +333,8 @@ Leave it on `skip` unless you want unattended clones.
 | pending request, k−1 reviews submitted | spawn round k (round-k directive: verify triage, verify fixes, sweep delta) |
 | round already enqueued | in-flight, no-op |
 | a round is owed but `max_concurrent_sessions` reviewer sessions are live | **deferred** — the round waits for a slot and is retried next poll; it burns no round number and no attempt — see *Spawn back-pressure* |
+| a round is owed but the head's CI has not concluded | **held** — the reviewer is not queued until the checks settle, bounded by `checks_spawn_wait_seconds`; a session that has not started cannot approve ahead of its evidence — see *Never approve a red head* |
+| a round is owed and the head's CI is red | queued **now**, with the failing jobs and run URLs in its directive and no approve permitted |
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
 | a round's review has landed | its reviewer session is reaped (freed) — see below |
 | a round's verdict envelope exists but no reviewer-identity review does | the daemon submits it natively after a short grace; the round is **not** closed until it lands |
@@ -598,8 +646,8 @@ alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
   JSON (10m cache, for the running-vs-latest drift chip).
 - **Reviewer semantics.** The pipeline board is PR-centric — PR ref → **round k
   of the cap** → session → stage (`spawned` / `in-flight` / `deferred` /
-  `queued` / `stale-re-enqueued` / `converged` / `capped` / `escalated` /
-  `skipped`). The
+  `queued` / `checks-held` / `stale-re-enqueued` / `converged` / `capped` /
+  `escalated` / `skipped`). The
   inbox pages the two things the daemon pages a human about: CR9 **cap-outs**
   (from `escalations`) and **stalled** deferral episodes (from `pings`), both
   linking to the PR. There is no worker-tasks panel — reviewers create no tasks —
@@ -765,7 +813,9 @@ bash docker/claude/tests-entrypoint-executor.sh  # bridge-executor role + gates
 bash docker/claude/tests-entrypoint-ui.sh        # reviewer-console wiring
 ```
 
-282 tests cover the decision state machine, the config layering, the
+706 tests cover the decision state machine, the config layering, the two CI
+gates (pre-spawn hold, verdict hold — pending→green, pending→red, both
+timeouts, a head that moves under either), the
 `poll_snapshots` exhaust buffer (record/read round-trip, retention pruning,
 in-place migration, one-snapshot-per-poll, dry-run capture), the
 `alissa-pr-review` round/verdict/timeout logic, and the reviewer console (auth

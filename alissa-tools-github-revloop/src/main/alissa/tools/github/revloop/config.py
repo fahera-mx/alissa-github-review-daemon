@@ -131,6 +131,7 @@ CONFIG_KEYS = (
     "reap_session_cap",
     "max_concurrent_sessions",
     "checks_wait_seconds",
+    "checks_spawn_wait_seconds",
     "dry_run",
 )
 
@@ -204,6 +205,24 @@ DEFAULT_MAX_CONCURRENT_SESSIONS = 4
 # not of the daemon.
 DEFAULT_CHECKS_WAIT_SECONDS = 30 * 60
 
+# How long an owed round waits for the head's checks to CONCLUDE before its
+# reviewer is queued at all (issue #84). The bound above protects the verdict
+# the DAEMON posts; this one protects the verdict the reviewer SESSION posts,
+# which is the normal path and the one that has no gate anywhere else: on
+# studio #560 a session approved a head 29 seconds before that same head's
+# `test` job failed, and the red PR carried a green approval for two hours. A
+# session that has not started cannot approve early, so the wait is applied to
+# the spawn.
+#
+# 15 minutes, not the 30 above, and the asymmetry is deliberate: this bound is
+# paid as LATENCY on every round of every PR whose checks are running, while the
+# verdict bound is paid only by a round that has already finished reviewing. CI
+# in this fleet concludes in 3-5 minutes, so 15 is several times the normal wait
+# and still bounded well inside one review round. 0 disables the pre-spawn wait
+# entirely -- the round is queued immediately and its directive carries the
+# still-running rollup, which is the directive-only posture.
+DEFAULT_CHECKS_SPAWN_WAIT_SECONDS = 15 * 60
+
 
 def default_state_path(workspace_root: Path) -> Path:
     return Path(workspace_root) / ".revloop" / "state.db"
@@ -263,6 +282,14 @@ class Config:
     # rollup that is not already green degrades the verdict to a comment on the
     # first poll that would have posted it.
     checks_wait_seconds: int = DEFAULT_CHECKS_WAIT_SECONDS
+
+    # The bound on holding an owed round's SPAWN while the head's rollup is
+    # still running; see DEFAULT_CHECKS_SPAWN_WAIT_SECONDS. 0 is legal and means
+    # "never hold the spawn": the round is queued at once and told what the
+    # rollup was. The re-check cadence is `poll_interval` -- a held round is
+    # re-decided by the poll like every other owed round, so there is no second
+    # timer to configure.
+    checks_spawn_wait_seconds: int = DEFAULT_CHECKS_SPAWN_WAIT_SECONDS
 
     dry_run: bool = False
 
@@ -408,6 +435,14 @@ class Config:
         if checks_wait < 0:
             raise ValueError(f"checks_wait_seconds must be >= 0, got {checks_wait}")
 
+        spawn_wait = int(
+            raw.get("checks_spawn_wait_seconds", cls.checks_spawn_wait_seconds)
+        )
+        if spawn_wait < 0:
+            raise ValueError(
+                f"checks_spawn_wait_seconds must be >= 0, got {spawn_wait}"
+            )
+
         token_env = raw.get("reviewer_token_env")
         if token_env is not None:
             token_env = str(token_env).strip()
@@ -453,6 +488,7 @@ class Config:
             reap_session_cap=session_cap,
             max_concurrent_sessions=max_sessions,
             checks_wait_seconds=checks_wait,
+            checks_spawn_wait_seconds=spawn_wait,
             dry_run=bool(raw.get("dry_run", False)),
         )
 

@@ -41,5 +41,8 @@
   "_checks_wait_seconds": "How long a round holds its APPROVE while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a COMMENT instead. PER CONDITION WAITED ON: an unreadable hold that becomes a genuine pending one restarts the clock once, so the worst-case hold is twice this (the daemon reports both numbers) — an approve from the reviewer identity is the operator's merge cue, so it must mean reviewed AND green. A RED rollup never waits: it posts REQUEST_CHANGES leading with the failing check names. 0 means never hold (degrade on the first poll). Skipped/neutral contexts never block.",
   "checks_wait_seconds": 1800,
 
+  "_checks_spawn_wait_seconds": "PRE-SPAWN CI GATE. How long an owed round waits for the head's checks to CONCLUDE before its reviewer is queued at all. The key above gates the verdict the DAEMON posts; this one is the only structural gate on the verdict a reviewer SESSION posts, which is the normal path — a session that has not started cannot approve ahead of its evidence (studio #560: an approve landed 29s before that head's test job failed). PENDING holds the spawn, re-checked every poll_interval; RED and UNKNOWN queue immediately with a directive that forbids the approve and names the failing checks; past the bound the round is queued anyway with a no-approve directive, because a CI system that never reports must delay a review, not cancel it. A held round costs nothing: no round number, no attempt, no ledger spawn row. 0 disables the wait and relies on the directive alone.",
+  "checks_spawn_wait_seconds": 900,
+
   "dry_run": false
 }
