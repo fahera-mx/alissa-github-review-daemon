@@ -186,8 +186,14 @@ CREATE TABLE IF NOT EXISTS review_tasks (
 --
 -- Keyed by head too, so a push mid-wait starts a fresh wait: the new commit's
 -- checks are a new question, and inheriting the old commit's clock would queue
--- the round against a rollup nobody waited on. Never pruned, like verdict_posts
--- and grants -- one row per round that ever waited.
+-- the round against a rollup nobody waited on.
+--
+-- NOT an audit trail, unlike verdict_posts and grants: a row means "a pre-spawn
+-- wait is IN PROGRESS", and `clear_spawn_checks_hold` deletes it the moment the
+-- round starts (see loop._end_checks_wait for why leaving it would make the NEXT
+-- wait on the same round and head read as already run out). So the table holds
+-- the waits currently in flight, plus the residue of waits whose round never
+-- started -- never one row per round that ever waited.
 CREATE TABLE IF NOT EXISTS spawn_checks_holds (
     repo     TEXT    NOT NULL,
     number   INTEGER NOT NULL,
