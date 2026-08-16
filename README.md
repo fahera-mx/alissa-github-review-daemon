@@ -123,7 +123,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `reap_session_cap` | `6` | more live reviewer sessions than this after a sweep and the daemon logs page-worthy; an alarm threshold, not a capacity limit |
 | `max_concurrent_sessions` | `4` | **spawn gate**: at this many live reviewer sessions of this daemon's own grammar, an owed round *waits* instead of spawning and is retried next poll. Deferral burns no round number and no attempt, trips no stale-round respawn, and pages nobody. Must be **≤ `reap_session_cap`**, which the loader enforces — the cap is the alarm, this is the limit |
 | `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead. Applies **per condition waited on**: an unreadable hold that becomes a genuine *pending* one restarts the clock once, so the worst-case hold is **twice** this. A **red** rollup never waits and never approves — see *Never approve a red head* |
-| `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the wait and relies on the directive alone — see *Never approve a red head* |
+| `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the *hold* and relies on the directive alone. **It also bounds the reviewer session's own in-round wait**: the same number is written into every directive as how long a session may wait for a running check before submitting, floored at 5 minutes so a `0` here cannot read as "do not wait at all" — see *Never approve a red head* |
 
 ### Config file discovery
 
@@ -282,6 +282,16 @@ current head** — the commit that round will actually review:
 
 A push mid-wait starts a fresh wait against the new commit: the old commit's
 checks say nothing about the code the reviewer will now open.
+
+The bound does double duty, and deliberately: the same
+`checks_spawn_wait_seconds` is written into every directive as how long a
+*session* may wait for a running check before it submits (floored at 5 minutes,
+so the `0` that disables the hold cannot read as "do not wait at all"). One
+number answers one question — how long is this loop willing to wait for this
+head's CI — on both sides of the spawn. It is deliberately **not**
+`checks_wait_seconds`: that one bounds the daemon holding a verdict it has
+already finished, while a session waiting is holding one of
+`max_concurrent_sessions` worker slots.
 
 And because the daemon cannot intercept what a session submits, every directive
 also carries the rule itself: **confirm the head you reviewed is still the head**

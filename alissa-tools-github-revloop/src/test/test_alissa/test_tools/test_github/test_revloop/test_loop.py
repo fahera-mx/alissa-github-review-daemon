@@ -63,6 +63,12 @@ from alissa.tools.github.revloop import ghclient as ghclient_module
 from alissa.tools.github.revloop import loop as loop_module
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
+    DIRECTIVE_DATA_TRUNCATED,
+    MAX_DIRECTIVE_CONTEXTS,
+    MAX_DIRECTIVE_DATA_CHARS,
+    MIN_SESSION_CHECKS_WAIT_SECONDS,
+    UNTRUSTED_LEAD,
+    directive_data,
     MAX_REENTRY_ROUNDS,
     MAX_VERDICT_POST_ATTEMPTS,
     POLL_ESCALATE_SECONDS,
@@ -4124,7 +4130,15 @@ def test_a_zero_bound_queues_immediately_and_still_tells_the_reviewer(config):
     d = w.evaluate(OWNER, REPO, NUMBER)
 
     assert d.action is Action.SPAWNED
-    assert "had not concluded after 0 min" in al.enqueued[0]["directive"]
+    directive = al.enqueued[0]["directive"]
+    assert "the pre-spawn wait is disabled on this daemon" in directive
+    assert "at the bound" not in directive, (
+        "a bound that is switched off cannot have anything 'at' it"
+    )
+    assert f"up to {MIN_SESSION_CHECKS_WAIT_SECONDS // 60} min" in directive, (
+        "and the session's own wait is floored, never 0 — 'wait up to 0 min' "
+        "instructs a reviewer not to wait at all"
+    )
     rows = st._db.execute("SELECT COUNT(*) c FROM spawn_checks_holds").fetchone()
     assert rows["c"] == 0, "a disabled gate stamps nothing: there is no wait to bound"
 
@@ -4180,6 +4194,157 @@ def test_the_gate_reads_no_rollup_when_no_round_is_owed(config):
     )
 
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert gh.rollup_reads == []
+
+
+# -- round-1 findings (PR #85): the two slots, the stamp, and the data --------
+
+
+def test_the_directives_wait_figure_tracks_the_spawn_bound(config):
+    """[major, round 1] The session-side wait was read from `checks_wait_seconds`
+    — the DAEMON's approve hold. Three consequences, all real: at its legal `0`
+    the directive said "wait up to 0 min"; the coupling was undocumented; and a
+    session spending that 30-minute default holds one of `max_concurrent_sessions`
+    worker slots, which is the cost the pre-spawn gate exists to avoid."""
+    tuned = dataclasses.replace(
+        config, checks_spawn_wait_seconds=20 * 60, checks_wait_seconds=99 * 60
+    )
+    w, _, al = watcher(tuned, make_pr(), [])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    directive = al.enqueued[0]["directive"]
+    assert "up to 20 min" in directive, "the bound about THIS head's CI"
+    assert "99" not in directive, "never the daemon's own approve hold"
+    assert f"every {tuned.poll_interval}s" in directive
+
+
+def test_the_session_wait_is_floored_when_the_spawn_gate_is_off(config):
+    """`checks_spawn_wait_seconds: 0` means "do not hold the SPAWN". Read into a
+    directive unfloored it would mean "do not wait at all", which is a different
+    instruction on a different code path."""
+    off = dataclasses.replace(config, checks_spawn_wait_seconds=0)
+    w, _, al = watcher(off, make_pr(), [])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert (
+        f"up to {MIN_SESSION_CHECKS_WAIT_SECONDS // 60} min"
+        in al.enqueued[0]["directive"]
+    )
+    assert MIN_SESSION_CHECKS_WAIT_SECONDS > 0
+
+
+def test_a_spawned_round_stops_holding_its_wait_stamp(config, monkeypatch):
+    """[minor, round 1] The stamp is frozen while a wait runs, so it has to be
+    dropped when the wait ends. The reachable path, and this fleet's normal
+    failure mode per studio #560: round 1 holds, goes green, spawns; its session
+    dies; 93 minutes later the stale branch re-enqueues it onto a rollup that is
+    pending again because the flaky check was re-run on that same sha. With the
+    stamp left behind, the second hold is born past its bound — and the directive
+    tells the reviewer the checks "had not concluded after 93 min of waiting",
+    which never happened."""
+    now = _clock(monkeypatch)
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    gh.default_rollup = rollup_of([running_check("test")])
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.QUEUED
+
+    now["t"] += 3 * 60
+    gh.default_rollup = rollup_of([CheckContext("test", "success")])
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    rows = st._db.execute("SELECT COUNT(*) c FROM spawn_checks_holds").fetchone()
+    assert rows["c"] == 0, "the wait is over, so the stamp is gone"
+
+    # The session dies; past the stale window the round is re-enqueued — onto a
+    # re-run of the same sha that is pending again.
+    al.sessions = []
+    now["t"] += STALE_ROUND_SECONDS + 60
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.QUEUED, "a fresh pending rollup gets a fresh bound"
+    assert d.checks_held is True
+    assert "0s of 900s" in d.reason, "measured from now, not from 96 minutes ago"
+
+
+def test_check_names_reach_the_directive_as_bounded_delimited_data(config):
+    """[minor, round 1] Check-run names come from the workflow file on the head
+    branch — the PR author's branch on a `pull_request` run — and this is the
+    first path where PR-controlled text becomes agent INSTRUCTIONS rather than
+    PR-comment text."""
+    w, gh, al = watcher(config, make_pr(), [])
+    gh.default_rollup = rollup_of(
+        [failing_check(f"job-{i}-{'x' * 40}") for i in range(30)]
+    )
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    directive = al.enqueued[0]["directive"]
+    assert UNTRUSTED_LEAD in directive, "says out loud that what follows is data"
+    assert "…(truncated:" in directive, "and the list is bounded"
+    # The cap bites on characters here, so it must still land between names:
+    # a mid-name cut reads as though the daemon meant to say something else.
+    payload = directive.split(UNTRUSTED_LEAD)[1].split("…(truncated:")[0]
+    assert len(payload) < MAX_DIRECTIVE_DATA_CHARS + 40
+    assert payload.count("`") % 2 == 0, "no name is cut mid-backtick"
+
+
+def test_directive_data_bounds_both_count_and_length():
+    """Count first, so the truncation marker lands between names."""
+    assert directive_data([]) == "none"
+    assert directive_data(["`a`", "`b`"]) == "`a`; `b`"
+
+    many = directive_data([f"`job{i}`" for i in range(MAX_DIRECTIVE_CONTEXTS + 5)])
+    assert many.endswith("(truncated: 5 more)")
+    assert "job10" not in many
+
+    one_long = directive_data(["`" + "x" * (MAX_DIRECTIVE_DATA_CHARS * 2) + "`"])
+    assert len(one_long) <= MAX_DIRECTIVE_DATA_CHARS + len(
+        DIRECTIVE_DATA_TRUNCATED.format(dropped=1)
+    ), "a single oversized name is cut rather than dropped silently"
+
+
+def test_the_clauses_carry_the_full_sha_the_session_must_compare(config):
+    """[nit, round 1] The pre-submit rule tells the session to compare against
+    `.head.sha` (40 chars); an abbreviation cannot match it."""
+    w, _, al = watcher(config, make_pr(sha="a" * 40), [])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "a" * 40 in al.enqueued[0]["directive"]
+
+
+def test_a_round_that_can_never_start_buys_no_rollup(config):
+    """[minor, round 1] The ordering rule — don't buy a rollup for a round that
+    cannot start — was applied to the slot gate only. A permanently task-less PR
+    paid two GitHub calls every poll forever, and while its CI ran the console
+    reported it as `checks-held`: the daemon saying "waiting on CI" about a round
+    it was never going to queue."""
+    skipping = dataclasses.replace(config, on_missing_review_task=ON_MISSING_SKIP)
+    w, gh, al = watcher(skipping, make_pr(), [], task=None)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert "review task" in d.reason
+    assert gh.rollup_reads == [], "and no rollup was bought for it"
+    assert al.enqueued == []
+
+
+def test_a_missing_hub_buys_no_rollup_either(config):
+    """The same rule, the other cheap refusal: `on_missing_hub: skip` with no hub
+    is a pure is_dir() read."""
+    nowhere = dataclasses.replace(config, hub_template="{root}/nope/{repo}/main")
+    w, gh, _ = watcher(nowhere, make_pr(), [])
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert "no worktree hub" in d.reason
     assert gh.rollup_reads == []
 
 

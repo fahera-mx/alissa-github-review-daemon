@@ -475,6 +475,23 @@ def test_the_spawn_checks_hold_keeps_its_first_stamp_per_head(ledger, monkeypatc
     assert ledger.note_spawn_checks_hold(REPO, 7, 2, "abc123") == 5000, "new round"
 
 
+def test_clearing_a_spawn_checks_hold_ends_the_wait_it_bounded(ledger, monkeypatch):
+    """The stamp means "a wait is in progress", so the round starting has to
+    remove it — otherwise the NEXT wait on the same (round, head) is born past
+    its bound. Idempotent, because most rounds never wait at all."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(state_module.time, "time", lambda: clock["t"])
+    ledger.note_spawn_checks_hold(REPO, 7, 1, "abc123")
+
+    ledger.clear_spawn_checks_hold(REPO, 7, 1, "abc123")
+    ledger.clear_spawn_checks_hold(REPO, 7, 1, "abc123")  # nothing to clear
+
+    clock["t"] = 5000.0
+    assert ledger.note_spawn_checks_hold(REPO, 7, 1, "abc123") == 5000, (
+        "the next wait on the same round and head starts from now"
+    )
+
+
 def test_the_spawn_checks_hold_table_is_added_to_an_older_database(tmp_path):
     """CREATE TABLE IF NOT EXISTS is the whole migration, exactly as it was for
     `grants`: an existing daemon's state.db gains the table on the next open and

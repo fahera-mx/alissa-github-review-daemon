@@ -875,6 +875,26 @@ class State:
         assert row is not None  # just inserted, or already there
         return int(row["first_at"])
 
+    def clear_spawn_checks_hold(
+        self, repo: str, number: int, round_: int, head_sha: str
+    ) -> None:
+        """Forget this round's wait stamp, because the wait is over.
+
+        The row means "a pre-spawn wait is IN PROGRESS for this (round, head)",
+        and the stamp is frozen for exactly as long as that holds. Leaving it
+        behind after the round starts would make the NEXT wait on the same
+        (round, head) -- a stale-round re-enqueue onto a re-run rollup -- read as
+        having already run out; see loop._end_checks_wait for the walk-through.
+        Idempotent: clearing a row that is not there is the normal case (most
+        rounds never wait at all).
+        """
+        self._db.execute(
+            "DELETE FROM spawn_checks_holds "
+            "WHERE repo=? AND number=? AND round=? AND head_sha=?",
+            (repo, number, round_, head_sha),
+        )
+        self._db.commit()
+
     def record_verdict_post_abandoned(
         self, repo: str, number: int, round_: int, why: str
     ) -> None:
