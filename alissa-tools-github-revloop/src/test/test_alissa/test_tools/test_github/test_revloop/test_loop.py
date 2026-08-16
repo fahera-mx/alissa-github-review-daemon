@@ -6407,6 +6407,60 @@ def test_a_search_that_raises_buys_no_silence(config, monkeypatch):
     assert state.review_task_miss(SLUG, NUMBER) is None
 
 
+def test_a_pass_that_already_holds_the_corpus_does_not_spend_a_window(config):
+    """The negative answer is only worth having while the corpus has NOT been
+    fetched this pass (PR #88 round 1).
+
+    Two unmapped PRs: #8's window has run out, so evaluating it first pays for
+    the corpus and fills the pass memo. #7's window is still open -- but
+    answering it from the ledger now saves nothing (the search is a list
+    comprehension over rows already in memory) and would hide a review task
+    created since its last search for the rest of the window.
+    """
+    w, al, state = _unmapped(config, ttl=5)
+    state.record_review_task_miss(SLUG, NUMBER, 5)  # #7: window open
+    other = dataclasses.replace(make_pr(), number=8)
+
+    w._review_task(other)                     # re-armed: pays for the corpus
+    assert al.list_calls == 1
+    w._review_task(make_pr())                 # #7, inside its window
+
+    assert al.list_calls == 1, "no second fetch — the memo answered both"
+    assert state.review_task_miss(SLUG, NUMBER) == 5, (
+        "and #7's window was not spent on an answer the pass already had"
+    )
+
+
+def test_the_free_corpus_is_searched_rather_than_trusted_blind(config):
+    """The other half of the same gate: with the memo populated, a PR inside its
+    window is genuinely SEARCHED, so a review task that appeared since its last
+    search is found on this pass instead of waiting out the window."""
+    w, al, state = _unmapped(config, ttl=5)
+    state.record_review_task_miss(SLUG, NUMBER, 5)
+    al.task = FakeTask()  # #7's review task exists now
+    w._review_task(dataclasses.replace(make_pr(), number=8))  # fills the memo
+
+    resolved = w._review_task(make_pr())
+
+    assert resolved.task is al.task, "found in the corpus the pass already held"
+    assert al.list_calls == 1, "for no extra read"
+    assert state.review_task_miss(SLUG, NUMBER) is None, "the miss is disproved"
+
+
+def test_the_first_pr_of_a_pass_is_still_answered_from_the_ledger(config):
+    """The gate must not undo the saving it is refining: with no corpus fetched
+    yet, an in-window PR is still answered without one."""
+    w, al, state = _unmapped(config, ttl=5)
+    state.record_review_task_miss(SLUG, NUMBER, 5)
+
+    w._pass_tasks = None
+    resolved = w._review_task(make_pr())
+
+    assert resolved == ResolvedTask(task=None)
+    assert al.list_calls == 0, "the whole point: no corpus fetch at all"
+    assert state.review_task_miss(SLUG, NUMBER) == 4, "one poll spent"
+
+
 def test_the_negative_cache_is_kept_per_pr(config):
     """One unmapped PR's window must not answer for another's -- they are
     different questions, and the corpus fetch is shared by the pass memo

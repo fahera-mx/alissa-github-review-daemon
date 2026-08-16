@@ -616,7 +616,7 @@ fire.
 entire live task corpus, sponsor-union scoped, several hundred rows — and it is
 the *only* way to FIND a review task, because the mapping is by title. Between
 2026-08-12 and 08-16 this loop was the largest single contributor to the Alissa
-deployment's top database-I/O endpoint. Three mechanisms bound it, innermost
+deployment's top database-I/O endpoint. Four mechanisms bound it, innermost
 first:
 
 | mechanism | what it removes |

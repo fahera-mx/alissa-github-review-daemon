@@ -1570,7 +1570,19 @@ class ReviewWatcher:
                     "an unreadable task is not a wrong one)",
                     pr.slug, cached,
                 )
-        elif self.state.consume_review_task_miss(pr.full_name, pr.number):
+        elif self._pass_tasks is None and self.state.consume_review_task_miss(
+            pr.full_name, pr.number
+        ):
+            # The negative answer is worth having only while the corpus has NOT
+            # been fetched this pass. Once the memo is populated -- some earlier
+            # PR of this pass re-armed and paid for it -- answering from the
+            # ledger saves nothing at all (the search is a list comprehension
+            # over rows already in memory) and still spends the window, so a
+            # review task created since this PR's last search would stay
+            # invisible for up to `review_task_miss_ttl_polls` more polls with
+            # the evidence for it sitting right there. Order-dependent within a
+            # pass, and therefore a partial win -- but never a read added, and
+            # sometimes a whole window of latency removed (PR #88 round 1).
             log.debug(
                 "%s: a recent search found no review task and the answer has "
                 "polls left — skipping the corpus fetch this pass", pr.slug,
@@ -1592,6 +1604,19 @@ class ReviewWatcher:
             # `_pass_task_list` and the pass turns it into one PR's SKIPPED),
             # so a transient CLI failure can never buy itself a window of
             # silence.
+            #
+            # KNOWN GAP, not reachable on any shipping CLI (PR #88 round 1): a
+            # search "ran" is only as good as the corpus it ran over. The two
+            # runtime disproofs in `Alissa.list_tasks` catch a narrowed call that
+            # FAILS and one that answers EMPTY; neither catches one that answers
+            # NON-EMPTY but INCOMPLETE -- a `--status` the API accepts and serves
+            # partially, say. The search then legitimately finds nothing and this
+            # line makes that wrong answer STICKY for a window, where before the
+            # negative cache it was wrong but self-correcting on the next pass.
+            # No CLI generation offers `--status` or `--view digest` yet, so
+            # nothing can reach it today; the first one that does must prove
+            # itself before this row may be trusted. See the operator's-gate
+            # checklist on PR #88.
             self.state.record_review_task_miss(
                 pr.full_name, pr.number, self.config.review_task_miss_ttl_polls
             )
