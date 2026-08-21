@@ -407,6 +407,22 @@ CHECKS_FAILING_LINE = "- `{name}` — {conclusion}{url}"
 
 # Prepended when the gate held the approve for the whole wait bound and the
 # rollup still had not settled, so the verdict lands as a COMMENT.
+# Prepended to an APPROVE whose green came from the Actions-API fallback rather
+# than the check-runs rollup. Not a caveat on the review -- the code verdict is
+# unchanged -- but on the EVIDENCE behind the approve: the fallback cannot see a
+# check run posted by a third-party check app, so "green" here means "every
+# Actions-produced context passed", which is the same thing only on an
+# Actions-only repo.
+CHECKS_FALLBACK_LEAD = (
+    "**CI rollup at `{sha}` read through the Actions API.** This deployment's "
+    "credential cannot read check runs (GitHub does not offer the `Checks` "
+    "permission on fine-grained PATs), so the head was confirmed green from its "
+    "workflow runs and jobs instead. That read sees every GitHub-Actions "
+    "context and no third-party check app's, so on an Actions-only repo it is "
+    "the same answer — flagging the path because an approve is the operator's "
+    "merge cue.\n\n"
+)
+
 CHECKS_UNSETTLED_LEAD = (
     "**Recorded as a comment, not an approve — the CI rollup at `{sha}` never "
     "concluded.**\n\n"
@@ -466,10 +482,18 @@ CHECKS_STILL_RUNNING = "Still running at the bound: {names}."
 # which waited on nothing and so cannot describe anything as being "at the
 # bound" (see CHECKS_AT_SPAWN_GATE_OFF).
 CHECKS_GATE_OFF_DETAIL = "Still running when the round was queued: {names}."
+# Deliberately does NOT tell the operator to grant `checks: read`, which is what
+# it said before the Actions fallback existed. GitHub does not offer the `Checks`
+# permission on fine-grained PATs at all, and a rollup that reaches UNKNOWN on
+# such a deployment has ALREADY tried the Actions read and failed -- so that
+# advice pointed at the one action that provably cannot work, at the moment the
+# operator is already blocked. The remaining causes are the ones named here.
 CHECKS_UNREADABLE = (
     "The rollup could not be read: `{why}`. An unreadable rollup is not a green "
-    "one — check that the reviewer credential carries `checks: read` on this "
-    "repo."
+    "one. On a credential that cannot read check runs the loop already fell "
+    "back to the Actions API, so reaching this point means that read failed "
+    "too — check the credential's `Actions: Read`, or whether the listing was "
+    "truncated (more contexts than the page bound)."
 )
 
 # The operator page for a native verdict post that keeps failing. Loud on
@@ -2438,10 +2462,24 @@ class ReviewWatcher:
         rollup = self.github.check_rollup(pr.owner, pr.repo, judged)
 
         if rollup.state == CHECKS_GREEN:
-            log.debug(
+            # `info`, not `debug`: this is the line an operator reads to find
+            # out WHICH read path called the head green, and on the deployment
+            # that needs the answer the fallback is every read.
+            log.info(
                 "%s round %d: CI rollup at %s is %s — approving as usual",
                 pr.slug, round_, judged[:8], rollup.summary,
             )
+            if rollup.via_actions_fallback:
+                # The one state where the marker had nowhere PR-visible to go.
+                # Every other path that surfaces `summary` (the hold activity
+                # comment, the degraded-verdict lead) is reachable only from
+                # PENDING or UNKNOWN, so "approved on green" -- the claim an
+                # operator acts on -- was the single verdict that did not say
+                # it came from the narrower read.
+                return ChecksGate(
+                    lead=CHECKS_FALLBACK_LEAD.format(sha=judged[:8]),
+                    state=CHECKS_GREEN,
+                )
             return ChecksGate()
 
         if rollup.state == CHECKS_RED:

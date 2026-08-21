@@ -3836,6 +3836,40 @@ def test_an_unpromoted_hold_does_not_report_a_second_number(config, no_post_grac
     assert "in total across both waits" not in gh.submitted[0]["body"]
 
 
+def test_an_approve_on_a_fallback_green_says_which_read_path_answered(
+    config, no_post_grace
+):
+    """[PR #91 r1 minor] GREEN was the one state whose marker reached nothing
+    PR-visible: the gate log.debug'd the summary and returned a bare
+    ChecksGate(), so the approve body — the claim the operator actually merges
+    on — was the single verdict that did not say it came from the narrower
+    read. Every other path that surfaces `summary` needs PENDING or UNKNOWN."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    gh.default_rollup = rollup_of(
+        [CheckContext("test", "success")], via_actions_fallback=True
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED
+    assert gh.submitted[0]["event"] == "APPROVE", "still an approve, not degraded"
+    body = gh.submitted[0]["body"]
+    assert "Actions API" in body
+    assert "third-party check app" in body, "names what the read cannot see"
+
+
+def test_an_ordinary_green_approve_carries_no_fallback_note(config, no_post_grace):
+    """The note is evidence about a narrower read, so a checks-capable
+    deployment's approve must look exactly as it always did."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    gh.default_rollup = rollup_of([CheckContext("test", "success")])
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert gh.submitted[0]["event"] == "APPROVE"
+    assert "Actions API" not in gh.submitted[0]["body"]
+
+
 def test_an_unreadable_rollup_is_never_treated_as_green(config, no_post_grace):
     impatient = dataclasses.replace(config, checks_wait_seconds=0)
     w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE)
@@ -3845,7 +3879,14 @@ def test_an_unreadable_rollup_is_never_treated_as_green(config, no_post_grace):
 
     assert gh.submitted[0]["event"] == "COMMENT"
     assert "403" in gh.submitted[0]["body"], "says why it could not be read"
-    assert "checks: read" in gh.submitted[0]["body"], "and how to fix it"
+    # …and points somewhere an operator can actually act. NOT at `checks: read`,
+    # which is what this said before the Actions fallback existed: reaching
+    # UNKNOWN now means the fallback read failed too, and GitHub will not grant
+    # `Checks` on a fine-grained PAT under any circumstances, so the old advice
+    # named the one action that cannot work.
+    body = gh.submitted[0]["body"]
+    assert "checks: read" not in body, "never the grant GitHub will not issue"
+    assert "Actions: Read" in body and "truncated" in body, "the real causes"
     assert d.action is Action.POSTED
 
 
@@ -5020,6 +5061,82 @@ def test_runs_of_different_workflows_are_all_kept(monkeypatch):
     assert rollup.state == CHECKS_RED
     assert [c.name for c in rollup.failing] == ["docs"]
     assert rollup.total == 2
+
+
+def test_two_trigger_events_of_one_workflow_are_both_kept(monkeypatch):
+    """[PR #91 r1 minor] The fail-open case the `workflow_id`-only key had.
+
+    A workflow declaring `on: [push, pull_request]` produces two runs for one
+    sha, and GitHub publishes a check run per job for BOTH — so the read this
+    fallback stands in for reports both. Keyed on `workflow_id` alone the lower
+    `run_number` was dropped unread, and when the dropped one was the RED one
+    the rollup answered green for a commit whose real rollup is red.
+    """
+    runs = [
+        workflow_run(run_id=11, workflow_id=900, run_number=1, conclusion="failure"),
+        workflow_run(run_id=12, workflow_id=900, run_number=2, conclusion="success"),
+    ]
+    runs[0]["event"] = "push"
+    runs[1]["event"] = "pull_request"
+    fake = FakeGh(
+        runs=runs,
+        jobs={
+            11: [workflow_job(name="test", conclusion="failure")],
+            12: [workflow_job(name="test", job_id=3)],
+        },
+    )
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.state == CHECKS_RED, "the red push run must not be dropped"
+    assert rollup.total == 2
+
+
+def test_a_retrigger_of_the_same_event_still_collapses_to_the_latest(monkeypatch):
+    """The other half of the same key: adding `event` must not cost the
+    superseded-attempt collapse it was doing correctly. A re-run preserves its
+    run's `event`, so same workflow + same event is still one context."""
+    runs = [
+        workflow_run(run_id=11, workflow_id=900, run_number=1, conclusion="failure"),
+        workflow_run(run_id=12, workflow_id=900, run_number=2, conclusion="success"),
+    ]
+    for run_ in runs:
+        run_["event"] = "pull_request"
+    fake = FakeGh(
+        runs=runs,
+        jobs={
+            11: [workflow_job(name="test", conclusion="failure")],
+            12: [workflow_job(name="test", job_id=3)],
+        },
+    )
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.state == CHECKS_GREEN
+    assert rollup.total == 1
+    assert not any("/actions/runs/11/jobs" in p for p in fake.paths)
+
+
+def test_runs_with_no_event_field_still_collapse_per_workflow(monkeypatch):
+    """A payload with no `event` must not turn every run into its own context —
+    the key falls back to one empty-string bucket per workflow, which is the
+    pre-existing behaviour for the fixtures that predate the field."""
+    fake = FakeGh(
+        runs=[
+            workflow_run(run_id=11, workflow_id=900, run_number=1,
+                         conclusion="failure"),
+            workflow_run(run_id=12, workflow_id=900, run_number=2),
+        ],
+        jobs={
+            11: [workflow_job(name="test", conclusion="failure")],
+            12: [workflow_job(name="test", job_id=3)],
+        },
+    )
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.state == CHECKS_GREEN
+    assert rollup.total == 1
 
 
 def test_runs_that_do_not_name_a_workflow_are_never_collapsed(monkeypatch):
