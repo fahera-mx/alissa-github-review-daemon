@@ -41,6 +41,7 @@ from alissa.tools.github.revloop.alissa import (
     session_repo_slug,
 )
 from alissa.tools.github.revloop.ghclient import (
+    ACTIONS_FALLBACK_NOTE,
     CHECK_RUN_PAGE_LIMIT,
     CHECKS_GREEN,
     CHECKS_PENDING,
@@ -4227,7 +4228,13 @@ def test_the_directives_wait_figure_tracks_the_spawn_bound(config):
 
     w.evaluate(OWNER, REPO, NUMBER)
 
-    directive = al.enqueued[0]["directive"]
+    # The session name carries a random hex nonce, and ~1.8% of nonces contain
+    # "99" — enough to fail this bare substring assertion about once every 55
+    # runs, on a suite whose whole job is to be the CI signal a merge waits on.
+    # Dropping the name keeps the assertion at full strength (any rendering of
+    # 5940s or 99 anywhere else still fails) without the coin flip.
+    enqueued = al.enqueued[0]
+    directive = enqueued["directive"].replace(enqueued["session"], "<session>")
     assert "up to 20 min" in directive, "the bound about THIS head's CI"
     assert "99" not in directive, "never the daemon's own approve hold"
     assert f"every {tuned.poll_interval}s" in directive
@@ -4768,6 +4775,392 @@ def test_more_contexts_than_the_page_bound_is_unknown_not_green():
 
     assert rollup.state == CHECKS_UNKNOWN
     assert str(CHECK_RUN_PAGE_LIMIT) in rollup.unreadable
+
+
+# -- the Actions-API fallback when check-runs is forbidden ------------------
+#
+# GitHub does not offer the `Checks` permission on fine-grained PATs at all, so
+# the deployed reviewer credential gets a hard 403 from
+# `commits/<sha>/check-runs` on every repo. Before the fallback that meant
+# CHECKS_UNKNOWN forever and no round could EVER approve (studio #681 round 3,
+# 2026-08-20: an approve verdict submitted comment-mode because "an unreadable
+# rollup is not a green one"). These tests drive the fallback at the `run_json`
+# layer, not at `_api`: the 403 has to survive `forbidden_is_rate_limit=False`
+# as a CommandError to reach the fallback at all, and a fake `_api` cannot show
+# that.
+
+FORBIDDEN_403 = "HTTP 403: Resource not accessible by personal access token"
+
+
+def workflow_run(run_id=11, workflow_id=900, run_number=1, status="completed",
+                 conclusion="success", name="CI"):
+    return {
+        "id": run_id,
+        "workflow_id": workflow_id,
+        "run_number": run_number,
+        "status": status,
+        "conclusion": conclusion,
+        "name": name,
+        "html_url": f"https://github.com/acme/widgets/actions/runs/{run_id}",
+    }
+
+
+def workflow_job(name="test", status="completed", conclusion="success", job_id=1):
+    return {
+        "id": job_id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "html_url": f"https://github.com/acme/widgets/actions/runs/11/job/{job_id}",
+    }
+
+
+class FakeGh:
+    """A `run_json` stand-in covering every endpoint `check_rollup` can touch.
+
+    `check_runs=None` means the credential cannot read checks (403); anything
+    else is served as the check-runs listing. `jobs` maps a run id to its jobs.
+    Each recorded call keeps the full path AND its query fields, so a test can
+    assert both which read path ran and that `head_sha` reached the endpoint.
+    """
+
+    def __init__(self, *, check_runs=None, runs=(), jobs=None, statuses=(),
+                 runs_total=None, jobs_total=None, actions_forbidden=False):
+        self.check_runs = check_runs
+        self.runs = list(runs)
+        self.jobs = dict(jobs or {})
+        self.statuses = list(statuses)
+        self.runs_total = runs_total
+        self.jobs_total = jobs_total
+        self.actions_forbidden = actions_forbidden
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, argv, **kwargs):
+        path = [a for a in argv if a.startswith("repos/")][0]
+        fields = dict(
+            a.split("=", 1) for a in argv if "=" in a and not a.startswith("repos/")
+        )
+        self.calls.append((path, fields))
+        page = int(fields.get("page", 1))
+
+        def listing(key, items, total):
+            served = items if page == 1 else []
+            return {
+                "total_count": len(items) if total is None else total,
+                key: served,
+            }
+
+        if path.endswith("/check-runs"):
+            if self.check_runs is None:
+                raise CommandError(argv, 1, FORBIDDEN_403)
+            return listing("check_runs", self.check_runs, None)
+        if path.endswith("/actions/runs"):
+            if self.actions_forbidden:
+                raise CommandError(argv, 1, FORBIDDEN_403)
+            return listing("workflow_runs", self.runs, self.runs_total)
+        if path.endswith("/jobs"):
+            run_id = int(path.split("/actions/runs/")[1].split("/")[0])
+            return listing("jobs", self.jobs.get(run_id, []), self.jobs_total)
+        return listing("statuses", self.statuses, None)
+
+    @property
+    def paths(self):
+        return [path for path, _ in self.calls]
+
+
+def fallback_rollup(monkeypatch, fake):
+    monkeypatch.setattr(ghclient_module, "run_json", fake)
+    return GitHub("alissa-app").check_rollup(OWNER, REPO, "abc123")
+
+
+def test_a_forbidden_check_runs_read_falls_back_to_the_actions_api(monkeypatch):
+    """The whole point: a credential that cannot read checks can still approve a
+    green Actions-only head, instead of holding CHECKS_UNKNOWN forever."""
+    fake = FakeGh(runs=[workflow_run()], jobs={11: [workflow_job()]})
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.state == CHECKS_GREEN
+    assert rollup.total == 1
+    assert fake.paths[0].endswith("/check-runs")
+    assert f"repos/{OWNER}/{REPO}/actions/runs" in fake.paths
+    # the run listing is per-COMMIT, exactly like the read it replaces
+    runs_call = next(f for p, f in fake.calls if p.endswith("/actions/runs"))
+    assert runs_call["head_sha"] == "abc123"
+
+
+def test_a_fallback_answer_says_it_came_from_the_actions_api(monkeypatch):
+    """The Actions API cannot see a third-party check app's runs, so an operator
+    reading "approved on green" has to be able to tell which path answered."""
+    rollup = fallback_rollup(
+        monkeypatch, FakeGh(runs=[workflow_run()], jobs={11: [workflow_job()]})
+    )
+
+    assert rollup.via_actions_fallback is True
+    assert ACTIONS_FALLBACK_NOTE in rollup.summary
+    assert rollup.summary.startswith("green")
+
+
+def test_a_failed_job_in_the_fallback_is_the_failing_context_with_its_url(monkeypatch):
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(
+            runs=[workflow_run(conclusion="failure")],
+            jobs={
+                11: [
+                    workflow_job(name="lint"),
+                    workflow_job(name="test", conclusion="failure", job_id=2),
+                ]
+            },
+        ),
+    )
+
+    assert rollup.state == CHECKS_RED
+    assert [c.name for c in rollup.failing] == ["test"]
+    assert rollup.failing[0].url.endswith("/actions/runs/11/job/2")
+    assert ACTIONS_FALLBACK_NOTE in rollup.summary
+
+
+def test_a_still_running_job_in_the_fallback_holds_rather_than_approves(monkeypatch):
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(
+            runs=[workflow_run(status="in_progress", conclusion=None)],
+            jobs={
+                11: [
+                    workflow_job(name="lint"),
+                    workflow_job(name="test", status="in_progress", conclusion=None,
+                                 job_id=2),
+                ]
+            },
+        ),
+    )
+
+    assert rollup.state == CHECKS_PENDING
+    assert [c.name for c in rollup.running] == ["test"]
+
+
+def test_a_job_claiming_a_conclusion_before_it_finished_still_reads_as_running(
+    monkeypatch,
+):
+    """Same rule the check-runs path applies: not `completed` carries no
+    conclusion whatever the payload says."""
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(
+            runs=[workflow_run(status="queued", conclusion=None)],
+            jobs={11: [workflow_job(status="queued", conclusion="success")]},
+        ),
+    )
+
+    assert rollup.state == CHECKS_PENDING
+
+
+def test_a_queued_run_with_no_jobs_yet_reads_as_running_never_green(monkeypatch):
+    """A run exposes no jobs while it is still queued, and an empty job list
+    must never read as "nothing failing here"."""
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(runs=[workflow_run(status="queued", conclusion=None)], jobs={}),
+    )
+
+    assert rollup.state == CHECKS_PENDING
+    assert [c.name for c in rollup.running] == ["CI"]
+
+
+def test_a_completed_run_with_no_jobs_is_judged_on_its_own_conclusion(monkeypatch):
+    """The conservative direction for the same gap: a run that finished red and
+    exposes no readable jobs must not simply vanish from the rollup."""
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(runs=[workflow_run(conclusion="failure")], jobs={}),
+    )
+
+    assert rollup.state == CHECKS_RED
+    assert [c.name for c in rollup.failing] == ["CI"]
+
+
+def test_several_runs_of_one_workflow_dedupe_to_the_most_recent(monkeypatch):
+    """A sha carries a run per trigger event. Judging the superseded attempt
+    would hold a head red forever after its re-trigger passed."""
+    fake = FakeGh(
+        runs=[
+            workflow_run(run_id=11, run_number=1, conclusion="failure"),
+            workflow_run(run_id=12, run_number=2, conclusion="success"),
+        ],
+        jobs={
+            11: [workflow_job(name="test", conclusion="failure")],
+            12: [workflow_job(name="test", job_id=3)],
+        },
+    )
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.state == CHECKS_GREEN
+    assert rollup.total == 1
+    assert not any("/actions/runs/11/jobs" in p for p in fake.paths)
+
+
+def test_runs_of_different_workflows_are_all_kept(monkeypatch):
+    """Dedupe is per workflow, not per commit: two workflows are two answers."""
+    fake = FakeGh(
+        runs=[
+            workflow_run(run_id=11, workflow_id=900, name="CI"),
+            workflow_run(run_id=12, workflow_id=901, name="Docs",
+                         conclusion="failure"),
+        ],
+        jobs={
+            11: [workflow_job(name="test")],
+            12: [workflow_job(name="docs", conclusion="failure", job_id=4)],
+        },
+    )
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.state == CHECKS_RED
+    assert [c.name for c in rollup.failing] == ["docs"]
+    assert rollup.total == 2
+
+
+def test_runs_that_do_not_name_a_workflow_are_never_collapsed(monkeypatch):
+    """Dedupe needs a `workflow_id` to group by. Runs that carry none are each
+    their own key: collapsing them would silently drop contexts, which is the
+    one direction this gate must never move in."""
+    runs = [workflow_run(run_id=11, name="one"), workflow_run(run_id=12, name="two")]
+    for run_ in runs:
+        del run_["workflow_id"]
+    fake = FakeGh(
+        runs=runs,
+        jobs={
+            11: [workflow_job(name="a")],
+            12: [workflow_job(name="b", conclusion="failure", job_id=5)],
+        },
+    )
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.total == 2
+    assert [c.name for c in rollup.failing] == ["b"]
+
+
+def test_legacy_commit_statuses_are_still_merged_into_a_fallback_rollup(monkeypatch):
+    """The fallback replaces the check-runs read only. External CI that posts
+    legacy statuses is still visible to this credential and still counts."""
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(
+            runs=[workflow_run()],
+            jobs={11: [workflow_job()]},
+            statuses=[{"context": "buildkite", "state": "failure",
+                       "target_url": "http://ci"}],
+        ),
+    )
+
+    assert rollup.state == CHECKS_RED
+    assert [c.name for c in rollup.failing] == ["buildkite"]
+    assert rollup.total == 2
+
+
+def test_an_unsatisfied_count_in_the_fallback_refuses_rather_than_answers(monkeypatch):
+    """The fallback listings answer under the SAME completeness contract as the
+    read they replace: a partial read cannot support an approve."""
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(runs=[workflow_run()], jobs={11: [workflow_job()]}, runs_total=40),
+    )
+
+    assert rollup.state == CHECKS_UNKNOWN
+    assert "40" in rollup.unreadable
+    assert rollup.via_actions_fallback is False
+
+
+def test_an_unsatisfied_job_count_in_the_fallback_refuses_too(monkeypatch):
+    rollup = fallback_rollup(
+        monkeypatch,
+        FakeGh(runs=[workflow_run()], jobs={11: [workflow_job()]}, jobs_total=12),
+    )
+
+    assert rollup.state == CHECKS_UNKNOWN
+    assert "12" in rollup.unreadable
+
+
+def test_a_forbidden_actions_read_too_is_still_unknown(monkeypatch):
+    """No third path: if neither read is permitted the rollup is unreadable,
+    which is exactly today's behaviour."""
+    rollup = fallback_rollup(monkeypatch, FakeGh(actions_forbidden=True))
+
+    assert rollup.state == CHECKS_UNKNOWN
+    assert "403" in rollup.unreadable
+    assert rollup.via_actions_fallback is False
+
+
+def test_a_throttled_check_runs_read_never_enters_the_fallback(monkeypatch):
+    """GitHub answers a secondary rate limit with 403 too. Taking the narrower
+    read path on throttling would answer from a degraded source for a condition
+    that resolves itself in seconds."""
+    fake = FakeGh(runs=[workflow_run()], jobs={11: [workflow_job()]})
+
+    def run_json(argv, **kwargs):
+        path = [a for a in argv if a.startswith("repos/")][0]
+        if path.endswith("/check-runs"):
+            raise CommandError(argv, 1, "403 You have exceeded a secondary rate limit")
+        return fake(argv, **kwargs)
+
+    monkeypatch.setattr(ghclient_module, "run_json", run_json)
+
+    with pytest.raises(RateLimited):
+        GitHub("alissa-app").check_rollup(OWNER, REPO, "abc123")
+
+
+def test_only_a_permission_403_counts_as_forbidden():
+    """The predicate on its own. `_api` already turns a marked throttle into
+    RateLimited before this is ever consulted, so this is the belt under those
+    braces: a 403 that says "rate limit" is not a permission fact."""
+    forbidden = ghclient_module._is_authorization_forbidden
+    argv = ["gh", "api", "x"]
+
+    assert forbidden(CommandError(argv, 1, FORBIDDEN_403))
+    assert not forbidden(
+        CommandError(argv, 1, "403 You have exceeded a secondary rate limit")
+    )
+    assert not forbidden(CommandError(argv, 1, "HTTP 500: Internal Server Error"))
+    assert not forbidden(CommandError(argv, 1, ""))
+
+
+def test_a_non_authorization_failure_never_enters_the_fallback(monkeypatch):
+    """A 500 is not "this credential cannot read checks"; it is a read to retry
+    next poll, and answering it from the narrower source would hide a check the
+    fallback cannot see."""
+    fake = FakeGh(runs=[workflow_run()], jobs={11: [workflow_job()]})
+
+    def run_json(argv, **kwargs):
+        path = [a for a in argv if a.startswith("repos/")][0]
+        if path.endswith("/check-runs"):
+            raise CommandError(argv, 1, "HTTP 500: Internal Server Error")
+        return fake(argv, **kwargs)
+
+    monkeypatch.setattr(ghclient_module, "run_json", run_json)
+    rollup = GitHub("alissa-app").check_rollup(OWNER, REPO, "abc123")
+
+    assert rollup.state == CHECKS_UNKNOWN
+    assert "500" in rollup.unreadable
+    assert not any("actions" in p for p in fake.paths)
+
+
+def test_a_checks_capable_credential_never_touches_the_actions_api(monkeypatch):
+    """Nothing changes for a deployment that can read check runs: same two
+    endpoints, same answer, no fallback marker."""
+    fake = FakeGh(
+        check_runs=[{"name": "test", "status": "completed", "conclusion": "success"}],
+        runs=[workflow_run(conclusion="failure")],
+    )
+
+    rollup = fallback_rollup(monkeypatch, fake)
+
+    assert rollup.state == CHECKS_GREEN
+    assert rollup.via_actions_fallback is False
+    assert ACTIONS_FALLBACK_NOTE not in rollup.summary
+    assert not any("actions" in p for p in fake.paths)
 
 
 def test_a_comment_review_is_a_submitted_round_but_not_an_approval():
