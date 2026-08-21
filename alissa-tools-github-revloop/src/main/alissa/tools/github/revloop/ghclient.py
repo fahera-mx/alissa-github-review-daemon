@@ -898,6 +898,13 @@ class GitHub:
         What this read CANNOT see is any check run posted by a third-party check
         app; see ACTIONS_FALLBACK_NOTE for why that is accepted here and how the
         answer says so.
+
+        COST: this path costs one call for the run listing plus one per kept
+        workflow, where the read it replaces cost one. It is taken only where
+        the alternative is a permanent CHECKS_UNKNOWN, and only on the rollup
+        reads the caller already decided to make -- the gate's existing
+        per-round caching is what bounds how often that is. On this fleet's
+        repos (one or two workflows per commit) it is two or three calls.
         """
         runs = self._rollup_listing(
             f"repos/{owner}/{repo}/actions/runs",
