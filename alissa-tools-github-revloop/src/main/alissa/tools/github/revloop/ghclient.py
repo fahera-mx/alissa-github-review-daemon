@@ -899,12 +899,28 @@ class GitHub:
         app; see ACTIONS_FALLBACK_NOTE for why that is accepted here and how the
         answer says so.
 
-        COST: this path costs one call for the run listing plus one per kept
-        workflow, where the read it replaces cost one. It is taken only where
-        the alternative is a permanent CHECKS_UNKNOWN, and only on the rollup
-        reads the caller already decided to make -- the gate's existing
-        per-round caching is what bounds how often that is. On this fleet's
-        repos (one or two workflows per commit) it is two or three calls.
+        COST, stated exactly, because it is the sentence an operator would size
+        rate-limit headroom from: this path costs one call for the run listing
+        plus one per KEPT workflow, where the read it replaces cost one.
+
+        Nothing caches that on the production path. `loop._dry_run_rollups` is
+        the only rollup memo and only the dry-run branch reads it, so what
+        bounds how often the cost is paid is the POLL INTERVAL -- both while
+        `_checks_at_spawn` holds a round on `checks_spawn_wait_seconds` and
+        while `_gate_on_checks` holds a finished verdict on
+        `checks_wait_seconds`, each of which re-reads the rollup every pass.
+
+        Nor is the fan-out bounded. CHECK_RUN_PAGE_LIMIT bounds the run
+        LISTING; the number of kept workflows is whatever the sha carries, and
+        each one costs a `jobs` call with `_api`'s 60s timeout, so a
+        many-workflow sha turns one rollup read into a long synchronous stall
+        inside a poll pass that has other PRs to decide. On this fleet's repos
+        (one or two workflows per commit) it is two or three calls; that is a
+        fact about these repos, not a bound this code enforces.
+
+        The trade is still worth taking where it applies: the alternative there
+        is a permanent CHECKS_UNKNOWN, which costs one call and can never
+        approve.
         """
         runs = self._rollup_listing(
             f"repos/{owner}/{repo}/actions/runs",
@@ -919,14 +935,26 @@ class GitHub:
 
     @staticmethod
     def _latest_run_per_workflow(runs: list[dict]) -> list[dict]:
-        """One run per workflow: the most recent.
+        """One run per workflow AND trigger event: the most recent.
 
-        A sha carries more than one run of the same workflow whenever it was
-        triggered more than once -- a re-run shares its run id, but a distinct
-        trigger event (a `push` and a `pull_request` on the same commit, a
-        workflow re-dispatched by hand) creates a distinct run. Reading all of
-        them would judge the commit on a superseded attempt: an earlier failed
-        run whose re-trigger passed would hold the head red forever.
+        Two different facts are being separated here, and collapsing them was a
+        fail-open bug.
+
+        SUPERSEDED ATTEMPTS collapse. A sha carries more than one run of the
+        same workflow for the same event whenever it was triggered again -- a
+        re-run shares its run id, a re-dispatch does not. Reading all of them
+        would judge the commit on a superseded attempt: an earlier failed run
+        whose re-trigger passed would hold the head red forever.
+
+        DISTINCT EVENTS DO NOT. A workflow declaring `on: [push, pull_request]`
+        produces a `push` run and a `pull_request` run for the same sha, and
+        GitHub publishes a check run per job for BOTH -- so the read this
+        stands in for reports both. Keying on `workflow_id` alone dropped the
+        lower `run_number` of the pair unread, and when the dropped one was the
+        red one the fallback answered GREEN for a commit whose real rollup is
+        red. That is the fail-open direction this whole component exists to
+        avoid, so the key carries `event` as well. A re-run preserves its run's
+        `event`, so the superseded-attempt collapse above is unaffected.
 
         Recency is `run_number` then `id`, both monotonic per workflow and both
         integers -- deliberately not a timestamp string, which is the field a
@@ -938,7 +966,7 @@ class GitHub:
         for index, run_ in enumerate(runs):
             workflow_id = run_.get("workflow_id")
             key: object = (
-                ("workflow", workflow_id)
+                ("workflow", workflow_id, str(run_.get("event") or ""))
                 if workflow_id is not None
                 else ("unidentified", index)
             )
