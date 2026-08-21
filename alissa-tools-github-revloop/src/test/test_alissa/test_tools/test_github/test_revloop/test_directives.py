@@ -86,3 +86,11 @@ def test_directive_gates_the_sessions_own_verdict_on_head_and_checks(template):
     assert "WAIT and re-read it" in out
     assert "request_changes and the finding names the job and links its run" in out
     assert "do NOT approve either" in out
+    # (4) the deployed credential is a fine-grained PAT, which GitHub does not
+    # let hold `Checks` at all: the session's own read gets the same 403 the
+    # daemon's does, so it needs the same fallback or it can never confirm green
+    assert "actions/runs?head_sha=<sha>" in out
+    assert "actions/runs/<run_id>/jobs" in out
+    assert "MOST RECENT run per workflow" in out
+    assert "exposes no jobs yet is still running, never" in out
+    assert "If the Actions read is forbidden too" in out

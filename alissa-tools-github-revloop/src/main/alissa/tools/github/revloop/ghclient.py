@@ -112,6 +112,20 @@ _STATUS_CONCLUSIONS = {
 # rather than green -- a partial read cannot support an approve.
 CHECK_RUN_PAGE_LIMIT = 5
 
+# What a fallback-answered rollup says about itself, in the log line and in the
+# `summary` that reaches a verdict body. The Actions API sees only contexts
+# GitHub Actions produced -- a check run posted by a third-party check app is
+# invisible to it, so a fallback rollup could call green a commit whose
+# non-Actions check failed. Every repo this fleet reviews runs Actions-only CI,
+# which is why the fallback is taken at all; the note is how an operator reading
+# "approved on green" can tell that this is the narrower read.
+ACTIONS_FALLBACK_NOTE = "via the Actions API — check-runs forbidden for this credential"
+
+# The workflow-run states that mean "this run has finished". Read exactly like a
+# check run's `status`: anything else is still going, whatever conclusion the
+# payload carries.
+_RUN_COMPLETED = "completed"
+
 # The hidden marker the daemon stamps into every native verdict review it
 # submits, carrying the round it closes. Two jobs, both load-bearing:
 #
@@ -251,17 +265,31 @@ class CheckRollup:
     # from GitHub and reaches loop._abandon_verdict, which proves absence from
     # the PR's commit list rather than trusting the message.
     unreadable: str = ""
+    # True when the contexts came from the Actions API instead of the check-runs
+    # rollup, because the credential cannot read checks. That read is NARROWER
+    # than the one it stands in for (see ACTIONS_FALLBACK_NOTE), so the answer
+    # carries which path produced it everywhere the rollup is reported.
+    via_actions_fallback: bool = False
 
     @property
     def summary(self) -> str:
-        """One log-line description of the rollup."""
+        """One log-line description of the rollup.
+
+        The fallback marker rides on EVERY state, not just green: an operator
+        reading "approved on green" has to be able to see which read path
+        answered, and so does one reading a request_changes that named a job.
+        """
         if self.state == CHECKS_RED:
-            return f"red — failing: {check_names(self.failing)}"
-        if self.state == CHECKS_PENDING:
-            return f"pending — still running: {check_names(self.running)}"
-        if self.state == CHECKS_UNKNOWN:
-            return f"unreadable — {self.unreadable or 'no reason recorded'}"
-        return f"green — {self.total} context(s), none failing or running"
+            base = f"red — failing: {check_names(self.failing)}"
+        elif self.state == CHECKS_PENDING:
+            base = f"pending — still running: {check_names(self.running)}"
+        elif self.state == CHECKS_UNKNOWN:
+            base = f"unreadable — {self.unreadable or 'no reason recorded'}"
+        else:
+            base = f"green — {self.total} context(s), none failing or running"
+        if self.via_actions_fallback:
+            return f"{base} [{ACTIONS_FALLBACK_NOTE}]"
+        return base
 
 
 def check_names(contexts: "tuple[CheckContext, ...]") -> str:
@@ -269,7 +297,37 @@ def check_names(contexts: "tuple[CheckContext, ...]") -> str:
     return ", ".join(c.name for c in contexts) or "none"
 
 
-def rollup_of(contexts: "list[CheckContext]") -> CheckRollup:
+def _completed_conclusion(payload: dict) -> str:
+    """A check run's / workflow job's conclusion, EMPTY unless it finished.
+
+    The one discriminator both read paths share: a payload that is not
+    `completed` carries no conclusion here whatever it says, so "queued",
+    "in_progress", "waiting" and whatever GitHub adds next all read as running
+    -- exactly the states a gate must not mistake for a verdict.
+    """
+    completed = str(payload.get("status") or "").lower() == _RUN_COMPLETED
+    return str(payload.get("conclusion") or "").lower() if completed else ""
+
+
+def _run_order(run_: dict) -> "tuple[int, int]":
+    """How recent a workflow run is, among runs of the same workflow.
+
+    `run_number` is the workflow's own monotonic counter and `id` breaks its
+    ties. A payload missing either sorts LAST (-1), so a malformed entry can
+    never displace a run that identifies itself.
+    """
+    def as_int(value: object) -> int:
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return -1
+
+    return (as_int(run_.get("run_number")), as_int(run_.get("id")))
+
+
+def rollup_of(
+    contexts: "list[CheckContext]", via_actions_fallback: bool = False
+) -> CheckRollup:
     """Reduce read contexts to a rollup state.
 
     Precedence is failure over running, deliberately: a commit with one job
@@ -289,7 +347,11 @@ def rollup_of(contexts: "list[CheckContext]") -> CheckRollup:
     else:
         state = CHECKS_GREEN
     return CheckRollup(
-        state=state, failing=failing, running=running, total=len(contexts)
+        state=state,
+        failing=failing,
+        running=running,
+        total=len(contexts),
+        via_actions_fallback=via_actions_fallback,
     )
 
 
@@ -352,6 +414,26 @@ class IdentityMismatch(RuntimeError):
 
 class ReviewerTokenUnset(RuntimeError):
     """`reviewer_token_env` names a variable that is absent or empty."""
+
+
+def _is_authorization_forbidden(exc: CommandError) -> bool:
+    """Is this a 403 about PERMISSION rather than about throttling?
+
+    GitHub answers a secondary rate limit with 403 too, and the two want
+    opposite responses: throttling is waited out, a missing permission never
+    resolves itself. `_api(forbidden_is_rate_limit=False)` already raises
+    RateLimited for anything carrying an explicit throttling marker, so today
+    every CommandError reaching a caller with a 403 in it is an authorization
+    fact. The markers are re-checked anyway rather than inherited from that
+    contract, because what this answer decides is whether to answer the gate
+    from a NARROWER source -- and doing that for a condition that clears itself
+    in seconds is the wrong trade in the one component whose job is to fail
+    closed.
+    """
+    blob = (exc.stderr or "").lower()
+    if any(marker in blob for marker in RATE_LIMIT_MARKERS):
+        return False
+    return "403" in blob
 
 
 class TruncatedListing(RuntimeError):
@@ -659,13 +741,37 @@ class GitHub:
         is dropped rather than read as "something is running" -- otherwise every
         approve on every Actions-only repo would hold until the wait bound.
 
+        A check-runs read that answers an authorization 403 does NOT stop here.
+        A fine-grained PAT cannot hold GitHub's `Checks` permission at all, so
+        on such a deployment that 403 is permanent and CHECKS_UNKNOWN would mean
+        no round can ever approve, on any repo, forever. The same credential's
+        `Actions: Read` answers for the same commit, so the rollup is read
+        through `_actions_contexts` instead and the answer is LABELLED as the
+        narrower read it is. Everything else about the failure handling is
+        unchanged: a 403 from the Actions API too, a TruncatedListing from
+        either listing, or any other error is still CHECKS_UNKNOWN, and
+        RateLimited still propagates.
+
         Never raises except RateLimited (which run_forever's backoff owns): an
         unreadable rollup is a CHECKS_UNKNOWN answer the caller can hold on, not
         a reason to abort a poll pass that has other PRs to decide.
         """
         contexts: list[CheckContext] = []
+        fallback = False
         try:
-            contexts.extend(self._check_runs(owner, repo, sha))
+            try:
+                contexts.extend(self._check_runs(owner, repo, sha))
+            except CommandError as exc:
+                if not _is_authorization_forbidden(exc):
+                    raise
+                log.warning(
+                    "%s/%s %s: check-runs is forbidden for this credential — "
+                    "reading CI %s instead (%s)",
+                    owner, repo, sha[:8], ACTIONS_FALLBACK_NOTE,
+                    str(exc)[:200],
+                )
+                contexts.extend(self._actions_contexts(owner, repo, sha))
+                fallback = True
             contexts.extend(self._commit_statuses(owner, repo, sha))
         except RateLimited:
             raise
@@ -675,9 +781,11 @@ class GitHub:
             return CheckRollup(
                 CHECKS_UNKNOWN, unreadable=f"{type(exc).__name__}: {exc}"[:300]
             )
-        return rollup_of(contexts)
+        return rollup_of(contexts, via_actions_fallback=fallback)
 
-    def _rollup_listing(self, path: str, key: str, what: str) -> list[dict]:
+    def _rollup_listing(
+        self, path: str, key: str, what: str, params: "tuple[str, ...]" = ()
+    ) -> list[dict]:
         """Page ONE rollup listing to completion, or refuse to answer.
 
         Completeness is decided by two signals, and the pair is the point --
@@ -701,11 +809,17 @@ class GitHub:
         30 successes and called a red head green -- and the direction has to be
         "cannot answer", never "nothing failing in what I got".
 
+        `params` are extra `-f key=value` query fields for endpoints that need
+        one (`actions/runs` is per-commit only via `head_sha=`), carried through
+        every page so the filter cannot silently drop off the second one.
+
         `forbidden_is_rate_limit=False` for the same reason `submit_review`
         passes it: a 403 here is an authorization fact about the deployment (a
         credential without `checks: read`) with its own handling one layer up,
         and collapsing it into RateLimited would abort the whole poll pass and
         double run_forever's backoff instead of degrading this one verdict.
+        That handling is now `check_rollup`'s Actions fallback, which is why the
+        CommandError has to arrive intact rather than as RateLimited.
         """
         out: list[dict] = []
         total: int | None = None
@@ -719,6 +833,7 @@ class GitHub:
                     f"per_page={PER_PAGE}",
                     "-f",
                     f"page={page}",
+                    *[arg for param in params for arg in ("-f", param)],
                     forbidden_is_rate_limit=False,
                 )
                 or {}
@@ -754,17 +869,111 @@ class GitHub:
         )
         out: list[CheckContext] = []
         for run_ in runs:
-            completed = str(run_.get("status") or "").lower() == "completed"
             out.append(
                 CheckContext(
                     name=str(run_.get("name") or "unnamed check"),
-                    conclusion=(
-                        str(run_.get("conclusion") or "").lower() if completed else ""
-                    ),
+                    conclusion=_completed_conclusion(run_),
                     url=str(run_.get("html_url") or run_.get("details_url") or ""),
                 )
             )
         return out
+
+    def _actions_contexts(self, owner: str, repo: str, sha: str) -> list[CheckContext]:
+        """The commit's CI as GitHub ACTIONS sees it -- the fallback read.
+
+        Taken only when the check-runs rollup answered an authorization 403.
+        GitHub does not offer the `Checks` permission on fine-grained PATs at
+        all (community discussion 129512), so on a fine-grained-PAT deployment
+        that read is not "sometimes unavailable", it is a permanent dead end:
+        `check_rollup` degrades to CHECKS_UNKNOWN forever and no round can ever
+        approve. The same credential's `Actions: Read` answers 200 for the same
+        commit's CI, one layer lower down -- workflow runs, and each run's jobs.
+
+        The jobs, not the runs, are the contexts: a job maps one-to-one onto the
+        check run GitHub would have published for it (same name, same status,
+        same conclusion), so `rollup_of` judges the fallback answer under
+        exactly the rules it judges the real one under, including `skipped` and
+        `neutral` passing for a path-filtered matrix.
+
+        What this read CANNOT see is any check run posted by a third-party check
+        app; see ACTIONS_FALLBACK_NOTE for why that is accepted here and how the
+        answer says so.
+        """
+        runs = self._rollup_listing(
+            f"repos/{owner}/{repo}/actions/runs",
+            "workflow_runs",
+            "workflow runs",
+            params=(f"head_sha={sha}",),
+        )
+        out: list[CheckContext] = []
+        for run_ in self._latest_run_per_workflow(runs):
+            out.extend(self._run_contexts(owner, repo, run_))
+        return out
+
+    @staticmethod
+    def _latest_run_per_workflow(runs: list[dict]) -> list[dict]:
+        """One run per workflow: the most recent.
+
+        A sha carries more than one run of the same workflow whenever it was
+        triggered more than once -- a re-run shares its run id, but a distinct
+        trigger event (a `push` and a `pull_request` on the same commit, a
+        workflow re-dispatched by hand) creates a distinct run. Reading all of
+        them would judge the commit on a superseded attempt: an earlier failed
+        run whose re-trigger passed would hold the head red forever.
+
+        Recency is `run_number` then `id`, both monotonic per workflow and both
+        integers -- deliberately not a timestamp string, which is the field a
+        re-run rewrites. A run with no `workflow_id` is not grouped with
+        anything (its position in the listing is its key), because collapsing
+        unidentified runs together would silently drop contexts.
+        """
+        latest: dict[object, dict] = {}
+        for index, run_ in enumerate(runs):
+            workflow_id = run_.get("workflow_id")
+            key: object = (
+                ("workflow", workflow_id)
+                if workflow_id is not None
+                else ("unidentified", index)
+            )
+            current = latest.get(key)
+            if current is None or _run_order(run_) >= _run_order(current):
+                latest[key] = run_
+        return list(latest.values())
+
+    def _run_contexts(self, owner: str, repo: str, run_: dict) -> list[CheckContext]:
+        """One workflow run's jobs as contexts, or the run itself if it has none.
+
+        A run exposes no jobs while it is still queued, and the empty list must
+        never read as "nothing failing here". So a run with no readable jobs
+        contributes ITSELF as one context, under the same completed/conclusion
+        rule: not completed reads as running (the case the gate exists for), and
+        a completed run with no jobs is judged on its own conclusion rather than
+        vanishing from the rollup.
+        """
+        run_id = run_.get("id")
+        run_name = str(run_.get("name") or run_.get("display_title") or "workflow run")
+        run_url = str(run_.get("html_url") or "")
+        jobs: list[dict] = []
+        if run_id is not None:
+            jobs = self._rollup_listing(
+                f"repos/{owner}/{repo}/actions/runs/{run_id}/jobs", "jobs", "jobs"
+            )
+        if not jobs:
+            return [
+                CheckContext(
+                    name=run_name,
+                    conclusion=_completed_conclusion(run_),
+                    url=run_url,
+                )
+            ]
+        return [
+            CheckContext(
+                name=str(job.get("name") or "unnamed job"),
+                conclusion=_completed_conclusion(job),
+                url=str(job.get("html_url") or run_url),
+            )
+            for job in jobs
+        ]
 
     def _commit_statuses(self, owner: str, repo: str, sha: str) -> list[CheckContext]:
         """The commit's legacy statuses, one context each.
