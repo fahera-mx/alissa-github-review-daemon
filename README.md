@@ -148,8 +148,13 @@ identity's, say, or everything except Dependabot and renovate.
   round number, no attempt record, and **no comment on the PR**. Silence, like
   an unwatched repo: an author this loop does not serve should not be handed an
   interaction surface.
-- It gates *starting* rounds only. Drop an author from the list and a round
-  already in flight for their PR still finishes; nothing is retro-dropped.
+- It gates *starting* rounds only, and sits below the branches that *close* a
+  round for exactly that reason. Drop an author from the list mid-round and the
+  round already in flight still finishes: its session is not reaped, its verdict
+  still becomes a review of record, and a converged PR still has its dangling
+  review request withdrawn. What it costs is that a filtered PR is not the
+  cheapest possible skip — it pays one review-list fetch and the (cached)
+  review-task lookup per poll before the gate is reached.
 - No entry in it can override the **self-review** skip: listing the reviewer's
   own login narrows the loop to a PR GitHub then forbids it to review.
 - `--author` is repeatable and *replaces* the config list, exactly like
@@ -917,7 +922,7 @@ bash docker/claude/tests-entrypoint-executor.sh  # bridge-executor role + gates
 bash docker/claude/tests-entrypoint-ui.sh        # reviewer-console wiring
 ```
 
-812 tests cover the decision state machine, the config layering (including the
+815 tests cover the decision state machine, the config layering (including the
 `authors` scope filter: default-empty, replace-not-extend, the string guard,
 case-insensitive matching, the pre-bookkeeping skip and the self-review guard's
 precedence over it), the two CI

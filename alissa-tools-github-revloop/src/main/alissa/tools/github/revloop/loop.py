@@ -1696,29 +1696,16 @@ class ReviewWatcher:
             # GitHub rejects a self review-request, so this should be
             # unreachable -- but a shared bot identity would land here.
             #
-            # FIRST, and deliberately above the authors allowlist below: the
-            # allowlist is a scope filter an operator writes, and no entry in it
-            # may buy back a review GitHub itself forbids. Listing the reviewer
-            # login in `authors` therefore narrows the loop to a PR it will then
-            # refuse -- which is the correct reading of "only serve this author"
-            # for an author that cannot be served.
+            # FIRST, and deliberately above the authors allowlist (further
+            # down): the allowlist is a scope filter an operator writes, and no
+            # entry in it may buy back a review GitHub itself forbids. Listing
+            # the reviewer login in `authors` therefore narrows the loop to a PR
+            # it will then refuse -- which is the correct reading of "only serve
+            # this author" for an author that cannot be served.
             return Decision(
                 Action.SKIPPED,
                 f"PR author is the reviewer identity ({pr.author}); "
                 "GitHub forbids self-review",
-            )
-
-        if not self.config.serves_author(pr.author):
-            # A scope filter, applied here rather than at discovery because the
-            # search query is not touched (the author is only in hand once the
-            # PR detail is fetched) -- and applied BEFORE any bookkeeping, so a
-            # filtered PR burns no round number, records no attempt, holds no
-            # stale-round slot and never learns it was considered. No PR comment
-            # either: an author this loop does not serve should get silence, not
-            # an interaction surface, exactly as an unwatched repo does.
-            return Decision(
-                Action.SKIPPED,
-                f"PR author {pr.author} is not in the authors allowlist",
             )
 
         my_reviews = self.github.my_reviews(owner, repo, number)
@@ -1774,6 +1761,36 @@ class ReviewWatcher:
             # self review request; see _clear_own_review_request.
             self._clear_own_review_request(pr, my_reviews, converged)
             return Decision(Action.CONVERGED, converged, completed)
+
+        # THE AUTHORS SCOPE FILTER (issue #93), and its position is the whole
+        # of its contract: it gates STARTING a round and nothing else.
+        #
+        # Client-side, because the discovery search is deliberately untouched --
+        # the author is only in hand once the PR detail is fetched. Below
+        # convergence rather than up beside the self-review skip, because every
+        # branch above finishes a round that was already started: a verdict
+        # envelope ahead of its native review still becomes a review of record
+        # (_close_round_natively), and a converged PR still gets its dangling
+        # review request withdrawn (_clear_own_review_request). An operator who
+        # narrows `authors` mid-round must not strand the round that is already
+        # running, and stopping one step short of its verdict of record is the
+        # studio #298 failure this module refuses everywhere else (PR #94 round
+        # 1). It costs a filtered PR one my_reviews fetch and the review-task
+        # lookup per poll -- the negative cache bounds the corpus search -- and
+        # that is the price of not stranding a round.
+        #
+        # Above THIS line, therefore, and everything the issue's checklist asks
+        # for follows from where it sits: the effective cap and its ack
+        # announcement, the cap-out escalation (the only branch below that would
+        # COMMENT on the PR), `round_ = completed + 1`, the stale-round probe and
+        # the spawn are all downstream. A filtered PR burns no round number,
+        # records no attempt, holds no stale-round slot and never says a word on
+        # the PR -- it gets silence, exactly as an unwatched repo does.
+        if not self.config.serves_author(pr.author):
+            return Decision(
+                Action.SKIPPED,
+                f"PR author {pr.author} is not in the authors allowlist",
+            )
 
         # The effective cap is the configured one plus every re-entry an
         # operator has explicitly acked on THIS PR (issue #42). The sum is a

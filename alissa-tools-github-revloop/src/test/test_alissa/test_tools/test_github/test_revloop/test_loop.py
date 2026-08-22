@@ -567,8 +567,21 @@ def test_a_pr_by_a_non_listed_author_is_skipped_before_any_bookkeeping(config):
     assert d.round is None, "a filtered PR must not consume a round number"
     assert al.enqueued == []
     assert gh.comments == [] and gh.issue_store == [], "log-only: silence on the PR"
-    assert al.list_calls == 0, "no review-task lookup either — the skip is upstream"
     assert st.get_spawn(SLUG, NUMBER, 1) is None
+
+
+def test_the_filter_never_escalates_a_capped_pr_it_does_not_serve(config):
+    """The one branch below the gate that would COMMENT on the PR. A PR sitting
+    at its cap must not be paged about by a loop that is not reviewing it."""
+    cfg = _authors(config, "someone-else")
+    reviews = [review(at=f"2026-07-18T1{i}:00:00Z") for i in range(cfg.round_cap)]
+    w, gh, al = watcher(cfg, make_pr(author="dependabot"), reviews)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert operator_comments(gh) == [], "no cap-out escalation on a filtered PR"
+    assert al.enqueued == []
 
 
 def test_the_skip_names_the_author_and_the_reason(config, caplog):
@@ -608,10 +621,10 @@ def test_listing_the_reviewer_login_does_not_resurrect_self_review(config):
     assert al.enqueued == []
 
 
-def test_narrowing_the_list_never_retro_drops_a_round_in_flight(config):
+def test_narrowing_the_list_never_kills_a_session_in_flight(config):
     """The filter gates STARTING rounds. A session already reviewing a PR whose
-    author was dropped from the list finishes its round: it is not killed, and
-    its ledger row is not rewritten under it."""
+    author was dropped from the list is not killed, and its ledger row is not
+    rewritten under it."""
     pr = make_pr(author="dependabot")
     cfg = _authors(config, "someone-else")
     st = State(cfg.state_db)
@@ -624,6 +637,43 @@ def test_narrowing_the_list_never_retro_drops_a_round_in_flight(config):
     assert al.killed == []
     row = st.get_spawn(SLUG, NUMBER, 1)
     assert row is not None and row["session"] == s1
+
+
+def test_a_round_already_started_still_gets_its_verdict_of_record(
+    config, no_post_grace
+):
+    """The other half of "in-flight rounds finish normally", and the half that
+    put the gate below the round-closing branches (PR #94 round 1).
+
+    An envelope ahead of the native review count is a round that stopped one
+    step short of finishing. Filtering its author must not freeze it there --
+    that is the studio #298 state: a verdict on the task with no review of
+    record on GitHub, and the review request still dangling.
+    """
+    cfg = _authors(config, "someone-else")
+    w, gh, _ = watcher(
+        cfg, make_pr(author="dependabot"), [], verdict="request_changes",
+        verdict_count=1,
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED
+    assert [p["event"] for p in gh.submitted] == ["REQUEST_CHANGES"]
+
+
+def test_a_filtered_pr_that_converged_still_withdraws_the_review_request(config):
+    """The same argument at the other terminal branch: an approve at the current
+    head is a finished round, and the dangling request it leaves is the daemon's
+    to clean up whether or not the author is still served."""
+    cfg = _authors(config, "someone-else")
+    pr = make_pr(author="dependabot", requested=("alissa-app",))
+    w, gh, _ = watcher(cfg, pr, [review("APPROVED")], verdict="approve")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert gh.removed == ["alissa-app"]
 
 
 # -- in-flight / idempotency ----------------------------------------------
