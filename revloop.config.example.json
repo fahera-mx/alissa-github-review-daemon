@@ -11,6 +11,9 @@
   "_repos": "Allowlist of owner/repo; empty means every repo that requests a review. --repo replaces this list rather than extending it.",
   "repos": [],
 
+  "_authors": "SCOPE FILTER on which PR AUTHORS are worth spending rounds on — a policy knob, NOT the security boundary. Summoning this loop already costs repo write access (someone has to request the reviewer) plus a place on the `repos` allowlist above; `authors` only narrows which of those already-authorised PRs get reviewed — skip dependabot/renovate, or a teammate who does not want agent reviews. Empty (the default) means EVERY author, so an existing deployment with no `authors` key behaves exactly as before. Matching is case-insensitive (GitHub logins are). Note the deliberate asymmetry with `operators` below: that one is a GRANT and empty means nobody. A filtered PR is skipped before any round bookkeeping and gets no comment — silence, like an unwatched repo. --author replaces this list rather than extending it, and no entry in it can override the self-review skip.",
+  "authors": [],
+
   "_operators": "GitHub logins allowed to re-open a capped PR with a `alissa-review: re-enter +N` comment (N up to 5). Empty means no ack is ever honoured; the reviewer identity is never an operator. --operator replaces this list rather than extending it.",
   "operators": [],
 

@@ -81,6 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="only watch this repo; repeatable. Replaces the config list entirely.",
     )
     over.add_argument(
+        "--author",
+        dest="authors",
+        action="append",
+        metavar="LOGIN",
+        help="only review PRs opened by this GitHub login; repeatable. "
+        "Replaces the config list entirely. Empty = every author is served "
+        "(a scope filter, not a grant); the self-review skip still applies.",
+    )
+    over.add_argument(
         "--operator",
         dest="operators",
         action="append",
@@ -194,6 +203,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
     through. `repos` becomes a tuple so it matches the config-file form."""
     return {
         "repos": tuple(args.repos) if args.repos else None,
+        "authors": tuple(args.authors) if args.authors else None,
         "operators": tuple(args.operators) if args.operators else None,
         "poll_interval": args.poll_interval,
         "round_cap": args.round_cap,

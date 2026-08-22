@@ -1695,10 +1695,30 @@ class ReviewWatcher:
         if pr.author == self.github.login:
             # GitHub rejects a self review-request, so this should be
             # unreachable -- but a shared bot identity would land here.
+            #
+            # FIRST, and deliberately above the authors allowlist below: the
+            # allowlist is a scope filter an operator writes, and no entry in it
+            # may buy back a review GitHub itself forbids. Listing the reviewer
+            # login in `authors` therefore narrows the loop to a PR it will then
+            # refuse -- which is the correct reading of "only serve this author"
+            # for an author that cannot be served.
             return Decision(
                 Action.SKIPPED,
                 f"PR author is the reviewer identity ({pr.author}); "
                 "GitHub forbids self-review",
+            )
+
+        if not self.config.serves_author(pr.author):
+            # A scope filter, applied here rather than at discovery because the
+            # search query is not touched (the author is only in hand once the
+            # PR detail is fetched) -- and applied BEFORE any bookkeeping, so a
+            # filtered PR burns no round number, records no attempt, holds no
+            # stale-round slot and never learns it was considered. No PR comment
+            # either: an author this loop does not serve should get silence, not
+            # an interaction surface, exactly as an unwatched repo does.
+            return Decision(
+                Action.SKIPPED,
+                f"PR author {pr.author} is not in the authors allowlist",
             )
 
         my_reviews = self.github.my_reviews(owner, repo, number)

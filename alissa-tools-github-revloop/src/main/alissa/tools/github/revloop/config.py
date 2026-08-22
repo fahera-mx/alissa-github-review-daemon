@@ -120,6 +120,7 @@ CONFIG_KEYS = (
     "poll_interval",
     "round_cap",
     "repos",
+    "authors",
     "operators",
     "agent_profile",
     "reviewer_login",
@@ -262,6 +263,21 @@ class Config:
     # Empty tuple means "every repo that requests a review from me".
     repos: tuple[str, ...] = ()
 
+    # GitHub logins whose PRs this loop will spend rounds on. A SCOPE FILTER,
+    # not a capability grant -- so, like `repos` and unlike `operators`, empty
+    # (the default) means EVERY author, and an existing deployment with no
+    # `authors` key behaves exactly as it did before the key existed.
+    #
+    # The distinction is worth keeping straight: `operators` empty means NOBODY
+    # because honouring an ack is a power being handed out, and a grant that
+    # defaults to everyone is a hole. Serving a review request is not a power
+    # the daemon hands to the author -- summoning the loop already costs repo
+    # write access (to request the reviewer) plus a place on the `repos`
+    # allowlist. This key only narrows which of those already-authorised PRs are
+    # worth the rounds: skip dependabot/renovate, or a teammate who does not
+    # want agent reviews.
+    authors: tuple[str, ...] = ()
+
     # GitHub logins whose re-entry ack may raise a capped PR's effective cap
     # (loop.parse_reentry_ack). Empty -- the default -- means NO ack is ever
     # honoured: the lever fails closed, because anyone who can comment on a PR
@@ -356,6 +372,23 @@ class Config:
     def watches(self, full_name: str) -> bool:
         return not self.repos or full_name in self.repos
 
+    def serves_author(self, login: str) -> bool:
+        """Whether a PR by this login is in scope for the loop.
+
+        Empty list = every author (the filter pattern, see the field). Otherwise
+        membership case-insensitively, because GitHub logins are: a config
+        saying `Alissa-App` must match the `alissa-app` the API returns, or the
+        allowlist silently serves nobody -- the same failure mode `_string_list`
+        exists to prevent. Mirrors `loop.ReviewWatcher._is_operator`.
+
+        This is not the self-review guard and cannot stand in for it: an author
+        listed here is still refused if it is the reviewer identity, because
+        that check runs first and independently (see `loop.evaluate`).
+        """
+        if not self.authors:
+            return True
+        return login.lower() in {a.lower() for a in self.authors}
+
     @classmethod
     def build(
         cls,
@@ -399,6 +432,9 @@ class Config:
             )
 
         repos = _string_list(raw.get("repos", ()), "repos", "owner/repo entries")
+        authors = _string_list(
+            raw.get("authors", ()), "authors", "GitHub logins"
+        )
         operators = _string_list(
             raw.get("operators", ()), "operators", "GitHub logins"
         )
@@ -529,6 +565,7 @@ class Config:
             poll_interval=interval,
             round_cap=cap,
             repos=repos,
+            authors=authors,
             operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),
@@ -553,8 +590,8 @@ def _string_list(value: Any, key: str, what: str) -> tuple[str, ...]:
     The guard is the point: JSON makes `"repos": "org/repo"` an easy typo, and
     Python would iterate it into single CHARACTERS -- an allowlist of 30-odd
     one-character names, which `watches()` then matches against nothing and the
-    daemon quietly reviews no PR at all. Both list keys go through here so
-    neither can grow the footgun back.
+    daemon quietly reviews no PR at all. Every list key goes through here so
+    none of them can grow the footgun back.
     """
     if isinstance(value, str):
         raise ValueError(
