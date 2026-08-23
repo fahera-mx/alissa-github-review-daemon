@@ -517,6 +517,165 @@ def test_self_authored_pr_is_skipped(config):
     assert al.enqueued == []
 
 
+# -- authors allowlist (issue #93) -----------------------------------------
+#
+# A SCOPE FILTER, not a grant: empty serves everyone, which is what makes the
+# key backward-compatible. What these pin is that the filter is applied where a
+# skip still costs nothing -- before the round is numbered, before any ledger
+# row, and without a word on the PR -- and that no entry in it can reach past
+# the self-review guard sitting above it.
+
+
+def _authors(config, *logins):
+    return dataclasses.replace(config, authors=tuple(logins))
+
+
+def test_an_empty_authors_list_serves_every_author(config):
+    """The default, and the whole backward-compatibility promise: a deployment
+    with no `authors` key reviews exactly what it reviewed before."""
+    w, _, al = watcher(config, make_pr(author="a-stranger"), [])
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 1
+    assert len(al.enqueued) == 1
+
+
+def test_a_listed_author_is_reviewed_normally(config):
+    w, _, al = watcher(_authors(config, "dependabot", "teammate"), make_pr(), [])
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 1
+    assert len(al.enqueued) == 1
+
+
+def test_a_pr_by_a_non_listed_author_is_skipped_before_any_bookkeeping(config):
+    """No spawn, no round number, no ledger row, no PR comment.
+
+    The round number is the load-bearing half: burning one on a PR the loop
+    never reviews would walk the whole PR toward its CR9 cap without a single
+    review being written.
+    """
+    cfg = _authors(config, "someone-else")
+    st = State(cfg.state_db)
+    w, gh, al = watcher(cfg, make_pr(author="dependabot"), [], state=st)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert d.round is None, "a filtered PR must not consume a round number"
+    assert al.enqueued == []
+    assert gh.comments == [] and gh.issue_store == [], "log-only: silence on the PR"
+    assert st.get_spawn(SLUG, NUMBER, 1) is None
+
+
+def test_the_filter_never_escalates_a_capped_pr_it_does_not_serve(config):
+    """The one branch below the gate that would COMMENT on the PR. A PR sitting
+    at its cap must not be paged about by a loop that is not reviewing it."""
+    cfg = _authors(config, "someone-else")
+    reviews = [review(at=f"2026-07-18T1{i}:00:00Z") for i in range(cfg.round_cap)]
+    w, gh, al = watcher(cfg, make_pr(author="dependabot"), reviews)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert operator_comments(gh) == [], "no cap-out escalation on a filtered PR"
+    assert al.enqueued == []
+
+
+def test_the_skip_names_the_author_and_the_reason(config, caplog):
+    w, _, _ = watcher(_authors(config, "someone-else"), make_pr(author="dependabot"), [])
+
+    with caplog.at_level(logging.DEBUG):
+        w.poll_once()
+
+    assert "dependabot" in caplog.text
+    assert "authors allowlist" in caplog.text
+
+
+@pytest.mark.parametrize("configured,actual", [
+    ("Alissa-Dev", "alissa-dev"),
+    ("alissa-dev", "Alissa-Dev"),
+])
+def test_author_matching_is_case_insensitive_both_ways(config, configured, actual):
+    """GitHub logins are case-insensitive; a case-sensitive allowlist would
+    serve nobody and say nothing, the same silent failure `_string_list` guards."""
+    w, _, al = watcher(_authors(config, configured), make_pr(author=actual), [])
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert len(al.enqueued) == 1
+
+
+def test_listing_the_reviewer_login_does_not_resurrect_self_review(config):
+    """The allowlist narrows what the loop serves; it never widens it. GitHub
+    forbids self-review whatever an operator writes in the config."""
+    cfg = _authors(config, "alissa-app")
+    w, _, al = watcher(cfg, make_pr(author="alissa-app"), [])
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert "self-review" in d.reason
+    assert "allowlist" not in d.reason, "the self-review guard is what refused it"
+    assert al.enqueued == []
+
+
+def test_narrowing_the_list_never_kills_a_session_in_flight(config):
+    """The filter gates STARTING rounds. A session already reviewing a PR whose
+    author was dropped from the list is not killed, and its ledger row is not
+    rewritten under it."""
+    pr = make_pr(author="dependabot")
+    cfg = _authors(config, "someone-else")
+    st = State(cfg.state_db)
+    w, _, al = watcher(cfg, pr, [], state=st)
+    s1 = _record(w, pr, 1)
+    _live(al, s1, status="busy")
+
+    w.poll_once()
+
+    assert al.killed == []
+    row = st.get_spawn(SLUG, NUMBER, 1)
+    assert row is not None and row["session"] == s1
+
+
+def test_a_round_already_started_still_gets_its_verdict_of_record(
+    config, no_post_grace
+):
+    """The other half of "in-flight rounds finish normally", and the half that
+    put the gate below the round-closing branches (PR #94 round 1).
+
+    An envelope ahead of the native review count is a round that stopped one
+    step short of finishing. Filtering its author must not freeze it there --
+    that is the studio #298 state: a verdict on the task with no review of
+    record on GitHub, and the review request still dangling.
+    """
+    cfg = _authors(config, "someone-else")
+    w, gh, _ = watcher(
+        cfg, make_pr(author="dependabot"), [], verdict="request_changes",
+        verdict_count=1,
+    )
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED
+    assert [p["event"] for p in gh.submitted] == ["REQUEST_CHANGES"]
+
+
+def test_a_filtered_pr_that_converged_still_withdraws_the_review_request(config):
+    """The same argument at the other terminal branch: an approve at the current
+    head is a finished round, and the dangling request it leaves is the daemon's
+    to clean up whether or not the author is still served."""
+    cfg = _authors(config, "someone-else")
+    pr = make_pr(author="dependabot", requested=("alissa-app",))
+    w, gh, _ = watcher(cfg, pr, [review("APPROVED")], verdict="approve")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert gh.removed == ["alissa-app"]
+
+
 # -- in-flight / idempotency ----------------------------------------------
 
 
@@ -1189,6 +1348,31 @@ def test_repeated_repo_flags_accumulate(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     cfg = resolve_config(cli("--repo", "a/one", "--repo", "a/two"))
     assert cfg.repos == ("a/one", "a/two")
+
+
+def test_repeated_author_flags_accumulate(tmp_path, monkeypatch):
+    from alissa.tools.github.revloop.__main__ import resolve_config
+
+    monkeypatch.chdir(tmp_path)
+    cfg = resolve_config(cli("--author", "one", "--author", "two"))
+    assert cfg.authors == ("one", "two")
+
+
+def test_author_flags_replace_the_config_list_rather_than_extend_it(
+    tmp_path, monkeypatch
+):
+    """Same rule as --repo, and the reason is the same: a flag that EXTENDED
+    could only ever widen the scope, so there would be no way to narrow one
+    deployment's daemon without editing the file every other daemon reads."""
+    import json
+
+    from alissa.tools.github.revloop.__main__ import resolve_config
+
+    (tmp_path / CONFIG_FILENAME).write_text(json.dumps({"authors": ["from-config"]}))
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_config(cli("--author", "from-cli")).authors == ("from-cli",)
+    assert resolve_config(cli()).authors == ("from-config",), "no flag: config shows through"
 
 
 def test_cli_fills_in_over_a_discovered_config_file(tmp_path, monkeypatch):
@@ -3323,6 +3507,21 @@ def test_operators_default_to_an_empty_allowlist(tmp_path):
     assert Config.build(tmp_path, {}).operators == ()
 
 
+def test_authors_default_to_an_empty_allowlist_that_serves_everyone(tmp_path):
+    """`operators` empty means NOBODY (a grant); `authors` empty means EVERYONE
+    (a filter). The asymmetry is the contract, so it is pinned here."""
+    cfg = Config.build(tmp_path, {})
+    assert cfg.authors == ()
+    assert cfg.serves_author("anyone-at-all") is True
+
+
+def test_authors_are_read_from_the_config_file(tmp_path):
+    cfg = Config.build(tmp_path, {"authors": ["alissa-develop-daemon", " rhdzmota "]})
+    assert cfg.authors == ("alissa-develop-daemon", "rhdzmota")
+    assert cfg.serves_author("RHDZMOTA") is True
+    assert cfg.serves_author("dependabot") is False
+
+
 def test_operators_are_read_from_the_config_file(tmp_path):
     cfg = Config.build(tmp_path, {"operators": ["rhdzmota", " ops-bot "]})
     assert cfg.operators == ("rhdzmota", "ops-bot")
@@ -3331,6 +3530,7 @@ def test_operators_are_read_from_the_config_file(tmp_path):
 @pytest.mark.parametrize("key,value", [
     ("operators", "rhdzmota"),
     ("repos", "acme/widgets"),
+    ("authors", "alissa-app"),
 ])
 def test_a_string_list_key_is_rejected(tmp_path, key, value):
     """A bare string iterates into single CHARACTERS: an allowlist of

@@ -114,6 +114,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `poll_interval` | `60` | seconds; must be ≥10 |
 | `round_cap` | `10` | CR9 cap; never queues round cap+1 |
 | `repos` | `[]` | allowlist of `owner/repo`; empty = all |
+| `authors` | `[]` | allowlist of GitHub logins whose PRs are reviewed; empty = all. A **scope filter, not the security boundary** — see *Who the loop serves* |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | the identity every verdict is posted under; resolved from `gh api user` when null |
@@ -128,6 +129,36 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the *hold* and relies on the directive alone. **It also bounds the reviewer session's own in-round wait**: the same number is written into every directive as how long a session may wait for a running check before submitting, floored at 5 minutes so a `0` here cannot read as "do not wait at all" — see *Never approve a red head* |
 | `review_task_miss_ttl_polls` | `10` | how many polls a PR with **no** review task is taken on trust before the task corpus is searched for one again. Trades **latency** for reads: a review task created mid-window is picked up at the re-arm rather than the next poll. Floor `1` — there is no value that turns it off — see *Bounding the task-list read* |
 | `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
+
+#### Who the loop serves
+
+`repos` and `authors` are both **scope filters**, and both read the same way:
+**empty means everything**, so a config with neither key reviews every PR that
+requests this reviewer. `operators` is the odd one out and deliberately so — it
+is a *grant* (whose ack may lift CR9's cap), and empty there means **nobody**.
+
+`authors` is a **policy knob, not the security boundary**. Summoning this loop
+already costs repo write access — someone has to request the reviewer — plus a
+place on the `repos` allowlist. What `authors` decides is which of those
+already-authorised PRs are worth spending rounds on: only the devloop
+identity's, say, or everything except Dependabot and renovate.
+
+- Matching is **case-insensitive** (GitHub logins are).
+- A filtered PR is skipped **before any round bookkeeping** — no reviewer, no
+  round number, no attempt record, and **no comment on the PR**. Silence, like
+  an unwatched repo: an author this loop does not serve should not be handed an
+  interaction surface.
+- It gates *starting* rounds only, and sits below the branches that *close* a
+  round for exactly that reason. Drop an author from the list mid-round and the
+  round already in flight still finishes: its session is not reaped, its verdict
+  still becomes a review of record, and a converged PR still has its dangling
+  review request withdrawn. What it costs is that a filtered PR is not the
+  cheapest possible skip — it pays one review-list fetch and the (cached)
+  review-task lookup per poll before the gate is reached.
+- No entry in it can override the **self-review** skip: listing the reviewer's
+  own login narrows the loop to a PR GitHub then forbids it to review.
+- `--author` is repeatable and *replaces* the config list, exactly like
+  `--repo`.
 
 ### Config file discovery
 
@@ -365,6 +396,7 @@ Leave it on `skip` unless you want unattended clones.
 | a granted re-entry consumed without approve | one fresh cap-out naming the ack, then capped again |
 | PR is a draft | skip (CR1) |
 | PR authored by the reviewer identity | skip — GitHub forbids self-review |
+| PR author not on a non-empty `authors` list | skip, silently (log-only; no round, no comment) |
 | repo has no worktree hub | skip, or hub-ify first if `on_missing_hub: "add"` |
 
 `COMMENTED` reviews close a round, not just `APPROVED`/`CHANGES_REQUESTED` —
@@ -890,7 +922,10 @@ bash docker/claude/tests-entrypoint-executor.sh  # bridge-executor role + gates
 bash docker/claude/tests-entrypoint-ui.sh        # reviewer-console wiring
 ```
 
-770 tests cover the decision state machine, the config layering, the two CI
+815 tests cover the decision state machine, the config layering (including the
+`authors` scope filter: default-empty, replace-not-extend, the string guard,
+case-insensitive matching, the pre-bookkeeping skip and the self-review guard's
+precedence over it), the two CI
 gates (pre-spawn hold, verdict hold — pending→green, pending→red, both
 timeouts, a head that moves under either), the task-list bounds (the negative
 cache's window, its re-arm, its per-PR countdown and every way it fails open;
