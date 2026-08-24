@@ -40,7 +40,14 @@
 # Build context is this directory (docker/claude) — the image pulls the daemon
 # from PyPI, so no repo source is copied in.
 #
-#   docker build -t alissa-review-daemon docker/claude
+#   docker build --platform linux/amd64 -t alissa-review-daemon docker/claude
+#
+# `--platform` is explicit because the base image publishes linux/amd64 ONLY (see
+# "Base image" in README.md); on an amd64 host it is a no-op, and off one it is
+# the difference between an emulated build and a manifest-match failure.
+#
+# The image contract this build has to preserve is checked mechanically by
+# ./tests-image-contract.sh, which builds and then asserts inside the result.
 #
 # Run: see docker/claude/README.md and ../../README.md.
 # =============================================================================
@@ -48,10 +55,29 @@
 # The shared loopwork base image. It is PUBLIC on GHCR, so the pull is anonymous
 # and no registry credential is needed anywhere (Railway included).
 #
-# Pinned to an EXACT semver, never `:latest`: a base bump is a deliberate,
-# reviewable one-line change to this `FROM`, and that is the ONLY thing that
-# advances the shared infrastructure layers.
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
+# Pinned TWICE, and the two halves do different jobs.
+#
+#   * the exact semver (never `:latest`) is the READABLE half — a base bump is a
+#     deliberate, reviewable change to this line, and that is the ONLY thing that
+#     advances the shared infrastructure layers;
+#   * the `@sha256:` is the ENFORCING half — a tag is mutable, so without it a
+#     re-push of `0.1.0` is substituted into every build with no diff to review.
+#     That matters more here than for an ordinary base: this pin is now the whole
+#     review surface for claude-code, the `curl … | bash` CLI install and the apt
+#     layer, none of which this repo builds any more.
+#
+# A bump changes BOTH values together.
+#
+# The digest is the INDEX digest — what the registry returns as
+# `Docker-Content-Digest` for the tag — not the amd64 child manifest's. That keeps
+# platform selection a build-time choice (`--platform`) instead of freezing it
+# into the reference, so an arm64 base, once published, needs only the ordinary
+# two-value bump. Read the current one back with:
+#
+#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
+#
+# The base is linux/amd64-ONLY today; see "Base image" in README.md.
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0@sha256:b8eeb3df52b1437a02d217523b447fb6066d536b3916222d2b141b7167361845
 
 # Version of the daemon to install from PyPI. Bump per release: 0.16.0 is the
 # release this repo publishes on merge (it must match the dist's version file,

@@ -18,14 +18,27 @@ executor instead of the review loop. See
 ## Build
 
 ```sh
-docker build -t alissa-review-daemon docker/claude
+docker build --platform linux/amd64 -t alissa-review-daemon docker/claude
 
 # with configuration baked in (see the Configuration table):
-docker build \
+docker build --platform linux/amd64 \
   --build-arg ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app" \
   --build-arg ALISSA_POLL_INTERVAL=90 \
   --build-arg ALISSA_ROUND_CAP=3 \
   -t alissa-review-daemon docker/claude
+```
+
+`--platform linux/amd64` is not optional boilerplate: the base image is published
+for that platform only. It is a no-op on an amd64 host and the difference between
+an emulated build and a hard failure anywhere else — see
+[Platform: amd64 only](#platform-amd64-only).
+
+To check the built image against its contract rather than by eye, run
+[`tests-image-contract.sh`](./tests-image-contract.sh), which does the build and
+then asserts inside the result:
+
+```sh
+docker/claude/tests-image-contract.sh
 ```
 
 The image installs the daemon from PyPI, so the build context is just this
@@ -41,11 +54,11 @@ you deliberately want a version other than the pinned one.
 
 ### Base image
 
-This Dockerfile is a thin **leaf** on the shared loopwork base image, pinned to
-an exact tag:
+This Dockerfile is a thin **leaf** on the shared loopwork base image, pinned by
+both an exact tag and a digest:
 
 ```dockerfile
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0@sha256:b8eeb3df52b1437a02d217523b447fb6066d536b3916222d2b141b7167361845
 ```
 
 The base is **public on GHCR**, so the pull is anonymous — no registry
@@ -75,9 +88,63 @@ below.
 
 **Bumping the base is a one-line `FROM` pin change**, reviewed like any other
 PR. That is how claude-code, the alissa CLI and the system packages advance for
-this image — never by re-adding a layer here. Always pin an **exact semver**,
-never `:latest`. Base repo and its leaf contract:
+this image — never by re-adding a layer here. Base repo and its leaf contract:
 <https://github.com/ali-fhr/alissa-loopwork>.
+
+#### How the pin is written
+
+Never `:latest`, and never a bare tag either. The reference carries **two values
+that do different jobs**, and a bump changes both together:
+
+| half | job |
+| --- | --- |
+| `:0.1.0` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
+| `@sha256:b8eeb3df…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.1.0` is substituted into every build with no diff to review. |
+
+The digest matters more here than for an ordinary base image. This one line is now
+the *entire* review surface for claude-code, a `curl … | bash` CLI install and
+the whole apt layer — none of which this repo builds, or sees, any more. A silent
+substitution should be a build failure, not a successful build of something else.
+
+The pinned digest is the **index** digest (what the registry returns as
+`Docker-Content-Digest` for the tag `0.1.0`), not the digest of the amd64 child
+manifest it currently selects (`sha256:8434c474…`). Pinning the index keeps
+platform selection a build-time choice, so when the base gains arm64 this stays an
+ordinary two-value bump instead of a reference that can only ever resolve to
+amd64. Read the current values back with:
+
+```sh
+docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
+```
+
+#### Platform: amd64 only
+
+**The base publishes `linux/amd64` and nothing else.** Its `0.1.0` index contains
+exactly one platform manifest plus an attestation manifest — no `arm64`, no
+`arm/v7`. The `python:3.12-slim-bookworm` this image used to build from shipped
+five architectures, so this is a real narrowing and it is worth knowing before you
+build.
+
+It is an upstream **omission rather than a decision**: the base repo's
+`publish.yml` calls `docker/build-push-action@v6` with no `platforms:` key, so the
+single architecture is inherited from the amd64 GitHub runner.
+
+What it costs, and what it does not:
+
+- **Production is unaffected.** Railway builds amd64.
+- **Local builds off amd64 are affected** — Apple Silicon in particular. Without
+  `--platform linux/amd64` the build fails at the `FROM` with
+  `no match for platform in manifest`, an error that points at the base rather
+  than at anything you did. With the flag it builds under emulation: slower, but
+  correct.
+
+That is why every `docker build` command documented above passes
+`--platform linux/amd64` explicitly, and why
+[`tests-image-contract.sh`](./tests-image-contract.sh) passes it too.
+
+The fix is upstream and cheap: add `platforms: linux/amd64,linux/arm64` to the
+base's publish workflow, then re-pin tag **and** digest here. Nothing in this leaf
+needs to change for it.
 
 ### On Railway
 
@@ -387,13 +454,19 @@ safe to leave on by default:
   review container a dirty worktree is *evidence* — a session that died
   mid-round with work someone may still want. The rail that keeps it is the one
   this container needs most.
-- **It is capability-gated, not version-pinned.** The image installs the alissa
-  CLI from its install channel, which may predate the subcommand. The entrypoint
-  probes once at boot and, if the subcommand is missing, logs exactly one loud
+- **It is capability-gated, not version-pinned.** The alissa CLI is not installed
+  by this image at all — it arrives prebuilt in the [base image](#base-image), and
+  therefore advances only when someone bumps the `FROM` pin, not on every rebuild
+  here. So the CLI in any given image may predate the subcommand, and may stay
+  that way across many builds of this repo — which makes capability-gating more
+  necessary than it was when this Dockerfile installed the CLI itself, not less: a
+  version pin written here would go stale against a layer this file no longer
+  owns. The entrypoint probes once at boot and, if the subcommand is missing, logs
+  exactly one loud
   `WARN: this alissa CLI predates 'alissa code workspace prune' …` and skips
-  *both* hooks. Nothing here needs to change when the CLI catches up. (The probe
-  reads the help *output*, not its exit status: commander answers an unknown
-  subcommand by printing the parent command's help and exiting `0`, so an
+  *both* hooks. Nothing here needs to change when a base bump brings a newer CLI.
+  (The probe reads the help *output*, not its exit status: commander answers an
+  unknown subcommand by printing the parent command's help and exiting `0`, so an
   exit-status probe would call every old CLI capable.)
 - **The interval loop is daemon-only.** The [executor role](#bridge-executor-role-a-second-service-from-this-same-image)
   gets the boot pass — it grows the same volume the same way — but not the loop:
