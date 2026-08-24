@@ -1,0 +1,65 @@
+name: Check Container Image Contract
+on: [pull_request]
+
+# Least privilege: this job only reads the checkout and pulls a PUBLIC base
+# image from GHCR anonymously. It never pushes an image and never needs a
+# registry credential — same as the documented build.
+permissions:
+  contents: read
+
+# WHY THIS WORKFLOW EXISTS
+#
+# docker/claude/Dockerfile is a thin LEAF on a shared base image
+# (ghcr.io/ali-fhr/alissa-loopwork-base). Nearly everything the container needs
+# at runtime is INHERITED from that base, and the single `FROM` line is the only
+# review surface those layers have left. Inherited things break silently: a base
+# that stops shipping `tmux`, drops the `alissa` user, or changes the ENTRYPOINT
+# path leaves this repo unchanged and every other check green, and the first
+# symptom is a container that will not boot in production.
+#
+# The tests-entrypoint-* suites cannot cover this. They boot the entrypoint
+# against STUBBED CLIs in a plain shell precisely BECAUSE they must run without
+# docker — which is what makes them silent about how the image was assembled.
+#
+# This job is the other half, and it is also the only place a `docker build` of
+# this Dockerfile happens anywhere: it is not built by any other workflow, not by
+# the release pipeline, and not by the agent runners that implement this repo
+# (they have no docker daemon, no root and no user namespaces). Without it, the
+# build is verified only by whoever remembers to run it by hand, and the next
+# `FROM` bump — the mechanism this leaf design makes the ONLY way the substrate
+# advances — lands unverified.
+jobs:
+  image-contract:
+    name: Image contract (build + in-image assertions)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # Fail loudly rather than let the harness take its no-daemon SKIP path on
+      # a runner that is supposed to have one. REQUIRE_DOCKER below is belt and
+      # braces for the same thing; this prints the versions into the log so a
+      # future failure can be dated against a runner-image change.
+      - name: Docker is present
+        run: |
+          docker version
+          docker buildx version || true
+
+      # Records what :0.1.0 resolved to at build time, next to the digest the
+      # Dockerfile pins. If a base re-tag ever does happen, this log line is what
+      # makes the resulting build failure self-explaining instead of a mystery.
+      - name: Resolve the pinned base reference
+        run: |
+          ref="$(grep -m1 '^FROM ' docker/claude/Dockerfile | awk '{print $2}')"
+          echo "Dockerfile pins: ${ref}"
+          docker buildx imagetools inspect "${ref%%@*}" || true
+
+      - name: Build the image and assert its contract
+        env:
+          # Turns the harness's "no docker daemon -> skip" path into a failure,
+          # so a runner that lost docker cannot report this job as green.
+          REQUIRE_DOCKER: '1'
+        run: |
+          bash docker/claude/tests-image-contract.sh
