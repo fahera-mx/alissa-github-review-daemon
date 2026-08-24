@@ -140,10 +140,17 @@ case "${rew}" in
   *"ssh://git@github.com/"*) ok "system rewrite: ssh://git@github.com/" ;;
   *) no "system rewrite ssh://git@github.com/ missing (got: ${rew:-<none>})" ;;
 esac
-helpers="$(git config --system --get-all credential.helper 2>/dev/null)"
+# NOT `credential.helper`: the base scopes it to the host, so /etc/gitconfig has
+# a [credential "https://github.com"] section and the bare key is genuinely
+# empty. Asking for the unscoped key reports "missing" against a correct image —
+# this check did exactly that on its first CI run. Ask for the scoped key, and
+# accept ANY credential.* helper as a fallback so a future base that widens the
+# scope does not read as a regression.
+helpers="$(git config --system --get-all 'credential.https://github.com.helper' 2>/dev/null)"
+[ -n "${helpers}" ] || helpers="$(git config --system --get-regexp '^credential\.' 2>/dev/null)"
 case "${helpers}" in
-  *"gh auth git-credential"*) ok "credential.helper -> gh auth git-credential" ;;
-  *) no "gh credential helper missing (got: ${helpers:-<none>})" ;;
+  *"gh auth git-credential"*) ok "credential helper for https://github.com -> gh auth git-credential" ;;
+  *) no "gh credential helper missing (system credential.* = ${helpers:-<none>})" ;;
 esac
 eq "advice.detachedHead" "false" "$(git config --system advice.detachedHead 2>/dev/null)"
 
