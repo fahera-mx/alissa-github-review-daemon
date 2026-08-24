@@ -198,7 +198,7 @@ eq "installed alissa-tools-github-revloop" "${EXPECT_REVLOOP}" "${got}"
 
 exit "${rc}"
 PROBE
-then :; else fail=1; fi
+then fail=1; fi
 
 # --- 6. the git identity, read as the user that owns it ----------------------
 info ""
@@ -211,7 +211,7 @@ eq "git config --global user.name"  "alissa-review-daemon" "$(git config --globa
 eq "git config --global user.email" "support@alissa.app"   "$(git config --global user.email 2>/dev/null)"
 exit "${rc}"
 PROBE
-then :; else fail=1; fi
+then fail=1; fi
 
 # --- 9. inherited image config ------------------------------------------------
 info ""
