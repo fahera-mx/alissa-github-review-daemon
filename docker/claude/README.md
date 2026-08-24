@@ -7,7 +7,8 @@ one image.
 This is **not** a thin Python-daemon container. The daemon only watches GitHub
 and enqueues sessions; the worker is what drains the queue and spawns reviewers,
 so the image bundles all three tiers (see the top-of-file comment in
-[`Dockerfile`](./Dockerfile)).
+[`Dockerfile`](./Dockerfile)). Two of those three now come from a shared base
+image rather than from layers built here — see [Base image](#base-image).
 
 The same image also serves a **second, separate service**: with
 `CONTAINER_ROLE=executor` it runs `alissa bridge start` as an Alissa Studio queue
@@ -37,6 +38,46 @@ stale — and a stale one is load-bearing once a config key has a version floor
 (pinning below `ALISSA_REVIEW_OPERATORS`' floor makes the daemon reject the key
 and the container exit at boot). Pass `--build-arg REVLOOP_VERSION=…` only when
 you deliberately want a version other than the pinned one.
+
+### Base image
+
+This Dockerfile is a thin **leaf** on the shared loopwork base image, pinned to
+an exact tag:
+
+```dockerfile
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
+```
+
+The base is **public on GHCR**, so the pull is anonymous — no registry
+credential is needed anywhere, Railway included.
+
+It owns the runtime substrate this image used to build for itself, and which was
+copy-pasted between this repo and the develop daemon. **Do not re-add any of it
+to the leaf:**
+
+- python 3.12 + Node 22, and `git` / `tmux` / `gh` / `tini` / `gosu` / `jq`
+  (+ `iptables`/`ipset` for the optional egress firewall)
+- **claude-code**, with its first-run gates pre-seeded (`~/.claude.json`,
+  `~/.claude/settings.json`) so worker-spawned reviewers start headless
+- the **alissa CLI** on the `alissa` user's `PATH`
+- the non-root **`alissa` user (uid 1000)** and the `/workspace` mount point
+- the system-wide GitHub **SSH→HTTPS rewrite** with `gh` as git's credential
+  helper, plus `advice.detachedHead=false`
+- the workspace ENV skeleton (`ALISSA_WORKSPACE_ROOT`, `TMUX_TMPDIR`,
+  `CLAUDE_CONFIG_DIR`), `EXPOSE 8080`, and the `tini` **ENTRYPOINT** hook at the
+  fixed path `/usr/local/bin/entrypoint.sh`
+
+What stays in this leaf: the pip-installed daemon (`REVLOOP_VERSION`), the
+entrypoint plus `revloop-config.sh` / `init-firewall.sh` — COPYed **over** the
+base's deliberately-failing stub at that fixed entrypoint path — `agents.yaml`,
+the `alissa-review-daemon` git author identity, and the whole ARG→ENV knob block
+below.
+
+**Bumping the base is a one-line `FROM` pin change**, reviewed like any other
+PR. That is how claude-code, the alissa CLI and the system packages advance for
+this image — never by re-adding a layer here. Always pin an **exact semver**,
+never `:latest`. Base repo and its leaf contract:
+<https://github.com/ali-fhr/alissa-loopwork>.
 
 ### On Railway
 

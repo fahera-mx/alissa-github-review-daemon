@@ -12,6 +12,24 @@
 #   * node + the alissa CLI                          (worker, tmux queue, tasks)
 #   * claude-code                                    (the agent the worker spawns)
 #
+# Only the FIRST of those three is installed here. This is a thin LEAF on the
+# shared loopwork base image, which owns the runtime substrate the review and
+# develop daemons had copy-pasted between them:
+#
+#   https://github.com/ali-fhr/alissa-loopwork   (README -> "leaf contract")
+#
+# In the BASE (never re-do any of it here): python 3.12 + Node 22, git/tmux/gh/
+# tini/gosu/jq + iptables/ipset, claude-code with its first-run gates pre-seeded,
+# the alissa CLI on the `alissa` user's PATH, the non-root `alissa` user (uid
+# 1000) + /workspace mount point, the system-wide GitHub SSH->HTTPS rewrite with
+# gh as git's credential helper, the workspace ENV skeleton
+# (ALISSA_WORKSPACE_ROOT / TMUX_TMPDIR / CLAUDE_CONFIG_DIR), EXPOSE 8080, and the
+# tini ENTRYPOINT hook at the fixed path /usr/local/bin/entrypoint.sh.
+#
+# In this LEAF (below): the pip-installed daemon, the entrypoint + its helper
+# scripts (COPYed OVER the base's failing stub at that fixed path), the
+# agents.yaml profile, the git author identity, and the whole ARG->ENV knob block.
+#
 # ONE IMAGE, TWO ROLES (issue #73). `CONTAINER_ROLE=executor` boots the same
 # image as an Alissa Studio queue EXECUTOR (`alissa bridge start`) instead of the
 # review daemon — deployed as a SECOND service, never as a sidecar of the first.
@@ -27,10 +45,13 @@
 # Run: see docker/claude/README.md and ../../README.md.
 # =============================================================================
 
-# Base is pinned to python 3.12 (matches the repo's .python-version); Node 22 is
-# layered on via NodeSource. The daemon needs python >= 3.11; the alissa CLI and
-# claude-code need Node >= 18 — both satisfied.
-FROM python:3.12-slim-bookworm
+# The shared loopwork base image. It is PUBLIC on GHCR, so the pull is anonymous
+# and no registry credential is needed anywhere (Railway included).
+#
+# Pinned to an EXACT semver, never `:latest`: a base bump is a deliberate,
+# reviewable one-line change to this `FROM`, and that is the ONLY thing that
+# advances the shared infrastructure layers.
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
 
 # Version of the daemon to install from PyPI. Bump per release: 0.16.0 is the
 # release this repo publishes on merge (it must match the dist's version file,
@@ -41,128 +62,40 @@ FROM python:3.12-slim-bookworm
 # script the entrypoint starts. Naming the two apart keeps the next release a
 # one-line edit.
 ARG REVLOOP_VERSION=0.16.14
-# Node major version (must be >= 18 for the alissa CLI and claude-code).
-ARG NODE_MAJOR=22
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# --- System dependencies ------------------------------------------------------
-# git   : reviewers operate over git worktree hubs
-# tmux  : the alissa worker manages tmux (ali-*) sessions
-# gh     : the daemon shells out to `gh api` for the review queue
-# tini   : PID 1 init — reaps the tmux/node/claude child fan-out
-# gosu   : drop root -> alissa after the entrypoint fixes the volume mount
-# iptables/ipset : only used by the optional firewall init
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git tmux tini gosu \
-        iptables ipset procps jq less; \
-    # GitHub CLI apt repo
-    mkdir -p /etc/apt/keyrings; \
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
-    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list; \
-    # Node.js via NodeSource
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
-    apt-get install -y --no-install-recommends gh nodejs; \
-    rm -rf /var/lib/apt/lists/*
-
-# --- claude-code (the reviewer agent) ----------------------------------------
-RUN npm install -g @anthropic-ai/claude-code \
-    && npm cache clean --force
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.
 RUN pip install "alissa-tools-github-revloop==${REVLOOP_VERSION}"
 
-# --- Non-root runtime user ----------------------------------------------------
-# Agents run unattended with three live tokens, and claude refuses
-# --dangerously-skip-permissions as root, so the worker/daemon run as this user.
-# The container still STARTS as root (see the USER root before ENTRYPOINT): the
-# entrypoint fixes the /workspace mount ownership, then drops to `alissa` via
-# gosu. This is what makes a root-owned platform volume (e.g. Railway) writable.
-RUN useradd --create-home --shell /bin/bash --uid 1000 alissa \
-    && mkdir -p /workspace \
-    && chown alissa:alissa /workspace
-
-# --- git: force GitHub over HTTPS with the gh token (no SSH key in a container)
-# `alissa code workspace add` clones over SSH by default (git@github.com:…), and
-# the daemon's on_missing_hub:add path calls it WITHOUT --https — so there is no
-# flag to flip. Rewrite every GitHub SSH URL to HTTPS system-wide and wire gh in
-# as the credential helper (gh reads GH_TOKEN from the env). This makes the clone
-# authenticate for both the unprivileged daemon and any manual shell (root).
-# NB: --add on the second insteadOf — a plain `git config` replaces the single
-# value, so without it only the last rewrite survives (and git@github.com: is the
-# form the alissa CLI actually emits).
-RUN git config --system url."https://github.com/".insteadOf "git@github.com:" \
-    && git config --system --add url."https://github.com/".insteadOf "ssh://git@github.com/" \
-    && git config --system credential."https://github.com".helper "" \
-    && git config --system --add credential."https://github.com".helper "!gh auth git-credential"
-
 # --- Entrypoint + optional firewall ------------------------------------------
+# /usr/local/bin/entrypoint.sh is the fixed path the base's ENTRYPOINT (tini ->
+# this script) points at; the base ships a stub there that exits 1, and this
+# COPY is what replaces it with the real one. Nothing here re-declares
+# ENTRYPOINT — it is inherited.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY revloop-config.sh /usr/local/bin/revloop-config.sh
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/revloop-config.sh /usr/local/bin/init-firewall.sh
-
-USER alissa
-WORKDIR /home/alissa
-
-# The alissa CLI installer is npm-free: it drops a `node cli.mjs` launcher into
-# ~/.local/bin. Run it as the target user so it lands in the user's home.
-ENV PATH="/home/alissa/.local/bin:${PATH}"
-RUN curl -fsSL https://share.alissa.app/install | bash
 
 # Agent profile the worker uses to launch reviewers non-interactively. Without
 # this, worker-spawned claude sessions stop on the first-run trust/permission
 # prompt. Mount your own over this path at runtime to override.
 COPY --chown=alissa:alissa agents.yaml /home/alissa/.config/alissa/agents.yaml
 
-# --- claude first-run gates: pre-seed so the TUI starts READY, no human ------
-# A brand-new user hits claude's first-run dialogs (welcome/onboarding, theme
-# picker, and the one-time --dangerously-skip-permissions "bypass mode" warning)
-# and the worker hangs forever: "agent UI not ready — a first-run/trust dialog
-# needs a human". These are the exact keys the working host carries, split across
-# the two files claude reads:
-#   ~/.claude.json          — user state: onboarding completed, warnings seen
-#   ~/.claude/settings.json — settings: skip the bypass-mode prompt, theme, TUI
-# skipDangerousModePermissionPrompt is the key the public docs omit; it is what
-# lets `claude --dangerously-skip-permissions` come up without a keypress.
-# Auth is still required and stays in the env (CLAUDE_CODE_OAUTH_TOKEN preferred
-# — an interactive TUI would prompt to approve a bare ANTHROPIC_API_KEY).
-RUN mkdir -p /home/alissa/.claude \
-    && CLAUDE_VER="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" \
-    && printf '{\n  "hasCompletedOnboarding": true,\n  "hasSeenAutoModeEntryWarning": true,\n  "lastOnboardingVersion": "%s"\n}\n' "${CLAUDE_VER:-2.1.215}" \
-        > /home/alissa/.claude.json \
-    && printf '{\n  "skipDangerousModePermissionPrompt": true,\n  "theme": "dark",\n  "tui": "fullscreen"\n}\n' \
-        > /home/alissa/.claude/settings.json
-
 # A git identity so any git operation (e.g. the clone in hub-ify) has an author
 # and never drops into git's interactive "who are you" prompt. Reviewers are
 # read-only (CR6), so this is a safety default, not a committing identity.
-RUN git config --global user.name  "alissa-review-daemon" \
-    && git config --global user.email "support@alissa.app" \
-    && git config --global advice.detachedHead false
-
-# Workspace root that the daemon and reviewers operate over. Mount a manifest
-# here, or let the entrypoint generate one from the config below (see README).
-# These are fixed internal paths, not meant to be reconfigured.
 #
-# CLAUDE_CONFIG_DIR points claude's config — crucially its OAuth credential file
-# `.credentials.json` — at a folder ON the /workspace volume, so a one-time
-# `claude /login` survives restarts and auto-renews (a static CLAUDE_CODE_OAUTH_
-# TOKEN expires and 401s). If you relocate the volume, move this with it.
-ENV ALISSA_WORKSPACE_ROOT=/workspace \
-    TMUX_TMPDIR=/home/alissa/.tmux \
-    CLAUDE_CONFIG_DIR=/workspace/.claude-config
-RUN mkdir -p /home/alissa/.tmux
-WORKDIR /workspace
+# This is the one piece of user-level git config that is per-daemon, which is
+# why it stays in the leaf: the rewrites, the credential helper and
+# advice.detachedHead are all system-level in the base. `--global` writes
+# /home/alissa/.gitconfig, so it has to run AS that user; the base left the
+# image on USER root (for the leaf's pip/COPY layers and the entrypoint's
+# root-phase chown), so hop over and back.
+USER alissa
+RUN git config --global user.name  "alissa-review-daemon" \
+    && git config --global user.email "support@alissa.app"
+USER root
 
 # --- Build-time configuration (Railway-friendly) -----------------------------
 # Railway's Dockerfile builds only expose service variables that are declared as
@@ -172,7 +105,7 @@ WORKDIR /workspace
 # default, so both paths work.
 #
 # Kept LAST on purpose: changing any of these rebuilds only these tiny trailing
-# layers, never the apt/npm/pip layers above.
+# layers, never the pip/COPY layers above (and never the base image at all).
 #
 # NOT here (by design): GH_TOKEN, ALISSA_API_TOKEN, ANTHROPIC_API_KEY /
 # CLAUDE_CODE_OAUTH_TOKEN. Secrets baked via ARG leak into `docker history` and
@@ -188,7 +121,8 @@ WORKDIR /workspace
 #     (`${ALISSA_UI_ENABLED:-0}`), so no ARG default is needed. Kept runtime-only
 #     so it pairs with the passcode it is useless without.
 #   * ALISSA_UI_SECURE_COOKIE — TLS-posture flag read by the sidecar itself.
-# EXPOSE below documents the console port; the console is disabled by default.
+# The base's EXPOSE 8080 documents the console port (metadata only); the console
+# is disabled by default.
 #
 # AND deliberately not here (runtime-only): every bridge-executor knob —
 # CONTAINER_ROLE, ALISSA_BRIDGE_EXECUTOR, ALISSA_BRIDGE_EXECUTOR_ID,
@@ -355,20 +289,3 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_ENABLE_FIREWALL=${ALISSA_ENABLE_FIREWALL} \
     ALISSA_FIREWALL_EXTRA=${ALISSA_FIREWALL_EXTRA} \
     ALISSA_FORCE_CHOWN=${ALISSA_FORCE_CHOWN}
-
-# The reviewer console (alissa-revloop-ui) listens here when ALISSA_UI_ENABLED is
-# set. EXPOSE is documentation/metadata only — it opens no port by itself; the
-# entrypoint binds 0.0.0.0:${PORT:-8080}, and 8080 is the default the console
-# falls back to when the platform injects no PORT (the sidecar's own default,
-# 127.0.0.1:8788, is for a local run — the container always overrides both).
-# The console is DISABLED by default (opt-in) and fail-closed on
-# ALISSA_UI_PASSCODE. Liveness (a platform healthcheck path): GET /healthz.
-EXPOSE 8080
-
-# Start as root so the entrypoint can chown a root-owned volume mount; it drops
-# to `alissa` (via gosu) before running anything else. All the build steps above
-# ran as `alissa`, so the CLI, agents.yaml and git config are already in place.
-USER root
-
-# tini reaps the worker/tmux/claude child fan-out; entrypoint does the rest.
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
