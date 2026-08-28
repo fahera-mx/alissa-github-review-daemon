@@ -13,8 +13,36 @@ from .proc import CommandError, run, run_json
 
 log = logging.getLogger(__name__)
 
-# A review task is "open" while it can still receive a verdict.
-OPEN_STATUSES = {"committed", "in_progress", "pending_validation", "todo"}
+# The seven canonical Alissa task statuses -- `TaskStatusSchema` in the studio
+# repo (`packages/client/src/schemas/common.ts`). Mirrored here for the reason
+# the studio CLI mirrors it into `TASK_STATUSES` rather than importing it: what
+# this module needs is the SET of names, not the schema that validates them.
+#
+# It is the vocabulary the `--status` filter below is allowed to speak. CLI
+# 0.2.0 validates `--status` against exactly these seven client-side and exits 1
+# on anything else BEFORE issuing any request, so a single non-canonical value
+# does not narrow the call slightly less -- it costs the whole narrowed call.
+CANONICAL_TASK_STATUSES = frozenset(
+    {
+        "draft",
+        "committed",
+        "in_progress",
+        "blocked",
+        "pending_validation",
+        "validated",
+        "cancelled",
+    }
+)
+
+# A review task is "open" while it can still receive a verdict. Every member is
+# canonical, and a test pins that: a status Alissa cannot issue is dead weight
+# in `is_open` and poison in the `--status` filter derived from it.
+#
+# `todo` was such a member until 0.22.0 (issue #97). Alissa has never had that
+# status, so `is_open` could never match it -- but it was still reaching CLI
+# 0.2.0's `--status` validator, which rejects the call over it, which in turn
+# drops this process back to the unnarrowed whole-corpus list for good.
+OPEN_STATUSES = {"committed", "in_progress", "pending_validation"}
 
 # -- narrowing the `alissa task list` call (issue #87) ------------------------
 #
@@ -26,13 +54,48 @@ OPEN_STATUSES = {"committed", "in_progress", "pending_validation", "todo"}
 # not evidence, and this daemon turns a non-zero `alissa` exit into a SKIPPED
 # decision, so sending a flag the CLI does not have costs a review.
 
-# Statuses a LIVE review task can hold. Deliberately OPEN_STATUSES itself and
-# not a hand-written list: `is_review_task_for` already rejects every other
+# Statuses a LIVE review task can hold. Deliberately derived from OPEN_STATUSES
+# and not a hand-written list: `is_review_task_for` already rejects every other
 # status client-side, so filtering server-side on exactly this set cannot change
 # which task the daemon resolves -- it only stops shipping the rows over the
 # wire. Any status added to `is_open` is added here by construction.
+#
+# The canonical guard below does not weaken that invariant, and is deliberately
+# not an INTERSECTION with the canonical set, which would: an intersection makes
+# the filter a strict subset of the open set the moment the two disagree, so the
+# daemon would stop fetching rows `is_open` still accepts -- a skipped review,
+# reported as an empty corpus. The whole derivation is kept or nothing is sent.
+# Sending nothing degrades to the call the daemon has always made: wide, but
+# complete, which is the direction every other failure on this path degrades in.
 TASK_LIST_STATUS_FLAG = "--status"
-TASK_LIST_STATUS_FILTER = ",".join(sorted(OPEN_STATUSES))
+
+
+def _status_filter(statuses: "set[str] | frozenset[str]") -> str:
+    """The `--status` argument for `statuses`, or `""` when they cannot be one.
+
+    `""` means "do not narrow by status". It is returned for a set carrying any
+    non-canonical value, because such a value is not a filter the CLI serves
+    less precisely -- it is one the CLI refuses outright, taking the `--view`
+    and `--self` narrowing down with it and pinning this process to the
+    whole-corpus list (`list_tasks`). One wide call beats every call being wide.
+
+    Loud rather than silent: the condition is a code defect (a status added to
+    `OPEN_STATUSES` that Alissa cannot issue), and the tests pin against it, so
+    this is the last line rather than the first.
+    """
+    unknown = sorted(set(statuses) - CANONICAL_TASK_STATUSES)
+    if unknown:
+        log.warning(
+            "not narrowing `alissa task list` by status: %s not canonical "
+            "Alissa status(es) -- the CLI rejects the whole call over one "
+            "unknown value, so this daemon lists the corpus unnarrowed",
+            ", ".join(unknown),
+        )
+        return ""
+    return ",".join(sorted(statuses))
+
+
+TASK_LIST_STATUS_FILTER = _status_filter(OPEN_STATUSES)
 
 # `--self` drops the SPONSOR's corpus and keeps only the calling actor's rows.
 #
@@ -375,7 +438,10 @@ class Alissa:
         if self._task_list_narrowing_disabled:
             return argv
         flags = self.probe_task_list()
-        if flags.status and narrow_status:
+        # An empty filter is not a filter: `_status_filter` answers `""` when
+        # the open set carries a status the CLI would reject, and sending
+        # `--status ""` would be that same rejected call with an extra step.
+        if flags.status and narrow_status and TASK_LIST_STATUS_FILTER:
             argv += [TASK_LIST_STATUS_FLAG, TASK_LIST_STATUS_FILTER]
         if flags.self_scope and self._task_list_self_scope:
             argv.append(TASK_LIST_SELF_FLAG)

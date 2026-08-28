@@ -54,7 +54,7 @@ def test_review_task_ref_none_when_absent():
     class A:
         def list_tasks(self, *, narrow_status=True):
             assert narrow_status is False
-            return [Task(ref="TASK-1", title="Review PR other/repo#1", status="todo")]
+            return [Task(ref="TASK-1", title="Review PR other/repo#1", status="committed")]
 
     assert prreview._review_task_ref(A(), OWNER, REPO, NUMBER) is None
 
