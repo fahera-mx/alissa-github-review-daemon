@@ -144,3 +144,48 @@ def test_timeout_returns_two_when_no_new_review(wiring, monkeypatch):
     wiring["review_seq"] = [[]]  # snapshot sees 0, and it never increases
     rc = prreview.main(["--reviewer", REVIEWER, "--timeout", "120", "--poll-interval", "30"])
     assert rc == 2
+
+
+# -- the BOW scope reaches this call site too (issue #100) -------------------
+
+
+def test_the_discovery_listing_is_bow_scoped_from_the_environment(monkeypatch, wiring):
+    """`alissa-pr-review` runs in a task worktree: no revloop config file under
+    its cwd and no daemon argv to inherit, so the environment is the only
+    channel the id can arrive on -- and this is the call site issue #100's
+    acceptance criterion names alongside the poll."""
+    built: list = []
+    monkeypatch.setattr(
+        prreview, "Alissa", lambda *a, **kw: built.append(kw) or _StubAlissa(wiring)
+    )
+    monkeypatch.setenv("ALISSA_REVIEW_TASK_BOW", "  kt7c9m2q4x8n1v5b3z6w0y9r7s4d2f8g  ")
+
+    prreview.main(["--reviewer", REVIEWER, "--timeout", "0"])
+
+    assert built == [{"task_list_bow_id": "kt7c9m2q4x8n1v5b3z6w0y9r7s4d2f8g"}]
+
+
+def test_an_unset_variable_leaves_the_client_unscoped(monkeypatch, wiring):
+    built: list = []
+    monkeypatch.setattr(
+        prreview, "Alissa", lambda *a, **kw: built.append(kw) or _StubAlissa(wiring)
+    )
+    monkeypatch.delenv("ALISSA_REVIEW_TASK_BOW", raising=False)
+
+    prreview.main(["--reviewer", REVIEWER, "--timeout", "0"])
+
+    assert built == [{"task_list_bow_id": None}]
+
+
+class _StubAlissa:
+    """The `wiring` fixture's own fake, re-expressed as a class so the ctor
+    kwargs under test can be recorded before it is built."""
+
+    def __init__(self, state):
+        self._state = state
+
+    def list_tasks(self, *, narrow_status=True):
+        return self._state["tasks"]
+
+    def latest_verdict(self, ref):
+        return self._state["verdict"]

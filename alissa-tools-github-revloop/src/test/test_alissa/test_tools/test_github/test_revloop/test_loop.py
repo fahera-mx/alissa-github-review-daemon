@@ -31,6 +31,7 @@ from alissa.tools.github.revloop.config import (
 from alissa.tools.github.revloop.alissa import (
     VERDICT_APPROVE,
     VERDICT_REQUEST_CHANGES,
+    Alissa,
     ManagedSession,
     SessionRef,
     Task,
@@ -297,6 +298,9 @@ class FakeAlissa:
         self.task_unreadable = False
         # Tasks this actor owns besides the PR's review task; see `corpus`.
         self.others: list = []
+        # The BOW this client would scope its list to -- None, like a real
+        # client built from a config that names none (issue #100).
+        self.task_list_bow_id: "str | None" = None
 
     def list_tasks(self, *, narrow_status=True):
         self.list_calls += 1
@@ -1401,6 +1405,40 @@ def test_no_dry_run_overrides_a_dry_run_config(tmp_path, monkeypatch):
 
     assert resolve_config(cli("--no-dry-run")).dry_run is False
     assert resolve_config(cli()).dry_run is True
+
+
+def test_the_bow_id_walks_all_three_layers_through_the_real_entry_point(
+    tmp_path, monkeypatch
+):
+    """file < CLI < env, assembled the way the daemon actually assembles it.
+
+    `Config.build` is exercised directly in test_task_list; what this pins is
+    the wiring in between — the argparse dest, `overrides_from`, and the fact
+    that `resolve_config` reads the real environment. Dropping any one of them
+    leaves the key configurable in a unit test and dead on the command line.
+    """
+    import json
+
+    from alissa.tools.github.revloop.__main__ import resolve_config
+
+    (tmp_path / CONFIG_FILENAME).write_text(json.dumps({"task_list_bow_id": "from-file"}))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALISSA_REVIEW_TASK_BOW", raising=False)
+
+    assert resolve_config(cli()).task_list_bow_id == "from-file"
+    assert resolve_config(cli("--task-list-bow", "from-cli")).task_list_bow_id == "from-cli"
+
+    monkeypatch.setenv("ALISSA_REVIEW_TASK_BOW", "from-env")
+    assert resolve_config(cli("--task-list-bow", "from-cli")).task_list_bow_id == "from-env"
+
+
+def test_no_bow_anywhere_leaves_the_key_unset(tmp_path, monkeypatch):
+    from alissa.tools.github.revloop.__main__ import resolve_config
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ALISSA_REVIEW_TASK_BOW", raising=False)
+
+    assert resolve_config(cli()).task_list_bow_id is None
 
 
 def test_dry_run_flags_are_mutually_exclusive():
@@ -5589,6 +5627,41 @@ def test_preflight_is_quiet_once_the_credential_is_routed(config):
     gh.verify_identity = lambda: "alissa-app"
 
     assert not any("reviewer_token_env" in w_ for w_ in w.preflight())
+
+
+def test_the_polls_own_client_carries_the_configured_bow(config):
+    """The poll pass is one of the two call sites issue #100 names, and its
+    client is built by `ReviewWatcher.__init__` -- every other test in this file
+    injects a fake there, so nothing else would notice the config key going
+    unread. Unset stays unset, which is the byte-identical default."""
+    bow = "kt7c9m2q4x8n1v5b3z6w0y9r7s4d2f8g"
+    gh, st = FakeGitHub(make_pr(), []), State(config.state_db)
+
+    assert ReviewWatcher(config, github=gh, state=st).alissa.task_list_bow_id is None
+
+    scoped = ReviewWatcher(
+        dataclasses.replace(config, task_list_bow_id=bow), github=gh, state=st
+    ).alissa
+
+    assert isinstance(scoped, Alissa)
+    assert scoped.task_list_bow_id == bow
+
+
+def test_preflight_warns_when_a_configured_bow_cannot_be_served(config):
+    """A BOW the CLI cannot scope to is silent otherwise -- the flag is simply
+    not sent, and the operator's whole point in setting it goes unmet with no
+    signal at all. Read off the CLIENT, not the config, because the env layer
+    outranks both the file and the flag (issue #100)."""
+    w, gh, al = watcher(config, make_pr(), [])
+    gh.verify_identity = lambda: "alissa-app"
+
+    assert not any("--bow" in warning for warning in w.preflight()), "none configured"
+
+    al.task_list_bow_id = "kt7c9m2q4x8n1v5b3z6w0y9r7s4d2f8g"
+    assert any("--bow" in warning for warning in w.preflight()), "configured, unadvertised"
+
+    al.probe_task_list = lambda: TaskListFlags(bow=True)
+    assert not any("--bow" in warning for warning in w.preflight()), "configured and served"
 
 
 # -- round-1 findings: the head a native verdict is ABOUT --------------------

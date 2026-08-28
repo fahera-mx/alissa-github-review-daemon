@@ -6,6 +6,13 @@ Settings come from three layers, later winning over earlier:
 2. a JSON config file (see `resolve_config_path`)
 3. CLI arguments
 
+`task_list_bow_id` adds a fourth above them all — the environment
+(`ALISSA_REVIEW_TASK_BOW`, see `env_task_list_bow_id`). It is the only key that
+does, and the reason is that it is the only one a second entry point needs:
+`alissa-pr-review` builds its own `Alissa` client with no config file and no
+argv of the daemon's, so an id that lives only in the file or the flags reaches
+the poll loop and silently misses that call site.
+
 `workspace_root` is deliberately **not** a config key — it is a property of the
 running process, not of the settings. That lets one config file drive several
 daemons over different workspaces on the same machine, each pointed with
@@ -15,6 +22,7 @@ daemons over different workspaces on the same machine, each pointed with
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,8 +143,29 @@ CONFIG_KEYS = (
     "checks_spawn_wait_seconds",
     "review_task_miss_ttl_polls",
     "task_list_self_scope",
+    "task_list_bow_id",
     "dry_run",
 )
+
+# The environment variable carrying the review BOW id (issue #100). It outranks
+# both the config file and the CLI flag -- see the module docstring for why this
+# one key gets a layer the others do not.
+TASK_LIST_BOW_ENV = "ALISSA_REVIEW_TASK_BOW"
+
+
+def env_task_list_bow_id(environ: "Mapping[str, str] | None" = None) -> "str | None":
+    """The review BOW id from the environment, or None when it is not set.
+
+    `environ` is passed in rather than read from `os.environ` at every call site
+    so the precedence is a pure function the tests can drive (the same shape
+    `webui.auth.require_passcode` uses). None and empty are the SAME answer: an
+    exported-but-empty variable is how a container renders "unset", and reading
+    it as an id would send `--bow ""` -- a call the CLI would take and answer
+    with nobody's tasks.
+    """
+    raw = (os.environ if environ is None else environ).get(TASK_LIST_BOW_ENV)
+    return (raw or "").strip() or None
+
 
 MIN_POLL_INTERVAL = 10  # the search API allows 30 req/min
 
@@ -343,6 +372,19 @@ class Config:
     # when the installed CLI does not advertise the flag.
     task_list_self_scope: bool = False
 
+    # The Convex `_id` of the body of work review tasks are created into. Set it
+    # and `alissa task list` is scoped to that BOW's junction rows (`--bow`)
+    # instead of the operator's whole involvement index; leave it None -- the
+    # default -- and the call shape is exactly what it has always been.
+    #
+    # Off by default because a review task OUTSIDE the configured BOW is
+    # invisible to the daemon, which is a missed round rather than a slower one,
+    # and nothing creates review tasks into a BOW until the operator's review
+    # protocol says to. Ignored when the installed CLI does not advertise the
+    # flag. See alissa.TASK_LIST_BOW_FLAG, and the README for the two ways to
+    # get the id wrong (a repo's `autodev:` feed BOW; a `mirrorInstanceId`).
+    task_list_bow_id: str | None = None
+
     dry_run: bool = False
 
     def __post_init__(self) -> None:
@@ -395,9 +437,15 @@ class Config:
         workspace_root: Path,
         file_data: Mapping[str, Any] | None = None,
         overrides: Mapping[str, Any] | None = None,
+        environ: Mapping[str, str] | None = None,
     ) -> "Config":
         """Merge the layers and validate. `overrides` entries that are None mean
-        "not specified on the CLI" and fall through to the file / defaults."""
+        "not specified on the CLI" and fall through to the file / defaults.
+
+        `environ` is the fourth layer and applies to `task_list_bow_id` alone;
+        it wins over both of the others (see the module docstring). Defaults to
+        the real environment, so callers that do not care pass nothing.
+        """
         raw: dict[str, Any] = dict(file_data or {})
 
         if "workspace_root" in raw:
@@ -418,6 +466,31 @@ class Config:
         for key, value in (overrides or {}).items():
             if value is not None:
                 raw[key] = value
+
+        # Applied AFTER the CLI overrides, which is the whole of "file < CLI <
+        # env": the variable is how a container hands the daemon an id that no
+        # file on its volume and no argv in its unit carries, so it has to be
+        # able to say something the other two do not.
+        env_bow = env_task_list_bow_id(environ)
+        if env_bow is not None:
+            raw["task_list_bow_id"] = env_bow
+        bow_id = raw.get("task_list_bow_id")
+        if bow_id is not None and not isinstance(bow_id, str):
+            # Deliberately NOT the `int(...)`/`bool(...)` coercion the numeric
+            # keys around here use. Those coerce into a value the validation
+            # below them then checks; there is nothing downstream to check an
+            # id against, so `0` would coerce to a well-formed `--bow 0` that
+            # can never resolve -- landing the deployment in the empty-answer
+            # path instead of telling it anything. A misspelled KEY already
+            # fails loudly at load; a mistyped VALUE should too.
+            raise ValueError(
+                f"task_list_bow_id must be the review BOW's Convex _id as a "
+                f"string (or null for unset), got a {type(bow_id).__name__}"
+            )
+        # Normalised the same way the env layer is, so `""` from a config file
+        # or a flag means "unset" too rather than `--bow ""` -- a call the CLI
+        # takes and answers with nobody's tasks.
+        bow_id = (bow_id or "").strip() or None
 
         mode = raw.get("on_missing_review_task", ON_MISSING_SPAWN)
         if mode not in _MISSING_MODES:
@@ -580,6 +653,7 @@ class Config:
             checks_spawn_wait_seconds=spawn_wait,
             review_task_miss_ttl_polls=miss_ttl,
             task_list_self_scope=bool(raw.get("task_list_self_scope", False)),
+            task_list_bow_id=bow_id,
             dry_run=bool(raw.get("dry_run", False)),
         )
 

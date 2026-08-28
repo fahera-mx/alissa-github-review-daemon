@@ -35,6 +35,7 @@ import sys
 import time
 
 from .alissa import Alissa, VERDICT_APPROVE, VERDICT_REQUEST_CHANGES
+from .config import env_task_list_bow_id
 from .ghclient import GitHub
 from .proc import CommandError, run, run_json
 
@@ -145,7 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     gh = GitHub()
-    alissa = Alissa()
+    # The same BOW narrowing the daemon's poll uses (issue #100), from the one
+    # channel this command has: it runs in a task worktree, so there is no
+    # revloop config file under its cwd and no daemon argv to inherit. Unset ->
+    # the call shape this command has always made.
+    alissa = Alissa(task_list_bow_id=env_task_list_bow_id())
 
     try:
         # Identity guard: GitHub forbids requesting review from the PR author, so
