@@ -131,7 +131,7 @@ variable `ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why.
 | `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the *hold* and relies on the directive alone. **It also bounds the reviewer session's own in-round wait**: the same number is written into every directive as how long a session may wait for a running check before submitting, floored at 5 minutes so a `0` here cannot read as "do not wait at all" — see *Never approve a red head* |
 | `review_task_miss_ttl_polls` | `10` | how many polls a PR with **no** review task is taken on trust before the task corpus is searched for one again. Trades **latency** for reads: a review task created mid-window is picked up at the re-arm rather than the next poll. Floor `1` — there is no value that turns it off — see *Bounding the task-list read* |
 | `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
-| `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon — see *Bounding the task-list read* for the id's contract and the two ways to get it wrong |
+| `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon, which on the default `on_missing_review_task` means a round spawned *untethered from its task* — see *Bounding the task-list read* for the id's contract, the two ways to get it wrong, and what `--bow` does to the other narrowing flags |
 
 #### Who the loop serves
 
@@ -722,24 +722,62 @@ key still makes exactly the call the daemon always made:
   rows, which carry a denormalized status, so a non-matching row never costs a
   task-document read — and a BOW-scoped query's cache is invalidated only by
   writes *inside* that BOW, so the operator's unrelated task churn stops
-  re-billing every 30-second poll. It composes with the three above: the BOW
-  picks the set, they narrow within it.
+  re-billing every 30-second poll. It does **not** compose the way the other
+  three do — see below.
 
 A narrowed call that fails, or that answers with an *empty* corpus, is retried
 once unnarrowed and the narrowing is dropped for the rest of the process — both
 are how a CLI that advertises a flag its API does not serve would present, and
 either would otherwise read as "this actor has no review tasks".
 
+#### What `--bow` actually does to the other flags
+
+Measured against the installed CLI on **2026-08-28**, because the wire semantics
+are the CLI's and not this daemon's, and the docs previously asserted the
+convenient reading of them:
+
+- **It replaces the actor's corpus; it does not intersect it.** Across five real
+  bodies of work, *no* BOW-scoped answer was a subset of the plain 1335-row one,
+  and every row outside it was non-terminal. So a BOW-scoped list can surface
+  tasks the actor's own involvement index does not contain.
+- **`--self` is ignored under `--bow`.** `--bow X --self` returns exactly what
+  `--bow X` returns. A deployment running `task_list_self_scope` *and* a BOW gets
+  the body of work's whole membership, actor-owned or not — **wider** than
+  `--self`, never narrower.
+- **`--include-terminal` is ignored too.** A BOW holding 52 tasks, 17 of them
+  `validated`, answers 35 rows either way: the default non-terminal filter is
+  applied server-side, but the flag that lifts it is not.
+- **`--digest` / `--view` still applies** — it is a projection, not a filter.
+- **`--status` could not be probed**, because the installed CLI has none. On the
+  `--include-terminal` evidence, do not assume it composes.
+
+None of that is a correctness risk, which is why the flags are still sent: a
+filter the server ignores makes the answer *wider*, the daemon's own `is_open`
+predicate still runs client-side, and the argv is one the CLI accepts. It costs
+bytes, not reviews. Treat the list as a **dated snapshot rather than a
+contract** — this CLI has now grown flags twice without moving off version
+`0.1.0`.
+
 #### Naming the review BOW
 
 `task_list_bow_id` is opt-in per deployment, and the reason is sharper than the
 one behind `--self`: every other narrowing on this page trades **wire bytes**,
 while this one trades **visibility**. A review task that is not attached to the
-configured BOW is invisible to the daemon — not a slower round, a **missed**
-one. Nothing creates review tasks into a BOW until the operator's review protocol
-says to (upstream studio `TASK-703031741` gives `create_downstream_task` a
-create-time `bodyOfWorkId`), so a deployment that sets this key before that is
-true lists an empty corpus.
+configured BOW is invisible to the daemon — and what that costs depends on
+`on_missing_review_task`, so it is worth being exact:
+
+- `skip` — the PR is passed over: a genuinely **missed** round;
+- `spawn_anyway` (the **default**) and `warn_and_spawn` — the round is spawned
+  **untethered from its task**. The reviewer session has no task to hydrate and
+  nowhere to record its verdict envelope; the second mode at least logs loudly.
+
+Round *counting* survives either way — `completed` is derived from the PR's own
+review records, not from the task — so the CR9 cap still holds.
+
+Nothing creates review tasks into a BOW until the operator's review protocol says
+to (upstream studio `TASK-703031741` gives `create_downstream_task` a create-time
+`bodyOfWorkId`), so a deployment that sets this key before that is true lists an
+empty corpus.
 
 The id itself has a contract, and two ways to get it wrong:
 
@@ -751,9 +789,20 @@ The id itself has a contract, and two ways to get it wrong:
 
 Both mistakes present identically — an empty answer — and both are caught rather
 than believed: an empty *narrowed* corpus is never taken at face value, so the
-call is retried plain and the narrowing is dropped for the rest of the process.
-The daemon degrades to seeing every review task, not none. That is a safety net
-for a mistyped id, not a licence to guess one.
+call is retried plain and the daemon degrades to seeing every review task, not
+none. That is a safety net for a mistyped id, not a licence to guess one.
+
+**A BOW that is merely empty costs the BOW narrowing until the next restart, and
+that is deliberate.** A wrong id and a correct-but-empty BOW are indistinguishable
+— a swap has no smaller answer to compare against — so the first poll pass that
+gets an empty BOW answer drops `--bow` for the life of the process. The other
+three narrowings are **kept**: they filter the same corpus, so an empty answer
+from them really is anomalous, while for `--bow` it is a legitimate answer, and
+condemning them on that evidence would drop the whole optimization on precisely
+the state a rollout starts in. Holding the BOW instead would mean paying two list
+calls every pass, for ever, on a typo. So: set the key *after* the review
+protocol starts attaching tasks, and if you set it earlier, restart the daemon
+once the body of work is populated. The warning in the log says so at the time.
 
 Three layers set it, later winning over earlier: the config file, the
 `--task-list-bow` flag, and the environment variable `ALISSA_REVIEW_TASK_BOW`.

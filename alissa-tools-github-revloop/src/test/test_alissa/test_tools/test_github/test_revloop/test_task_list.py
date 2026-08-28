@@ -758,20 +758,58 @@ def test_a_bow_on_todays_cli_is_the_only_narrowing_it_can_send(cli):
     assert cli_0_2_0_task_list(argv) == {"bodyOfWorkId": BOW}
 
 
-def test_a_disproved_narrowing_drops_the_bow_with_everything_else(cli):
-    """A BOW that lists EMPTY is the shape a mistyped id takes -- and it is
-    caught by the machinery that was already there, because an empty narrowed
-    answer is never taken at face value. The retry is the plain call, so the
-    daemon degrades to seeing every review task rather than none."""
-    cli.help = HELP_LIVE_2026_08_28
-    narrowed = tuple(PLAIN + ["--bow", BOW])
+def test_an_empty_bow_is_retried_plain_and_drops_the_bow_alone(cli):
+    """A BOW that lists EMPTY is the shape a mistyped id takes -- and also the
+    shape a CORRECT id takes before anything is created into it. The two are
+    indistinguishable under a swap, so both are handled the same way: retry
+    plain (the pass still sees every review task) and stop sending `--bow`.
+
+    What must NOT happen is the other three narrowings going down with it. They
+    filter the same corpus, so an empty answer from them really is anomalous;
+    `--bow` replaces the corpus, so "the plain list found rows" says nothing
+    about it. Condemning them here would drop the whole optimization on exactly
+    the state a rollout starts in (PR #101 round 1).
+    """
+    cli.help = HELP_0_2_0
+    filters = ["--status", TASK_LIST_STATUS_FILTER, "--self", "--view", "digest"]
+    narrowed = tuple(PLAIN + ["--bow", BOW] + filters)
     cli.answers[narrowed] = []
-    client = Alissa(task_list_bow_id=BOW)
+    client = Alissa(task_list_self_scope=True, task_list_bow_id=BOW)
 
     assert [t.ref for t in client.list_tasks()] == ["TASK-500"]
-    assert cli.calls == [list(narrowed), PLAIN]
+    assert cli.calls == [list(narrowed), PLAIN], "one retry, unnarrowed"
 
-    assert client.task_list_argv() == PLAIN, "and the BOW is not sent again"
+    assert client.task_list_argv() == PLAIN + filters, (
+        "the BOW is dropped for the process and every other narrowing survives"
+    )
+    assert client.list_tasks() and cli.calls[-1] == PLAIN + filters
+
+
+def test_the_empty_bow_warning_names_both_causes_and_the_remedy(cli, caplog):
+    """The old message asserted the filter was broken, which for `--bow` is one
+    of two readings and not the likelier one during a rollout."""
+    cli.help = HELP_LIVE_2026_08_28
+    cli.answers[tuple(PLAIN + ["--bow", BOW])] = []
+
+    with caplog.at_level(logging.WARNING):
+        Alissa(task_list_bow_id=BOW).list_tasks()
+
+    assert "REPLACES" in caplog.text, "why the plain answer is not evidence"
+    assert "only the BOW is dropped" in caplog.text
+    assert "restart the daemon" in caplog.text, "the remedy once it is populated"
+
+
+def test_an_empty_answer_without_a_bow_still_disables_everything(cli):
+    """The pre-existing behaviour, unchanged: for flags that filter the actor's
+    own corpus, an empty answer IS evidence the call is broken."""
+    cli.help = HELP_0_2_0
+    narrowed = tuple(PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"])
+    cli.answers[narrowed] = []
+    client = Alissa()
+
+    assert [t.ref for t in client.list_tasks()] == ["TASK-500"]
+
+    assert client.task_list_argv() == PLAIN, "narrowing off wholesale, as before"
 
 
 # -- where the id comes from: file < CLI < env ------------------------------
@@ -823,6 +861,17 @@ def test_the_id_is_stripped_wherever_it_comes_from(tmp_path):
     assert env_task_list_bow_id({TASK_LIST_BOW_ENV: f"  {BOW}\n"}) == BOW
     assert Config.build(tmp_path, {"task_list_bow_id": f" {BOW} "}, {}, {}).task_list_bow_id == BOW
     assert Alissa(task_list_bow_id=f" {BOW} ").task_list_bow_id == BOW
+
+
+def test_a_non_string_id_is_refused_rather_than_coerced(tmp_path):
+    """`str(0)` would be a well-formed `--bow 0` that can never resolve, so the
+    deployment would land in the empty-answer path instead of being told. A
+    mistyped VALUE fails at load like a misspelled KEY does."""
+    for bad in (0, 1, False, True, ["a"], {"a": 1}):
+        with pytest.raises(ValueError, match="task_list_bow_id must be"):
+            Config.build(tmp_path, {"task_list_bow_id": bad}, {}, {})
+
+    assert Config.build(tmp_path, {"task_list_bow_id": None}, {}, {}).task_list_bow_id is None
 
 
 def test_an_unknown_config_key_is_still_refused(tmp_path):

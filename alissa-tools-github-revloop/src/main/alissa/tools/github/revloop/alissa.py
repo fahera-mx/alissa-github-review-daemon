@@ -133,12 +133,35 @@ TASK_LIST_DIGEST_VIEW = "digest"
 # invalidated only by writes INSIDE that BOW, so the operator's unrelated task
 # churn stops re-billing this daemon's 30-second poll.
 #
+# It really is a SWAP and not an intersection, and that was measured against the
+# installed CLI on 2026-08-28 rather than assumed (PR #101 round 1): across five
+# real BOWs, not one answer was a subset of the plain 1335-row one, and the rows
+# outside it were all non-terminal. Two consequences the composition story has to
+# respect, from the same probe:
+#
+#   * `--self` is IGNORED under `--bow`. `--bow X --self` returns exactly what
+#     `--bow X` returns, and that set is not a subset of the `--self` answer. So
+#     a BOW-scoped deployment gets the body of work's whole membership, actor-
+#     owned or not -- WIDER than `--self`, never narrower.
+#   * `--include-terminal` is ignored too (a BOW holding 52 tasks, 17 of them
+#     `validated`, answers 35 either way), so the default non-terminal filter is
+#     applied server-side but the flag that lifts it is not. `--status` could not
+#     be probed -- this CLI has none -- and on that evidence should not be
+#     assumed to compose either.
+#
+# None of that is a correctness risk, which is why the flags are still sent: a
+# filter the server ignores makes the answer WIDER, `is_open` still runs
+# client-side, and the argv is one the CLI accepts. It costs bytes, not reviews.
+# Treat the list above as a dated snapshot, not a contract: this CLI has grown
+# flags twice now without moving off version `0.1.0`.
+#
 # Opt-in per deployment for the same reason `--self` is, only sharper: a review
 # task that is not attached to the configured BOW is INVISIBLE to the daemon --
-# a missed review round, not a slower one -- and review tasks are only born into
+# and on the default `on_missing_review_task` that is not even a missed round but
+# a round spawned untethered from its task -- and review tasks are only born into
 # a BOW once the sessions that create them say so. A configured BOW that nothing
-# writes into lists empty, which `list_tasks` treats as a disproved narrowing
-# and retries plain; that is a safety net, not a licence to guess the id.
+# writes into lists empty; `list_tasks` retries plain and drops the BOW alone.
+# That is a safety net, not a licence to guess the id.
 TASK_LIST_BOW_FLAG = "--bow"
 
 
@@ -421,6 +444,13 @@ class Alissa:
         # wrongly is worse than a list that is large: `find_review_task` reads an
         # empty corpus as "this PR has no review task".
         self._task_list_narrowing_disabled = False
+        # Set when the BOW SPECIFICALLY has been disproved at runtime -- a
+        # BOW-scoped call that answered empty. Separate from the flag above
+        # because the evidence is different in kind: `--status`/`--self`/
+        # `--view` filter the same corpus, so an empty answer from them is
+        # anomalous, while `--bow` REPLACES the corpus and "this body of work
+        # holds nothing" is a legitimate answer (see `list_tasks`).
+        self._task_list_bow_disabled = False
         # One diagnostic per client for a status filter that could not be sent
         # (see `_warn_status_filter_dropped`); this path runs every poll pass.
         self._status_filter_warned = False
@@ -523,12 +553,13 @@ class Alissa:
             return argv
         flags = self.probe_task_list()
         # The BOW goes FIRST because it is the only one of these that chooses a
-        # candidate set rather than filtering one: `--status`/`--self`/`--view`
-        # then narrow WITHIN it, and reading the argv left to right is reading
-        # them in that order. Composition is the point -- they are independent
-        # server-side, so scoping to a BOW does not make the status filter or
-        # the digest projection redundant.
-        if flags.bow and self._task_list_bow_id:
+        # candidate set rather than filtering one, and reading the argv left to
+        # right is reading them in that order. The others are still sent: the
+        # projection (`--view digest`) genuinely applies within a BOW, and the
+        # ones the server ignores there cost bytes rather than reviews -- see
+        # TASK_LIST_BOW_FLAG for which is which, and for why that list is a
+        # dated snapshot rather than a contract.
+        if flags.bow and self._task_list_bow_id and not self._task_list_bow_disabled:
             argv += [TASK_LIST_BOW_FLAG, self._task_list_bow_id]
         # An empty filter is not a filter: `_status_filter` answers `""` when
         # the open set carries a status the CLI would reject, and sending
@@ -610,7 +641,34 @@ class Alissa:
             "empty corpus from a filter this API does not serve", " ".join(argv),
         )
         tasks = self._tasks_from(run_json(plain, timeout=90) or [])
-        if tasks:
+        if not tasks:
+            return tasks
+        if TASK_LIST_BOW_FLAG in argv:
+            # "The plain list found rows" proves nothing about a BOW-scoped
+            # call, because the two answers are not comparable: `--bow` swaps
+            # the candidate set rather than filtering the actor's, so its answer
+            # is not a subset of the plain one (measured 2026-08-28 -- see
+            # TASK_LIST_BOW_FLAG). Condemning the other three flags on this
+            # evidence would drop the whole optimization on the state the
+            # rollout STARTS in: a review BOW nothing has been created into yet.
+            #
+            # The BOW itself is still dropped for the process, and that is not a
+            # third option so much as the only tractable one: with a swap there
+            # is no way to tell a mistyped id from an empty-but-correct one, and
+            # holding the BOW would mean paying two list calls every pass, for
+            # ever, on a typo. Wide-but-complete, the direction everything on
+            # this path degrades in.
+            self._task_list_bow_disabled = True
+            log.warning(
+                "the BOW-scoped task list answered empty while the plain list "
+                "returned %d task(s) — that is not evidence the call is broken "
+                "(a BOW-scoped list REPLACES the actor's corpus), so only the "
+                "BOW is dropped for this process and the other narrowing "
+                "stands. Either the configured id is wrong, or nothing has been "
+                "created into that body of work yet; once it is populated, "
+                "restart the daemon to scope to it again", len(tasks),
+            )
+        else:
             self._task_list_narrowing_disabled = True
             log.warning(
                 "the plain task list returned %d task(s) — the narrowed call is "

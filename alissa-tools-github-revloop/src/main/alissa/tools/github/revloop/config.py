@@ -475,10 +475,22 @@ class Config:
         if env_bow is not None:
             raw["task_list_bow_id"] = env_bow
         bow_id = raw.get("task_list_bow_id")
+        if bow_id is not None and not isinstance(bow_id, str):
+            # Deliberately NOT the `int(...)`/`bool(...)` coercion the numeric
+            # keys around here use. Those coerce into a value the validation
+            # below them then checks; there is nothing downstream to check an
+            # id against, so `0` would coerce to a well-formed `--bow 0` that
+            # can never resolve -- landing the deployment in the empty-answer
+            # path instead of telling it anything. A misspelled KEY already
+            # fails loudly at load; a mistyped VALUE should too.
+            raise ValueError(
+                f"task_list_bow_id must be the review BOW's Convex _id as a "
+                f"string (or null for unset), got a {type(bow_id).__name__}"
+            )
         # Normalised the same way the env layer is, so `""` from a config file
         # or a flag means "unset" too rather than `--bow ""` -- a call the CLI
         # takes and answers with nobody's tasks.
-        bow_id = (str(bow_id).strip() or None) if bow_id is not None else None
+        bow_id = (bow_id or "").strip() or None
 
         mode = raw.get("on_missing_review_task", ON_MISSING_SPAWN)
         if mode not in _MISSING_MODES:
