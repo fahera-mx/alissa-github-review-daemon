@@ -1425,7 +1425,8 @@ class ReviewWatcher:
             config.reviewer_login, token_env=config.reviewer_token_env
         )
         self.alissa = alissa or Alissa(
-            task_list_self_scope=config.task_list_self_scope
+            task_list_self_scope=config.task_list_self_scope,
+            task_list_bow_id=config.task_list_bow_id,
         )
         self.state = state or State(config.state_db)
         # (repo, number, comment id) of every re-entry directive already
@@ -4062,6 +4063,15 @@ class ReviewWatcher:
                 "task_list_self_scope is set but the installed `alissa` CLI "
                 "does not advertise `task list --self` — the task list is not "
                 "actor-scoped; upgrade the CLI or drop the key"
+            )
+        # Read off the CLIENT, not the config: the env layer outranks both the
+        # file and the flag, so an operator who set only ALISSA_REVIEW_TASK_BOW
+        # would otherwise get no warning about the CLI that cannot serve it.
+        if self.alissa.task_list_bow_id and not self.alissa.probe_task_list().bow:
+            warnings.append(
+                "a review task BOW is configured but the installed `alissa` "
+                "CLI does not advertise `task list --bow` — the task list is "
+                "not BOW-scoped; upgrade the CLI or drop the key"
             )
 
         if not self.config.dry_run and not self.alissa.worker_running():

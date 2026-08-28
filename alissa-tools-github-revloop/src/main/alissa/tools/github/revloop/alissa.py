@@ -122,6 +122,25 @@ TASK_LIST_SELF_FLAG = "--self"
 TASK_LIST_VIEW_FLAG = "--view"
 TASK_LIST_DIGEST_VIEW = "digest"
 
+# `--bow` narrows the CANDIDATE SET rather than filtering the answer, and that
+# is the whole reason it is worth more than the flags above (issue #100).
+#
+# `--status` / `--self` / `--view` all start from the operator's involvement
+# index -- every non-terminal task they are party to -- and cut it down. A BOW
+# scope starts from that body of work's junction rows instead, which carry a
+# denormalized status, so a row that does not match never costs a task-document
+# read at all. The cache story is the same shape: a BOW-scoped query is
+# invalidated only by writes INSIDE that BOW, so the operator's unrelated task
+# churn stops re-billing this daemon's 30-second poll.
+#
+# Opt-in per deployment for the same reason `--self` is, only sharper: a review
+# task that is not attached to the configured BOW is INVISIBLE to the daemon --
+# a missed review round, not a slower one -- and review tasks are only born into
+# a BOW once the sessions that create them say so. A configured BOW that nothing
+# writes into lists empty, which `list_tasks` treats as a disproved narrowing
+# and retries plain; that is a safety net, not a licence to guess the id.
+TASK_LIST_BOW_FLAG = "--bow"
+
 
 @dataclass(frozen=True)
 class TaskListFlags:
@@ -135,6 +154,7 @@ class TaskListFlags:
     status: bool = False
     self_scope: bool = False
     digest: bool = False
+    bow: bool = False
 
 
 # How deeply an OPTION may be indented in a commander help listing. Commander
@@ -370,7 +390,12 @@ class TaskDetail:
 
 
 class Alissa:
-    def __init__(self, *, task_list_self_scope: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        task_list_self_scope: bool = False,
+        task_list_bow_id: "str | None" = None,
+    ) -> None:
         """`task_list_self_scope` opts the list call into `--self`.
 
         Default OFF, and that default is evidence, not caution -- see
@@ -378,8 +403,15 @@ class Alissa:
         of a DEPLOYMENT (who creates its review tasks), not of this code, and an
         operator who knows their review tasks are all actor-owned should be able
         to say so.
+
+        `task_list_bow_id` opts the list call into `--bow <id>` (issue #100).
+        Unset -- the default -- is today's call shape, unconditionally. It is
+        the id ALREADY RESOLVED through the config layers (file < CLI < env);
+        this class does not read the environment, so the one place that decides
+        what the id is stays `config.env_task_list_bow_id`.
         """
         self._task_list_self_scope = bool(task_list_self_scope)
+        self._task_list_bow_id = (task_list_bow_id or "").strip() or None
         # The probe's answer, memoized for the process; None = not probed yet.
         # A probe that FAILS is deliberately not memoized (see probe_task_list).
         self._task_list_flags: "TaskListFlags | None" = None
@@ -392,6 +424,16 @@ class Alissa:
         # One diagnostic per client for a status filter that could not be sent
         # (see `_warn_status_filter_dropped`); this path runs every poll pass.
         self._status_filter_warned = False
+
+    @property
+    def task_list_bow_id(self) -> "str | None":
+        """The BOW this client scopes its task list to, or None.
+
+        Read by the boot preflight, which must warn on the id this CLIENT holds
+        rather than on the one the config file happens to carry -- the env layer
+        wins over both file and CLI, so those two can disagree.
+        """
+        return self._task_list_bow_id
 
     # -- the `alissa task list` narrowing probe -----------------------------
 
@@ -433,6 +475,7 @@ class Alissa:
             status=_advertises(helptext, TASK_LIST_STATUS_FLAG),
             self_scope=_advertises(helptext, TASK_LIST_SELF_FLAG),
             digest=_advertises(helptext, TASK_LIST_VIEW_FLAG),
+            bow=_advertises(helptext, TASK_LIST_BOW_FLAG),
         )
         self._task_list_flags = flags
         return flags
@@ -479,6 +522,14 @@ class Alissa:
         if self._task_list_narrowing_disabled:
             return argv
         flags = self.probe_task_list()
+        # The BOW goes FIRST because it is the only one of these that chooses a
+        # candidate set rather than filtering one: `--status`/`--self`/`--view`
+        # then narrow WITHIN it, and reading the argv left to right is reading
+        # them in that order. Composition is the point -- they are independent
+        # server-side, so scoping to a BOW does not make the status filter or
+        # the digest projection redundant.
+        if flags.bow and self._task_list_bow_id:
+            argv += [TASK_LIST_BOW_FLAG, self._task_list_bow_id]
         # An empty filter is not a filter: `_status_filter` answers `""` when
         # the open set carries a status the CLI would reject, and sending
         # `--status ""` would be that same rejected call with an extra step.
@@ -502,8 +553,9 @@ class Alissa:
         filtering. Newer CLIs offer more, so the call is now assembled from a
         boot-time probe of the installed CLI's help (`task_list_argv`): a status
         filter covering exactly the statuses a live review task can hold, a lean
-        `--view digest`, and `--self` when the deployment says its review tasks
-        are actor-owned. None of it is required; an absent flag is simply not
+        `--view digest`, `--self` when the deployment says its review tasks are
+        actor-owned, and `--bow <id>` when it has named the body of work they
+        are created into. None of it is required; an absent flag is simply not
         sent.
 
         Narrowing is still the SECOND line of defence, not the first. Even a

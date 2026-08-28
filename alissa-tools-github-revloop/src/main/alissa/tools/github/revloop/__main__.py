@@ -14,6 +14,7 @@ from .config import (
     ON_MISSING_CREATE,
     ON_MISSING_SKIP,
     ON_MISSING_SPAWN,
+    TASK_LIST_BOW_ENV,
     Config,
     load_config_file,
     resolve_config_path,
@@ -181,6 +182,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="list the sponsor-union corpus even if the config narrows it",
     )
 
+    over.add_argument(
+        "--task-list-bow",
+        dest="task_list_bow_id",
+        metavar="BOW_ID",
+        help="scope `alissa task list` to one body of work (--bow): the Convex "
+        "_id of the BOW review tasks are created into, NOT a repo's `autodev:` "
+        "feed BOW and not a mirrorInstanceId. A review task outside it is "
+        f"invisible to this daemon. Overridden by ${TASK_LIST_BOW_ENV}",
+    )
+
     dry = over.add_mutually_exclusive_group()
     dry.add_argument(
         "--dry-run",
@@ -221,6 +232,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "checks_spawn_wait_seconds": args.checks_spawn_wait_seconds,
         "review_task_miss_ttl_polls": args.review_task_miss_ttl_polls,
         "task_list_self_scope": args.task_list_self_scope,
+        "task_list_bow_id": args.task_list_bow_id,
         "dry_run": args.dry_run,
     }
 

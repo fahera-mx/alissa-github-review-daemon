@@ -106,6 +106,8 @@ alissa-revloop --workspace-root ~/ws/beta  --repo org/beta-web &
 Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
 the flag wins. `--repo` is repeatable and *replaces* the config list rather than
 extending it. `--dry-run` / `--no-dry-run` override the config in both directions.
+One key — `task_list_bow_id` — has a third layer above both, the environment
+variable `ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why.
 
 | key / flag | default | meaning |
 | --- | --- | --- |
@@ -129,6 +131,7 @@ extending it. `--dry-run` / `--no-dry-run` override the config in both direction
 | `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the *hold* and relies on the directive alone. **It also bounds the reviewer session's own in-round wait**: the same number is written into every directive as how long a session may wait for a running check before submitting, floored at 5 minutes so a `0` here cannot read as "do not wait at all" — see *Never approve a red head* |
 | `review_task_miss_ttl_polls` | `10` | how many polls a PR with **no** review task is taken on trust before the task corpus is searched for one again. Trades **latency** for reads: a review task created mid-window is picked up at the re-arm rather than the next poll. Floor `1` — there is no value that turns it off — see *Bounding the task-list read* |
 | `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
+| `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon — see *Bounding the task-list read* for the id's contract and the two ways to get it wrong |
 
 #### Who the loop serves
 
@@ -685,9 +688,13 @@ What that trades is latency, not correctness:
 The **narrowing** is probe-gated. At boot the daemon reads `alissa task list
 --help` and sends only what that output advertises as an option — an issue's (or
 a docs page's) claim about a flag is not evidence, and a non-zero `alissa` exit
-becomes a skipped review, not a slower one. Of the three narrowings below,
-today's CLI (0.1.0) offers only `--self`, so the call the daemon makes is the
-same one it always made:
+becomes a skipped review, not a slower one. Of the four narrowings below, the
+CLI installed on 2026-08-28 offers `--self` and `--bow` — and still reports
+itself as version `0.1.0`, the same string it reported on 08-16 when it offered
+neither `--bow` nor `--digest`. So `alissa --version` is not a capability signal
+for this CLI, and the help output is re-read rather than remembered. Both of the
+flags it does offer are opt-in per deployment, so a deployment that sets neither
+key still makes exactly the call the daemon always made:
 
 - **status filter** — sent as exactly the daemon's own open-status set, so it
   cannot change which task resolves; adopted automatically when the CLI grows a
@@ -709,11 +716,52 @@ same one it always made:
   by the agent actor whose sessions write the rest. A review task the list cannot
   see is a round the daemon cannot count. Turn it on only where every review task
   is created by this daemon's own reviewer sessions.
+- **`--bow <id>`** — off unless `task_list_bow_id` names a body of work. The only
+  one of the four that changes the **candidate set** rather than filtering it, and
+  the only one worth more than bytes: candidates come from that BOW's junction
+  rows, which carry a denormalized status, so a non-matching row never costs a
+  task-document read — and a BOW-scoped query's cache is invalidated only by
+  writes *inside* that BOW, so the operator's unrelated task churn stops
+  re-billing every 30-second poll. It composes with the three above: the BOW
+  picks the set, they narrow within it.
 
 A narrowed call that fails, or that answers with an *empty* corpus, is retried
 once unnarrowed and the narrowing is dropped for the rest of the process — both
 are how a CLI that advertises a flag its API does not serve would present, and
 either would otherwise read as "this actor has no review tasks".
+
+#### Naming the review BOW
+
+`task_list_bow_id` is opt-in per deployment, and the reason is sharper than the
+one behind `--self`: every other narrowing on this page trades **wire bytes**,
+while this one trades **visibility**. A review task that is not attached to the
+configured BOW is invisible to the daemon — not a slower round, a **missed**
+one. Nothing creates review tasks into a BOW until the operator's review protocol
+says to (upstream studio `TASK-703031741` gives `create_downstream_task` a
+create-time `bodyOfWorkId`), so a deployment that sets this key before that is
+true lists an empty corpus.
+
+The id itself has a contract, and two ways to get it wrong:
+
+- it must be the **Convex `_id`** of the BOW review tasks are created into. A
+  BOW's `_id` is **not** its `mirrorInstanceId`, and passing the latter is a
+  well-formed id that resolves to nothing;
+- it must **not** be a repo's `autodev:` feed BOW. That one carries the *issue*
+  feed, not this daemon's review tasks, so it lists rows and still finds none.
+
+Both mistakes present identically — an empty answer — and both are caught rather
+than believed: an empty *narrowed* corpus is never taken at face value, so the
+call is retried plain and the narrowing is dropped for the rest of the process.
+The daemon degrades to seeing every review task, not none. That is a safety net
+for a mistyped id, not a licence to guess one.
+
+Three layers set it, later winning over earlier: the config file, the
+`--task-list-bow` flag, and the environment variable `ALISSA_REVIEW_TASK_BOW`.
+It is the only key with that third layer, and the reason is `alissa-pr-review`:
+the implementer-side driver lists tasks too, and it runs in a task worktree with
+neither the daemon's config file nor its argv, so the variable is the only
+channel that reaches both call sites. An **empty** variable means unset — it does
+not blank an id the file or the flag already set.
 
 ### Poll snapshots (console exhaust)
 

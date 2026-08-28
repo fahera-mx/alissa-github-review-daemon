@@ -33,6 +33,11 @@ from alissa.tools.github.revloop.alissa import (
     TaskListFlags,
     _status_filter,
 )
+from alissa.tools.github.revloop.config import (
+    TASK_LIST_BOW_ENV,
+    Config,
+    env_task_list_bow_id,
+)
 from alissa.tools.github.revloop.proc import CommandError
 
 PLAIN = ["alissa", "task", "list", "--json"]
@@ -66,6 +71,34 @@ Options:
   --json              Output raw JSON
   --include-terminal  Also list validated and cancelled tasks
   -h, --help          display help for command
+"""
+
+# The help of the CLI installed TODAY, captured verbatim on 2026-08-28 -- still
+# self-reporting version 0.1.0, and carrying three options the 2026-08-16
+# capture above does not: `--digest`, `--project` and `--bow`.
+#
+# It is here because it is the evidence for issue #100. `--bow` is a flag the
+# fleet's own `alissa` actually offers, so the probe gate has a real listing to
+# answer against rather than an invented one -- and it doubles as the standing
+# proof that `alissa --version` is not a capability signal for this CLI: the
+# flag set moved and the version string did not.
+HELP_LIVE_2026_08_28 = """Usage: alissa task list [options]
+
+List the actionable tasks owned by your actor (validated/cancelled hidden)
+
+Options:
+  --json                 Output raw JSON
+  --include-terminal     Also list validated and cancelled tasks
+  --self                 Only your own actor's rows — skip the sponsor's corpus
+                         (agent tokens). Pair with --include-shared
+  --include-shared       Also list tasks shared with you
+                         (contributor/reviewer/observer)
+  --digest               Ask for the digest row shape: id, number, title,
+                         status, priority, updatedAt
+  --project <projectId>  Only tasks in this project's bodies of work (Convex
+                         project id)
+  --bow <bowId>          Only tasks in this body of work (Convex BOW id)
+  -h, --help             display help for command
 """
 
 # The help of CLI 0.2.0 -- the version that ships the two flags this daemon has
@@ -246,12 +279,28 @@ def cli(monkeypatch):
 # -- the probe -------------------------------------------------------------
 
 
-def test_todays_cli_advertises_only_self(cli):
+def test_the_2026_08_16_cli_advertised_only_self(cli):
     """The measured baseline. Anything else the daemon can ask for is absent
     from this CLI, so the probe must say so rather than assume."""
     flags = Alissa().probe_task_list()
 
-    assert flags == TaskListFlags(status=False, self_scope=True, digest=False)
+    assert flags == TaskListFlags(status=False, self_scope=True, digest=False, bow=False)
+
+
+def test_todays_cli_advertises_self_and_bow(cli):
+    """And what the SAME self-reported version offers twelve days later.
+
+    `--bow` is found; `--status` and `--view` still are not (the live listing
+    ships a boolean `--digest`, which is a different option and deliberately not
+    what the probe looks for). `--project` is advertised too and stays unread --
+    the daemon has no project to scope to, and probing for a flag it would never
+    send is how a probe grows answers nothing consumes.
+    """
+    cli.help = HELP_LIVE_2026_08_28
+
+    flags = Alissa().probe_task_list()
+
+    assert flags == TaskListFlags(status=False, self_scope=True, digest=False, bow=True)
 
 
 def test_an_older_cli_advertises_nothing(cli):
@@ -264,7 +313,7 @@ def test_cli_0_2_0_advertises_everything_the_daemon_asks_for(cli):
     cli.help = HELP_0_2_0
 
     assert Alissa().probe_task_list() == TaskListFlags(
-        status=True, self_scope=True, digest=True
+        status=True, self_scope=True, digest=True, bow=True
     )
 
 
@@ -631,3 +680,153 @@ def test_a_genuinely_empty_corpus_costs_one_extra_list_and_keeps_narrowing(cli):
         "cross-check costs one extra EMPTY list each pass, which is the price "
         "of never mistaking a broken filter for an empty corpus"
     )
+
+
+# -- the BOW scope (issue #100) ---------------------------------------------
+#
+# The one narrowing that chooses a candidate set instead of filtering one, and
+# so the one whose failure mode is a review the daemon never sees rather than a
+# list that is merely large. Everything below is about the two gates in front of
+# it -- the CLI advertises `--bow`, AND the deployment named a BOW -- and about
+# it composing with, rather than replacing, the flags that were already there.
+
+BOW = "kt7c9m2q4x8n1v5b3z6w0y9r7s4d2f8g"
+
+
+def test_a_bow_needs_both_the_flag_and_a_configured_id(cli):
+    """Neither gate alone. An id on a CLI without `--bow` is an argv the CLI
+    exits 1 on -- which this daemon turns into a SKIPPED decision -- and a CLI
+    with `--bow` and no id has nothing to scope to."""
+    cli.help = HELP_LIVE_2026_08_28
+    assert Alissa().task_list_argv() == PLAIN, "advertised, but no id configured"
+    assert Alissa(task_list_bow_id=BOW).task_list_argv() == PLAIN + ["--bow", BOW]
+
+    cli.help = HELP_0_1_0
+    assert Alissa(task_list_bow_id=BOW).task_list_argv() == PLAIN, "id set, flag absent"
+
+
+def test_an_unset_bow_leaves_todays_call_byte_identical(cli):
+    """The acceptance criterion the whole opt-in exists to protect: a deployment
+    that says nothing gets the argv it got before this key existed, on every CLI
+    -- including the one that would happily serve the flag."""
+    for helptext, expected in (
+        (HELP_OLD, PLAIN),
+        (HELP_0_1_0, PLAIN),
+        (HELP_LIVE_2026_08_28, PLAIN),
+        (HELP_0_2_0, PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"]),
+    ):
+        cli.help = helptext
+        for unset in (None, "", "   "):
+            assert Alissa(task_list_bow_id=unset).task_list_argv() == expected, helptext
+
+
+def test_the_bow_composes_with_every_other_narrowing_and_is_accepted(cli):
+    """The maximally-narrowed call: BOW first because it picks the candidate
+    set, then the filters that narrow within it. Put through the CLI's own parse
+    so the claim is 'a call 0.2.0 takes', not 'the argv we meant to build'."""
+    cli.help = HELP_0_2_0
+    client = Alissa(task_list_self_scope=True, task_list_bow_id=BOW)
+
+    argv = client.task_list_argv()
+
+    assert argv == PLAIN + [
+        "--bow", BOW,
+        "--status", "committed,in_progress,pending_validation",
+        "--self", "--view", "digest",
+    ]
+    assert cli_0_2_0_task_list(argv) == {
+        "bodyOfWorkId": BOW,
+        "scope": "self",
+        "view": "digest",
+        "status": ["committed", "in_progress", "pending_validation"],
+    }
+    assert cli_0_2_0_task_list(client.task_list_argv(narrow_status=False)) == {
+        "bodyOfWorkId": BOW,
+        "scope": "self",
+        "view": "digest",
+    }, "and `alissa-pr-review`'s shape keeps the BOW, dropping only the status filter"
+
+
+def test_a_bow_on_todays_cli_is_the_only_narrowing_it_can_send(cli):
+    """What the fleet would actually emit if the key were set right now: today's
+    CLI offers `--self` and `--bow` and neither of the other two."""
+    cli.help = HELP_LIVE_2026_08_28
+
+    argv = Alissa(task_list_bow_id=BOW).task_list_argv()
+
+    assert argv == PLAIN + ["--bow", BOW]
+    assert cli_0_2_0_task_list(argv) == {"bodyOfWorkId": BOW}
+
+
+def test_a_disproved_narrowing_drops_the_bow_with_everything_else(cli):
+    """A BOW that lists EMPTY is the shape a mistyped id takes -- and it is
+    caught by the machinery that was already there, because an empty narrowed
+    answer is never taken at face value. The retry is the plain call, so the
+    daemon degrades to seeing every review task rather than none."""
+    cli.help = HELP_LIVE_2026_08_28
+    narrowed = tuple(PLAIN + ["--bow", BOW])
+    cli.answers[narrowed] = []
+    client = Alissa(task_list_bow_id=BOW)
+
+    assert [t.ref for t in client.list_tasks()] == ["TASK-500"]
+    assert cli.calls == [list(narrowed), PLAIN]
+
+    assert client.task_list_argv() == PLAIN, "and the BOW is not sent again"
+
+
+# -- where the id comes from: file < CLI < env ------------------------------
+
+
+def test_the_bow_id_defaults_to_unset(tmp_path):
+    assert Config.build(tmp_path, {}, {}, {}).task_list_bow_id is None
+    assert Config.build(tmp_path, environ={}).task_list_bow_id is None
+
+
+def test_a_cli_flag_beats_the_config_file(tmp_path):
+    cfg = Config.build(tmp_path, {"task_list_bow_id": "from-file"}, {}, {})
+    assert cfg.task_list_bow_id == "from-file"
+
+    cfg = Config.build(
+        tmp_path, {"task_list_bow_id": "from-file"}, {"task_list_bow_id": BOW}, {}
+    )
+    assert cfg.task_list_bow_id == BOW
+
+
+def test_the_environment_beats_both(tmp_path):
+    """The layer this key has and the others do not. It is what reaches
+    `alissa-pr-review`, which has neither of the other two."""
+    cfg = Config.build(
+        tmp_path,
+        {"task_list_bow_id": "from-file"},
+        {"task_list_bow_id": "from-cli"},
+        {TASK_LIST_BOW_ENV: BOW},
+    )
+
+    assert cfg.task_list_bow_id == BOW
+
+
+def test_an_empty_value_means_unset_in_every_layer(tmp_path):
+    """`--bow ""` is a call the CLI takes and answers with nobody's tasks, and
+    an exported-but-empty variable is how a container spells "not configured"."""
+    assert env_task_list_bow_id({TASK_LIST_BOW_ENV: ""}) is None
+    assert env_task_list_bow_id({TASK_LIST_BOW_ENV: "  "}) is None
+    assert env_task_list_bow_id({}) is None
+
+    assert Config.build(tmp_path, {"task_list_bow_id": "  "}, {}, {}).task_list_bow_id is None
+    cfg = Config.build(
+        tmp_path, {"task_list_bow_id": BOW}, {}, {TASK_LIST_BOW_ENV: "  "}
+    )
+    assert cfg.task_list_bow_id == BOW, "an empty variable does not blank a configured id"
+
+
+def test_the_id_is_stripped_wherever_it_comes_from(tmp_path):
+    assert env_task_list_bow_id({TASK_LIST_BOW_ENV: f"  {BOW}\n"}) == BOW
+    assert Config.build(tmp_path, {"task_list_bow_id": f" {BOW} "}, {}, {}).task_list_bow_id == BOW
+    assert Alissa(task_list_bow_id=f" {BOW} ").task_list_bow_id == BOW
+
+
+def test_an_unknown_config_key_is_still_refused(tmp_path):
+    """The new key is in CONFIG_KEYS, so its near-misses are not."""
+    Config.build(tmp_path, {"task_list_bow_id": BOW}, {}, {})
+    with pytest.raises(ValueError, match="unknown config key"):
+        Config.build(tmp_path, {"task_list_bow": BOW}, {}, {})
