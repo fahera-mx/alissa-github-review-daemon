@@ -22,6 +22,12 @@ log = logging.getLogger(__name__)
 # 0.2.0 validates `--status` against exactly these seven client-side and exits 1
 # on anything else BEFORE issuing any request, so a single non-canonical value
 # does not narrow the call slightly less -- it costs the whole narrowed call.
+#
+# A status Alissa adds lands HERE first: a name added to `OPEN_STATUSES` alone
+# reads as non-canonical and drops the narrowing for the whole fleet. That is
+# the safe direction -- wide, never a wrong task resolved -- and the canonical
+# test fails on it, but it fails naming `OPEN_STATUSES`, which is the constant
+# that is right; this is the one that is stale (PR #98 round 1).
 CANONICAL_TASK_STATUSES = frozenset(
     {
         "draft",
@@ -79,23 +85,23 @@ def _status_filter(statuses: "set[str] | frozenset[str]") -> str:
     and `--self` narrowing down with it and pinning this process to the
     whole-corpus list (`list_tasks`). One wide call beats every call being wide.
 
-    Loud rather than silent: the condition is a code defect (a status added to
-    `OPEN_STATUSES` that Alissa cannot issue), and the tests pin against it, so
-    this is the last line rather than the first.
+    Pure on purpose. The condition is a code defect and deserves saying out
+    loud, but not from here: this runs at IMPORT, which is the one moment the
+    daemon's logging is not configured yet (see
+    `Alissa._warn_status_filter_dropped`). The tests are what pin the condition;
+    the runtime warning is the second line, and it is emitted where it can both
+    be formatted and be true.
     """
-    unknown = sorted(set(statuses) - CANONICAL_TASK_STATUSES)
-    if unknown:
-        log.warning(
-            "not narrowing `alissa task list` by status: %s not canonical "
-            "Alissa status(es) -- the CLI rejects the whole call over one "
-            "unknown value, so this daemon lists the corpus unnarrowed",
-            ", ".join(unknown),
-        )
+    if set(statuses) - CANONICAL_TASK_STATUSES:
         return ""
     return ",".join(sorted(statuses))
 
 
 TASK_LIST_STATUS_FILTER = _status_filter(OPEN_STATUSES)
+
+# Why the filter above is empty, when it is -- kept for the diagnostic, which
+# cannot be emitted from module scope. Empty in the healthy case.
+NON_CANONICAL_OPEN_STATUSES = tuple(sorted(OPEN_STATUSES - CANONICAL_TASK_STATUSES))
 
 # `--self` drops the SPONSOR's corpus and keeps only the calling actor's rows.
 #
@@ -383,6 +389,9 @@ class Alissa:
         # wrongly is worse than a list that is large: `find_review_task` reads an
         # empty corpus as "this PR has no review task".
         self._task_list_narrowing_disabled = False
+        # One diagnostic per client for a status filter that could not be sent
+        # (see `_warn_status_filter_dropped`); this path runs every poll pass.
+        self._status_filter_warned = False
 
     # -- the `alissa task list` narrowing probe -----------------------------
 
@@ -428,6 +437,38 @@ class Alissa:
         self._task_list_flags = flags
         return flags
 
+    def _warn_status_filter_dropped(self) -> None:
+        """Say, once, that a status narrowing this CLI offers is going unused.
+
+        Not emitted where the filter is COMPUTED, which is import time, and that
+        is the whole point of it living here (PR #98 round 1): `__main__` pulls
+        this module in through `.loop` long before it calls
+        `logging.basicConfig`, so a warning at module scope falls through to
+        `logging.lastResort` -- bare on stderr, no timestamp or logger name, and
+        outside whatever handler the deployment configured.
+
+        It would also be premature there. At import nothing yet knows whether
+        this CLI serves `--status` at all, and on a CLI that does not, the
+        filter costs nothing and there is nothing to warn about. Here the
+        message is only emitted when the flag was on offer and could not be
+        used, which is the only case where the defect actually costs reads.
+        """
+        if self._status_filter_warned:
+            return
+        self._status_filter_warned = True
+        reason = (
+            "non-canonical status(es) in OPEN_STATUSES: "
+            + ", ".join(NON_CANONICAL_OPEN_STATUSES)
+            if NON_CANONICAL_OPEN_STATUSES
+            else "OPEN_STATUSES is empty"
+        )
+        log.warning(
+            "`alissa task list` offers --status and this daemon is not using "
+            "it (%s) -- the CLI rejects the whole call over one unknown value, "
+            "so the corpus is listed unnarrowed",
+            reason,
+        )
+
     def task_list_argv(self, *, narrow_status: bool = True) -> list[str]:
         """The narrowest `alissa task list` this CLI actually supports.
 
@@ -441,8 +482,11 @@ class Alissa:
         # An empty filter is not a filter: `_status_filter` answers `""` when
         # the open set carries a status the CLI would reject, and sending
         # `--status ""` would be that same rejected call with an extra step.
-        if flags.status and narrow_status and TASK_LIST_STATUS_FILTER:
-            argv += [TASK_LIST_STATUS_FLAG, TASK_LIST_STATUS_FILTER]
+        if flags.status and narrow_status:
+            if TASK_LIST_STATUS_FILTER:
+                argv += [TASK_LIST_STATUS_FLAG, TASK_LIST_STATUS_FILTER]
+            else:
+                self._warn_status_filter_dropped()
         if flags.self_scope and self._task_list_self_scope:
             argv.append(TASK_LIST_SELF_FLAG)
         if flags.digest:

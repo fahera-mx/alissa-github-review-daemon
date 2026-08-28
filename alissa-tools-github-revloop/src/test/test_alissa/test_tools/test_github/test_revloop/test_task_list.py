@@ -396,7 +396,7 @@ def test_the_open_set_and_its_filter_hold_only_canonical_alissa_statuses():
     )
 
 
-def test_a_non_canonical_status_added_to_the_open_set_disables_the_filter(caplog):
+def test_a_non_canonical_status_added_to_the_open_set_disables_the_filter():
     """What stops a value like `todo` re-entering through `is_open`.
 
     The answer is deliberately NOT to intersect the filter with the canonical
@@ -405,11 +405,44 @@ def test_a_non_canonical_status_added_to_the_open_set_disables_the_filter(caplog
     would read its absence as "this PR has no review task". Dropping the status
     filter entirely is wide but complete.
     """
-    with caplog.at_level(logging.WARNING):
-        assert _status_filter(OPEN_STATUSES | {"todo"}) == ""
-
-    assert "todo" in caplog.text, "and it says which value cost the narrowing"
+    assert _status_filter(OPEN_STATUSES | {"todo"}) == ""
+    assert _status_filter(set()) == "", "and an empty set is not a filter either"
     assert _status_filter(OPEN_STATUSES) == TASK_LIST_STATUS_FILTER
+
+
+def test_the_dropped_filter_is_reported_once_from_the_call_that_loses_it(
+    cli, caplog, monkeypatch
+):
+    """Where the diagnostic is emitted, which is the whole of PR #98 round 1.
+
+    It used to be emitted while this module was being IMPORTED -- which
+    `__main__` does (through `.loop`) long before it calls
+    `logging.basicConfig`, so the one warning the guard produces fell through to
+    `logging.lastResort`: bare on stderr, outside the deployment's handlers.
+    """
+    cli.help = HELP_0_2_0
+    monkeypatch.setattr(alissa_module, "TASK_LIST_STATUS_FILTER", "")
+    monkeypatch.setattr(alissa_module, "NON_CANONICAL_OPEN_STATUSES", ("todo",))
+    client = Alissa()
+
+    with caplog.at_level(logging.WARNING):
+        assert client.task_list_argv() == PLAIN + ["--view", "digest"]
+        client.task_list_argv()
+
+    assert caplog.text.count("todo") == 1, "once per client, not once per poll pass"
+
+
+def test_a_cli_that_does_not_offer_status_is_not_warned_about(cli, caplog, monkeypatch):
+    """And the message is only emitted when it is true: on a CLI without
+    `--status` the filter costs nothing, so there is nothing lost to report."""
+    cli.help = HELP_0_1_0
+    monkeypatch.setattr(alissa_module, "TASK_LIST_STATUS_FILTER", "")
+    monkeypatch.setattr(alissa_module, "NON_CANONICAL_OPEN_STATUSES", ("todo",))
+
+    with caplog.at_level(logging.WARNING):
+        assert Alissa().task_list_argv() == PLAIN
+
+    assert "todo" not in caplog.text
 
 
 def test_the_narrowed_call_is_one_cli_0_2_0_accepts(cli):
@@ -449,6 +482,31 @@ def test_the_narrowed_call_this_daemon_used_to_build_is_rejected(cli, monkeypatc
     with pytest.raises(CliError) as excinfo:
         cli_0_2_0_task_list(argv)
     assert "Unknown --status value: todo" in str(excinfo.value)
+
+
+def test_the_whole_narrowed_call_a_self_scoped_deployment_makes_is_accepted(cli):
+    """Every narrowing at once -- the one argv a real deployment can emit that
+    the acceptance harness never saw (PR #98 round 1). `--self` is a plain
+    boolean on both sides, so the risk was low; the file's claim is that the
+    argv is one the CLI ACCEPTS, and this is the shape that claim missed."""
+    cli.help = HELP_0_2_0
+    client = Alissa(task_list_self_scope=True)
+
+    argv = client.task_list_argv()
+
+    assert argv == PLAIN + [
+        "--status", "committed,in_progress,pending_validation",
+        "--self", "--view", "digest",
+    ]
+    assert cli_0_2_0_task_list(argv) == {
+        "scope": "self",
+        "view": "digest",
+        "status": ["committed", "in_progress", "pending_validation"],
+    }
+    assert cli_0_2_0_task_list(client.task_list_argv(narrow_status=False)) == {
+        "scope": "self",
+        "view": "digest",
+    }, "and the shape `alissa-pr-review` opts into is accepted too"
 
 
 def test_a_filter_the_cli_would_refuse_is_not_sent_at_all(cli, monkeypatch):

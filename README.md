@@ -691,9 +691,9 @@ same one it always made:
 
 - **status filter** — sent as exactly the daemon's own open-status set, so it
   cannot change which task resolves; adopted automatically when the CLI grows a
-  `--status`. That set holds only *canonical* Alissa statuses (`draft`,
-  `committed`, `in_progress`, `blocked`, `pending_validation`, `validated`,
-  `cancelled`), because the CLI validates `--status` against exactly those and
+  `--status`. That set holds only *canonical* Alissa statuses, because the CLI
+  validates `--status` against exactly the seven of them (`draft`, `committed`,
+  `in_progress`, `blocked`, `pending_validation`, `validated`, `cancelled`) and
   refuses the whole call over one unknown value — losing the digest view and
   `--self` with it. So a non-canonical status in the open set drops the status
   filter rather than being sent: wide but complete, the direction everything
