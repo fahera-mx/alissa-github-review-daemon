@@ -23,8 +23,11 @@
 # eye:
 #
 #   1. the build itself succeeds
-#   2. `alissa-revloop`, `alissa-revloop-ui`, `claude`, `alissa`, `gh`, `tmux`
-#      all resolvable on PATH
+#   2. `alissa-revloop`, `alissa-revloop-ui`, `claude`, `alissa`, `gh`, `tmux`,
+#      `codex`, `pi` all resolvable on PATH. The last two are base-contract only:
+#      this daemon never spawns them (base 0.2.0 made the base multi-agent), and
+#      they are asserted precisely BECAUSE nothing here would notice them going
+#      missing — which is the same reason every other inherited item is listed.
 #   3. `alissa` is uid 1000 / gid 1000
 #   4. BOTH GitHub SSH->HTTPS rewrites, the gh credential helper, and
 #      advice.detachedHead=false are present system-wide
@@ -121,7 +124,10 @@ eq()  { # eq <label> <expected> <actual>
 }
 
 # --- console scripts + inherited CLIs ---
-for b in alissa-revloop alissa-revloop-ui claude alissa gh tmux; do
+# `codex` and `pi` arrived with base 0.2.0 and are unused by this daemon; they
+# are here as BASE-CONTRACT assertions, not because anything in the leaf calls
+# them.
+for b in alissa-revloop alissa-revloop-ui claude alissa gh tmux codex pi; do
   p="$(command -v "$b" 2>/dev/null)"
   if [ -n "$p" ]; then ok "command -v $b -> $p"; else no "command -v $b -> NOT FOUND"; fi
 done
