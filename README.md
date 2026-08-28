@@ -685,14 +685,24 @@ What that trades is latency, not correctness:
 The **narrowing** is probe-gated. At boot the daemon reads `alissa task list
 --help` and sends only what that output advertises as an option — an issue's (or
 a docs page's) claim about a flag is not evidence, and a non-zero `alissa` exit
-becomes a skipped review, not a slower one. Today's CLI (0.1.0) offers only
-`--self`, so the call the daemon makes is the same one it always made:
+becomes a skipped review, not a slower one. Of the three narrowings below,
+today's CLI (0.1.0) offers only `--self`, so the call the daemon makes is the
+same one it always made:
 
 - **status filter** — sent as exactly the daemon's own open-status set, so it
   cannot change which task resolves; adopted automatically when the CLI grows a
-  `--status`;
+  `--status`. That set holds only *canonical* Alissa statuses (`draft`,
+  `committed`, `in_progress`, `blocked`, `pending_validation`, `validated`,
+  `cancelled`), because the CLI validates `--status` against exactly those and
+  refuses the whole call over one unknown value — losing the digest view and
+  `--self` with it. So a non-canonical status in the open set drops the status
+  filter rather than being sent: wide but complete, the direction everything
+  else on this path degrades in;
 - **`--view digest`** — a lean projection of each row; the daemon keeps only
-  `taskNumber`/`title`/`status`, so it is adopted automatically too, with no key;
+  `taskNumber`/`title`/`status`, so it is adopted automatically too, with no key.
+  (0.1.0 does ship a boolean `--digest` spelling of the same projection. The
+  probe looks for `--view`, so that spelling is not adopted today — a narrowing
+  question, not a correctness one, and untouched here.)
 - **`--self`** — off unless `task_list_self_scope` says otherwise. On the live
   fleet corpus it removes 4% of the payload, and 3 of the 371 review tasks in
   that corpus are among the rows it removes: they are owned by another actor, not

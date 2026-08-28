@@ -9,18 +9,29 @@ actor-owned, that an older CLI produces byte-for-byte the call the daemon has
 always made, and -- the part that protects reviews rather than bytes -- that a
 narrowed call which fails or comes back empty is disproved at runtime instead of
 being read as "this actor has no review tasks".
+
+Since issue #97 it also pins the one thing the probe cannot check: that the argv
+is a call the CLI on the other side ACCEPTS. The status filter is validated
+client-side against seven canonical statuses, and one unknown value costs not a
+coarser filter but every narrowing on the call -- so the filter's vocabulary is
+pinned against that canonical set, and the assembled argv is put through a
+transcription of the CLI's own parse (`cli_0_2_0_task_list`).
 """
 
 from __future__ import annotations
+
+import logging
 
 import pytest
 
 from alissa.tools.github.revloop import alissa as alissa_module
 from alissa.tools.github.revloop.alissa import (
+    CANONICAL_TASK_STATUSES,
     OPEN_STATUSES,
     TASK_LIST_STATUS_FILTER,
     Alissa,
     TaskListFlags,
+    _status_filter,
 )
 from alissa.tools.github.revloop.proc import CommandError
 
@@ -57,19 +68,133 @@ Options:
   -h, --help          display help for command
 """
 
-# A hypothetical future CLI carrying everything the daemon knows how to ask for.
-HELP_FULL = """Usage: alissa task list [options]
+# The help of CLI 0.2.0 -- the version that ships the two flags this daemon has
+# been probing for (fahera-mx/studio.alissa.app PR #830).
+#
+# Not hand-written: rendered by the commander bundled in the installed `alissa`
+# CLI, with #830's own `.option()` calls for `--status` / `--view` spliced into
+# `task list`, and captured verbatim on 2026-08-28. The probe is a text matcher
+# over a listing whose column widths move with the longest option name, so an
+# invented layout tests a shape the fleet never emits -- and this real one
+# carries a trap an invented one would not have thought of: `--view`'s
+# description names `--digest`, which is a real option two rows above it.
+HELP_0_2_0 = """Usage: alissa task list [options]
 
 List the actionable tasks owned by your actor (validated/cancelled hidden)
 
 Options:
   --json                 Output raw JSON
   --include-terminal     Also list validated and cancelled tasks
-  --self                 Only your own actor's rows
-  --status <statuses>    Comma-separated statuses to include
-  --view <view>          Projection: full (default) or digest
+  --self                 Only your own actor's rows — skip the sponsor's corpus
+                         (agent tokens). Pair with --include-shared
+  --include-shared       Also list tasks shared with you
+                         (contributor/reviewer/observer)
+  --digest               Ask for the digest row shape: id, number, title,
+                         status, priority, updatedAt
+  --status <statuses>    Comma-separated statuses to keep — any of draft,
+                         committed, in_progress, blocked, pending_validation,
+                         validated, cancelled
+  --view <view>          Row shape asked of the API: digest (same as --digest)
+                         or full (whole task documents)
+  --project <projectId>  Only tasks in this project's bodies of work (Convex
+                         project id)
+  --bow <bowId>          Only tasks in this body of work (Convex BOW id)
   -h, --help             display help for command
 """
+
+
+class CliError(Exception):
+    """The studio CLI's own failure type: a message and exit 1, no request."""
+
+
+# The seven statuses CLI 0.2.0 validates `--status` against -- `TASK_STATUSES`
+# in `cli/src/commands/task.ts`, transcribed rather than imported from the
+# daemon's own CANONICAL_TASK_STATUSES: a harness that reads the constant under
+# test cannot fail when that constant is wrong, which is the only failure this
+# file exists to catch.
+CLI_0_2_0_STATUSES = [
+    "draft",
+    "committed",
+    "in_progress",
+    "blocked",
+    "pending_validation",
+    "validated",
+    "cancelled",
+]
+
+
+def cli_0_2_0_task_list(argv: "list[str]") -> dict:
+    """What CLI 0.2.0 does with `argv` BEFORE it issues a request.
+
+    A transcription of `parseStatusFilter` / `parseListView` and the option
+    table around them (fahera-mx/studio.alissa.app PR #830). Raises `CliError`
+    exactly where that CLI raises one -- unknown option, unknown status, unknown
+    view, or the `--digest --view full` contradiction -- and otherwise returns
+    the `TaskListQuery` it would send.
+
+    It is here because the acceptance criterion is not "the daemon builds the
+    argv it means to", which a self-referential assertion satisfies with any
+    filter at all: it is that the CLI on the other side ACCEPTS that argv. The
+    real CLI cannot be run from these tests (it is a node bundle, and the
+    version that has these flags is not the one installed), so the validation it
+    would apply is written out here, with the exact vocabulary it validates
+    against, and checked against the argv the daemon actually assembles.
+    """
+    assert argv[:3] == ["alissa", "task", "list"]
+    booleans = {"--json", "--include-terminal", "--self", "--include-shared", "--digest"}
+    valued = {"--status", "--view", "--project", "--bow"}
+
+    opts: dict = {}
+    rest, i = argv[3:], 0
+    while i < len(rest):
+        token = rest[i]
+        if token in booleans:
+            opts[token] = True
+            i += 1
+        elif token in valued:
+            if i + 1 >= len(rest):
+                raise CliError(f"option '{token} <value>' argument missing")
+            opts[token] = rest[i + 1]
+            i += 2
+        else:
+            raise CliError(f"unknown option '{token}'")
+
+    view = None
+    if "--view" in opts:
+        view = opts["--view"].strip()
+        if view not in ("digest", "full"):
+            raise CliError(f"Unknown --view value: {opts['--view']}. Valid: digest, full")
+    if opts.get("--digest") and view == "full":
+        raise CliError(
+            "--digest and --view full ask for different row shapes. Pass one of them."
+        )
+
+    query: dict = {}
+    if opts.get("--include-terminal"):
+        query["includeTerminal"] = True
+    if opts.get("--self"):
+        query["scope"] = "self"
+    if opts.get("--include-shared"):
+        query["includeShared"] = True
+    if opts.get("--digest"):
+        query["view"] = "digest"
+    if view:
+        query["view"] = view
+    if "--status" in opts:
+        raw = opts["--status"]
+        values = [v.strip() for v in raw.split(",") if v.strip()]
+        valid = ", ".join(CLI_0_2_0_STATUSES)
+        if not values:
+            raise CliError(f'--status needs at least one status (got "{raw}"). Valid: {valid}')
+        unknown = [v for v in values if v not in CLI_0_2_0_STATUSES]
+        if unknown:
+            plural = "s" if len(unknown) > 1 else ""
+            raise CliError(f"Unknown --status value{plural}: {', '.join(unknown)}. Valid: {valid}")
+        query["status"] = list(dict.fromkeys(values))
+    for flag, key in (("--project", "projectId"), ("--bow", "bodyOfWorkId")):
+        if opts.get(flag):
+            query[key] = opts[flag]
+    return query
 
 
 def _row(number, title, status="committed"):
@@ -135,8 +260,8 @@ def test_an_older_cli_advertises_nothing(cli):
     assert Alissa().probe_task_list() == TaskListFlags()
 
 
-def test_a_future_cli_advertises_everything(cli):
-    cli.help = HELP_FULL
+def test_cli_0_2_0_advertises_everything_the_daemon_asks_for(cli):
+    cli.help = HELP_0_2_0
 
     assert Alissa().probe_task_list() == TaskListFlags(
         status=True, self_scope=True, digest=True
@@ -180,7 +305,7 @@ def test_a_flag_starting_a_wrapped_description_line_is_not_an_offer(cli):
 def test_an_option_is_found_however_the_listing_indents_its_column(cli):
     """The guard is the option COLUMN, not one hardcoded width: a listing whose
     longest option name pushes the description column out must still work."""
-    cli.help = HELP_FULL.replace("  --status", "   --status")
+    cli.help = HELP_0_2_0.replace("  --status", "   --status")
 
     assert Alissa().probe_task_list().status is True
 
@@ -240,7 +365,7 @@ def test_the_status_filter_is_the_daemons_own_open_set(cli):
     """Server-side filtering by exactly the statuses `is_open` accepts cannot
     change which task resolves -- only how much of the corpus crosses the wire.
     Deriving it from OPEN_STATUSES is what keeps that true as the set grows."""
-    cli.help = HELP_FULL
+    cli.help = HELP_0_2_0
 
     argv = Alissa().task_list_argv()
 
@@ -248,10 +373,104 @@ def test_the_status_filter_is_the_daemons_own_open_set(cli):
     assert set(TASK_LIST_STATUS_FILTER.split(",")) == OPEN_STATUSES
 
 
+# -- and the filter has to be a vocabulary the CLI speaks (issue #97) --------
+
+
+def test_the_open_set_and_its_filter_hold_only_canonical_alissa_statuses():
+    """The pin the acceptance criterion asks for: against the CANONICAL set, not
+    against OPEN_STATUSES.
+
+    `is_open` is a client-side `in` over a set of strings and accepts anything;
+    `--status` is validated against seven names. Asserting the filter equals the
+    open set (above) therefore says nothing about whether the CLI would take it
+    -- until the open set itself is pinned, which is what re-admitted `todo` for
+    four releases.
+    """
+    assert OPEN_STATUSES <= CANONICAL_TASK_STATUSES, sorted(
+        OPEN_STATUSES - CANONICAL_TASK_STATUSES
+    )
+    assert set(TASK_LIST_STATUS_FILTER.split(",")) <= CANONICAL_TASK_STATUSES
+    assert CANONICAL_TASK_STATUSES == set(CLI_0_2_0_STATUSES), (
+        "the daemon's canonical set and the vocabulary CLI 0.2.0 validates "
+        "against are the same seven names"
+    )
+
+
+def test_a_non_canonical_status_added_to_the_open_set_disables_the_filter(caplog):
+    """What stops a value like `todo` re-entering through `is_open`.
+
+    The answer is deliberately NOT to intersect the filter with the canonical
+    set: that would keep narrowing on a filter narrower than `is_open`, so a
+    review task in the dropped status would never cross the wire and the daemon
+    would read its absence as "this PR has no review task". Dropping the status
+    filter entirely is wide but complete.
+    """
+    with caplog.at_level(logging.WARNING):
+        assert _status_filter(OPEN_STATUSES | {"todo"}) == ""
+
+    assert "todo" in caplog.text, "and it says which value cost the narrowing"
+    assert _status_filter(OPEN_STATUSES) == TASK_LIST_STATUS_FILTER
+
+
+def test_the_narrowed_call_is_one_cli_0_2_0_accepts(cli):
+    """The Definition of Done, end to end: what the daemon assembles against a
+    0.2.0 help is a call 0.2.0 takes -- so `list_tasks` never sees the
+    `CommandError` that turns the narrowing off for the process."""
+    cli.help = HELP_0_2_0
+
+    argv = Alissa().task_list_argv()
+
+    assert argv == PLAIN + [
+        "--status", "committed,in_progress,pending_validation", "--view", "digest",
+    ]
+    assert cli_0_2_0_task_list(argv) == {
+        "view": "digest",
+        "status": ["committed", "in_progress", "pending_validation"],
+    }
+
+
+def test_the_narrowed_call_this_daemon_used_to_build_is_rejected(cli, monkeypatch):
+    """The counterfactual, without which the test above passes on any filter.
+
+    This is the argv of revloop 0.21.0 and earlier -- the open set with `todo`
+    in it -- put through the same acceptance harness. CLI 0.2.0 refuses it
+    before issuing a request, which is issue #97: not a coarser filter, no
+    filter, no digest view, and one wasted subprocess per daemon process.
+    """
+    cli.help = HELP_0_2_0
+    monkeypatch.setattr(
+        alissa_module,
+        "TASK_LIST_STATUS_FILTER",
+        "committed,in_progress,pending_validation,todo",
+    )
+
+    argv = Alissa().task_list_argv()
+
+    with pytest.raises(CliError) as excinfo:
+        cli_0_2_0_task_list(argv)
+    assert "Unknown --status value: todo" in str(excinfo.value)
+
+
+def test_a_filter_the_cli_would_refuse_is_not_sent_at_all(cli, monkeypatch):
+    """`--status ""` is the rejected call with an extra step, and the rest of
+    the narrowing is worth keeping on its own."""
+    cli.help = HELP_0_2_0
+    monkeypatch.setattr(alissa_module, "TASK_LIST_STATUS_FILTER", "")
+
+    argv = Alissa().task_list_argv()
+
+    assert argv == PLAIN + ["--view", "digest"]
+    assert cli_0_2_0_task_list(argv) == {"view": "digest"}
+
+
 def test_the_digest_view_needs_no_knob(cli):
     """The daemon keeps taskNumber/title/status and nothing else, so a leaner
     projection is pure saving with no semantics to get wrong."""
-    cli.help = HELP_FULL.replace("  --self                 Only your own actor's rows\n", "")
+    cli.help = HELP_0_2_0.replace(
+        "  --self                 Only your own actor's rows — skip the sponsor's corpus\n"
+        "                         (agent tokens). Pair with --include-shared\n",
+        "",
+    )
 
     assert Alissa().task_list_argv() == PLAIN + [
         "--status", TASK_LIST_STATUS_FILTER, "--view", "digest",
@@ -261,7 +480,7 @@ def test_the_digest_view_needs_no_knob(cli):
 def test_narrow_status_false_drops_only_the_status_filter(cli):
     """`alissa-pr-review` reads a review task whose status `is_open` rejects, so
     it opts out of that one narrowing and keeps every other."""
-    cli.help = HELP_FULL
+    cli.help = HELP_0_2_0
 
     argv = Alissa(task_list_self_scope=True).task_list_argv(narrow_status=False)
 
@@ -269,7 +488,7 @@ def test_narrow_status_false_drops_only_the_status_filter(cli):
 
 
 def test_list_tasks_makes_the_narrowed_call_and_parses_it(cli):
-    cli.help = HELP_FULL
+    cli.help = HELP_0_2_0
     narrowed = tuple(PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"])
     cli.answers[narrowed] = ROWS
 
@@ -283,7 +502,7 @@ def test_list_tasks_makes_the_narrowed_call_and_parses_it(cli):
 
 
 def test_a_narrowed_call_that_fails_retries_plain_and_stops_narrowing(cli):
-    cli.help = HELP_FULL
+    cli.help = HELP_0_2_0
     narrowed = tuple(PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"])
     cli.answers[narrowed] = CommandError(list(narrowed), 1, "unknown option")
     client = Alissa()
@@ -300,7 +519,7 @@ def test_a_failed_narrowed_call_does_not_also_pay_the_empty_cross_check(cli):
     EMPTY corpus, the empty-answer cross-check must not fire a THIRD list --
     inside the change whose purpose is removing whole-corpus fetches (PR #88
     round 1)."""
-    cli.help = HELP_FULL
+    cli.help = HELP_0_2_0
     narrowed = tuple(PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"])
     cli.answers[narrowed] = CommandError(list(narrowed), 1, "unknown option")
     cli.answers[tuple(PLAIN)] = []
@@ -326,7 +545,7 @@ def test_a_narrowed_call_that_answers_empty_is_checked_against_the_plain_one(cli
     nothing. `find_review_task` reads an empty corpus as 'this PR has no review
     task', which is a skipped review -- so an empty narrowed answer is never
     taken at face value."""
-    cli.help = HELP_FULL
+    cli.help = HELP_0_2_0
     narrowed = tuple(PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"])
     cli.answers[narrowed] = []
     client = Alissa()
@@ -339,7 +558,7 @@ def test_a_narrowed_call_that_answers_empty_is_checked_against_the_plain_one(cli
 
 
 def test_a_genuinely_empty_corpus_costs_one_extra_list_and_keeps_narrowing(cli):
-    cli.help = HELP_FULL
+    cli.help = HELP_0_2_0
     narrowed = tuple(PLAIN + ["--status", TASK_LIST_STATUS_FILTER, "--view", "digest"])
     cli.answers[narrowed] = []
     cli.answers[tuple(PLAIN)] = []
