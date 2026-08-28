@@ -24,7 +24,10 @@
 # 1000) + /workspace mount point, the system-wide GitHub SSH->HTTPS rewrite with
 # gh as git's credential helper, the workspace ENV skeleton
 # (ALISSA_WORKSPACE_ROOT / TMUX_TMPDIR / CLAUDE_CONFIG_DIR), EXPOSE 8080, and the
-# tini ENTRYPOINT hook at the fixed path /usr/local/bin/entrypoint.sh.
+# tini ENTRYPOINT hook at the fixed path /usr/local/bin/entrypoint.sh. Since base
+# 0.2.0 it is also MULTI-AGENT: the `codex` and `pi` CLIs ship alongside
+# claude-code. This daemon spawns `claude` only, so they are inert here — do not
+# add knobs or config for them.
 #
 # In this LEAF (below): the pip-installed daemon, the entrypoint + its helper
 # scripts (COPYed OVER the base's failing stub at that fixed path), the
@@ -61,7 +64,7 @@
 #     deliberate, reviewable change to this line, and that is the ONLY thing that
 #     advances the shared infrastructure layers;
 #   * the `@sha256:` is the ENFORCING half — a tag is mutable, so without it a
-#     re-push of `0.1.0` is substituted into every build with no diff to review.
+#     re-push of `0.2.0` is substituted into every build with no diff to review.
 #     That matters more here than for an ordinary base: this pin is now the whole
 #     review surface for claude-code, the `curl … | bash` CLI install and the apt
 #     layer, none of which this repo builds any more.
@@ -74,10 +77,10 @@
 # into the reference, so an arm64 base, once published, needs only the ordinary
 # two-value bump. Read the current one back with:
 #
-#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
+#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0
 #
 # The base is linux/amd64-ONLY today; see "Base image" in README.md.
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0@sha256:b8eeb3df52b1437a02d217523b447fb6066d536b3916222d2b141b7167361845
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0@sha256:f46fd1431462392993da6dd209e23c15c3dc8495540469eaa06b40ca5bafda1c
 
 # Version of the daemon to install from PyPI. Bump per release: 0.16.0 is the
 # release this repo publishes on merge (it must match the dist's version file,

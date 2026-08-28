@@ -58,7 +58,7 @@ This Dockerfile is a thin **leaf** on the shared loopwork base image, pinned by
 both an exact tag and a digest:
 
 ```dockerfile
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0@sha256:b8eeb3df52b1437a02d217523b447fb6066d536b3916222d2b141b7167361845
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0@sha256:f46fd1431462392993da6dd209e23c15c3dc8495540469eaa06b40ca5bafda1c
 ```
 
 The base is **public on GHCR**, so the pull is anonymous — no registry
@@ -72,6 +72,10 @@ to the leaf:**
   (+ `iptables`/`ipset` for the optional egress firewall)
 - **claude-code**, with its first-run gates pre-seeded (`~/.claude.json`,
   `~/.claude/settings.json`) so worker-spawned reviewers start headless
+- since base `0.2.0`, two further agent CLIs — **`codex`** and **`pi`** — which
+  make the base multi-agent for its other leaves. This daemon spawns `claude`
+  only, so both are present and unused here; that is expected, not a defect, and
+  it is not a reason to add knobs or config for them
 - the **alissa CLI** on the `alissa` user's `PATH`
 - the non-root **`alissa` user (uid 1000)** and the `/workspace` mount point
 - the system-wide GitHub **SSH→HTTPS rewrite** with `gh` as git's credential
@@ -91,6 +95,13 @@ PR. That is how claude-code, the alissa CLI and the system packages advance for
 this image — never by re-adding a layer here. Base repo and its leaf contract:
 <https://github.com/ali-fhr/alissa-loopwork>.
 
+The bump to `0.2.0` (base PR `ali-fhr/alissa-loopwork#2`) is the multi-agent one:
+it adds `codex` and `pi` next to claude-code, and that is the whole of it — the
+claude-code version is unchanged across the bump, and so is everything this leaf
+builds on top. What it costs is **size**: the base's compressed amd64 layers go
+from ~270 MB to ~430 MB (≈840 MB → ≈1.31 GB unpacked), and this image inherits
+all of it. Expect a slower cold pull; nothing else about the runtime changes.
+
 #### How the pin is written
 
 Never `:latest`, and never a bare tag either. The reference carries **two values
@@ -98,8 +109,8 @@ that do different jobs**, and a bump changes both together:
 
 | half | job |
 | --- | --- |
-| `:0.1.0` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
-| `@sha256:b8eeb3df…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.1.0` is substituted into every build with no diff to review. |
+| `:0.2.0` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
+| `@sha256:f46fd143…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.2.0` is substituted into every build with no diff to review. |
 
 The digest matters more here than for an ordinary base image. This one line is now
 the *entire* review surface for claude-code, a `curl … | bash` CLI install and
@@ -107,19 +118,19 @@ the whole apt layer — none of which this repo builds, or sees, any more. A sil
 substitution should be a build failure, not a successful build of something else.
 
 The pinned digest is the **index** digest (what the registry returns as
-`Docker-Content-Digest` for the tag `0.1.0`), not the digest of the amd64 child
-manifest it currently selects (`sha256:8434c474…`). Pinning the index keeps
+`Docker-Content-Digest` for the tag `0.2.0`), not the digest of the amd64 child
+manifest it currently selects (`sha256:ba2f9b7b…`). Pinning the index keeps
 platform selection a build-time choice, so when the base gains arm64 this stays an
 ordinary two-value bump instead of a reference that can only ever resolve to
 amd64. Read the current values back with:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.1.0
+docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0
 ```
 
 #### Platform: amd64 only
 
-**The base publishes `linux/amd64` and nothing else.** Its `0.1.0` index contains
+**The base publishes `linux/amd64` and nothing else.** Its `0.2.0` index contains
 exactly one platform manifest plus an attestation manifest — no `arm64`, no
 `arm/v7`. The `python:3.12-slim-bookworm` this image used to build from shipped
 five architectures, so this is a real narrowing and it is worth knowing before you
