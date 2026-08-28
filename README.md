@@ -726,9 +726,13 @@ key still makes exactly the call the daemon always made:
   three do — see below.
 
 A narrowed call that fails, or that answers with an *empty* corpus, is retried
-once unnarrowed and the narrowing is dropped for the rest of the process — both
-are how a CLI that advertises a flag its API does not serve would present, and
-either would otherwise read as "this actor has no review tasks".
+once unnarrowed — both are how a CLI that advertises a flag its API does not
+serve would present, and either would otherwise read as "this actor has no review
+tasks". A **failure** then drops the narrowing for the rest of the process. An
+**empty answer** drops it too, *except* when the call was BOW-scoped: there only
+`--bow` is dropped and the other three are kept, because an empty answer is a
+legitimate result for a flag that replaces the corpus rather than filtering it —
+see *Naming the review BOW* below for the whole of that carve-out.
 
 #### What `--bow` actually does to the other flags
 
