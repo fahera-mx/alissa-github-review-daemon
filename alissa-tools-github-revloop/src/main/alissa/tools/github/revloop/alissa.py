@@ -545,8 +545,12 @@ class Alissa:
     def task_list_argv(self, *, narrow_status: bool = True) -> list[str]:
         """The narrowest `alissa task list` this CLI actually supports.
 
-        Every addition is probe-gated, so an older CLI -- today's, which offers
-        none of them -- produces exactly the call the daemon has always made.
+        Every addition is probe-gated, so a CLI that offers none of them
+        produces exactly the call the daemon has always made. (The CLI installed
+        on 2026-08-28 offers `--self` and `--bow`, so that is no longer the
+        no-op it once was -- and it still reports version `0.1.0`, which is why
+        the gate reads the help rather than the version. See
+        TASK_LIST_BOW_FLAG.)
         """
         argv = ["alissa", "task", "list", "--json"]
         if self._task_list_narrowing_disabled:
@@ -603,10 +607,17 @@ class Alissa:
         filter; every other narrowing still applies.
 
         A narrowed call that FAILS, or that answers with an empty corpus, is
-        retried once unnarrowed and turns the narrowing off for the rest of the
-        process. Both are how a CLI that advertises a flag its API does not
-        serve would present, and either would otherwise read as "this actor has
-        no review tasks" -- which is a skipped review, not a slower one.
+        retried once unnarrowed. Both are how a CLI that advertises a flag its
+        API does not serve would present, and either would otherwise read as
+        "this actor has no review tasks" -- which is a skipped review, not a
+        slower one.
+
+        What the retry then turns OFF differs by which signal it was, because
+        the two carry different evidence. A FAILURE turns off all narrowing for
+        the process. An EMPTY answer does too -- unless the call was BOW-scoped,
+        in which case only the BOW is dropped and the other flags stand: `--bow`
+        replaces the corpus instead of filtering it, so an empty answer from it
+        is a legitimate result and says nothing about the rest.
         """
         argv = self.task_list_argv(narrow_status=narrow_status)
         plain = ["alissa", "task", "list", "--json"]
@@ -615,6 +626,13 @@ class Alissa:
         except CommandError:
             if argv == plain:
                 raise
+            # Deliberately blunter than the empty-answer path below, which
+            # attributes the disproof to `--bow` alone when it can. A hard
+            # failure cannot be attributed: it does not say which flag the
+            # server choked on, and a transient timeout or 5xx says nothing
+            # about the flags at all. So all narrowing goes -- wide but
+            # complete, which costs the optimization and never a review. The
+            # asymmetry is a decision, not a corner the BOW split missed.
             log.warning(
                 "`%s` failed — retrying the plain task list and dropping the "
                 "narrowing for this process", " ".join(argv),
