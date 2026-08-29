@@ -8872,3 +8872,32 @@ def test_compare_files_refuses_to_answer_from_a_truncated_listing():
     with pytest.raises(TruncatedListing):
         gh.compare_files(OWNER, REPO, "base", "head")
     assert len(calls) == COMPARE_PAGE_LIMIT
+
+
+def test_stability_re_established_after_a_break_earns_a_fresh_grace_round(
+    stability_config,
+):
+    """A hold needs a grace round the reviewer actually received. Once the
+    product moves, the notice already spent is stale — the next stable window
+    is a NEW episode and gets told before it is stopped, or the guard would
+    hold a reviewer that was never warned about THIS convergence."""
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held at s4
+
+    # the implementer pushes shipped code: the hold clears by itself
+    moved = make_pr(sha="s5")
+    w2, gh2, al2 = watcher(stability_config, moved, list(gh._reviews), state=st)
+    gh2.changed_files = ["src/app.py"]
+    assert w2.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED  # round 5
+
+    # rounds 5, 6, 7 all come back request_changes, nothing pushed after them
+    for i, hour in enumerate(("21", "22", "23")):
+        add_round(gh2, al2, sha="s5", at=f"2026-07-18T{hour}:00:00Z")
+    gh2.changed_files = ["tests/test_app.py"]            # stable again
+
+    d = w2.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 8, "a fresh grace round"
+    assert "PRODUCT-STABILITY NOTICE" in al2.enqueued[-1]["directive"]
+    assert len(operator_comments(gh2)) == 0, "the stale notice must not hold it"

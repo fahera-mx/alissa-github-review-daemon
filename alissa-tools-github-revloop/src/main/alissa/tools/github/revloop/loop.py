@@ -2310,20 +2310,24 @@ class ReviewWatcher:
         granted: int,
         rounds: int,
     ) -> Decision:
-        """Stop the loop on this head, and page the operator once.
+        """Stop the loop on this head, and page the operator.
 
         Once per (head, grants spent), like the cap-out: a push re-decides by
         itself, and a grant consumed without an approve is a new decision on an
         unmoved head. Everything else is the page the operator already has.
+
+        The once-only check is the CALLER'S, and deliberately only the
+        caller's: it has to run before the comparison (that is what stops a
+        held PR buying a compare call every poll), so a second check here would
+        be unreachable — a guard defending an invariant that is already decided
+        upstream, which is its own hazard. This method pages unconditionally;
+        reaching it at all means the page is owed.
         """
         kind = stability_kind(pr.head_sha, base, granted)
         reason = (
             f"product-stable for {rounds} request_changes round(s) "
             f"since `{base[:8]}` — round {round_} not queued"
         )
-        if self.state.pinged(pr.full_name, pr.number, kind):
-            return Decision(Action.CAPPED, reason, round_)
-
         listed = [f"- `{directive_text(f)}`" for f in changed[:STABILITY_PAGE_PATHS]]
         dropped = len(changed) - len(listed)
         if dropped > 0:
