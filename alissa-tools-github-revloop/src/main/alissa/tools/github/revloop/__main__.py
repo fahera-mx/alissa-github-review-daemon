@@ -101,6 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     over.add_argument("--poll-interval", type=int, metavar="SECONDS")
     over.add_argument("--round-cap", type=int, metavar="N", help="CR9 round cap")
+    over.add_argument(
+        "--stability-rounds",
+        type=int,
+        metavar="N",
+        help="PRODUCT-STABILITY GUARD: hold the loop once the shipped-product "
+        "diff has been empty for N consecutive request_changes rounds (0 "
+        "disables the guard entirely)",
+    )
     over.add_argument("--hub-template", metavar="TEMPLATE")
     over.add_argument("--agent-profile", metavar="NAME")
     over.add_argument("--reviewer-login", metavar="LOGIN")
@@ -218,6 +226,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "operators": tuple(args.operators) if args.operators else None,
         "poll_interval": args.poll_interval,
         "round_cap": args.round_cap,
+        "stability_rounds": args.stability_rounds,
         "hub_template": args.hub_template,
         "agent_profile": args.agent_profile,
         "reviewer_login": args.reviewer_login,

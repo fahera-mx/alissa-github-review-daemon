@@ -793,3 +793,48 @@ def test_forgetting_a_miss_re_arms_the_search_now(ledger):
 
     assert ledger.forget_review_task_miss(REPO, 7) is True
     assert ledger.consume_review_task_miss(REPO, 7) is False
+
+
+# -- the product-stability guard's ledger (issue #105) ---------------------
+
+
+def test_a_stability_notice_round_trips_and_carries_its_bookkeeping(ledger):
+    assert ledger.stability_notice(REPO, 7) is None
+
+    ledger.record_stability_notice(REPO, 7, 4, 3, 0)
+    row = ledger.stability_notice(REPO, 7)
+
+    assert row is not None
+    assert (row["round"], row["rc_rounds"], row["lifts"]) == (4, 3, 0)
+
+
+def test_a_later_notice_supersedes_the_first(ledger):
+    """One row per PR: the hold is measured against the NEWEST notice, so a
+    round bought by an operator ack replaces the one before it rather than
+    accumulating a history nothing reads."""
+    ledger.record_stability_notice(REPO, 7, 4, 3, 0)
+    ledger.record_stability_notice(REPO, 7, 5, 4, 1)
+
+    row = ledger.stability_notice(REPO, 7)
+    assert (row["round"], row["rc_rounds"], row["lifts"]) == (5, 4, 1)
+    assert ledger._db.execute(
+        "SELECT COUNT(*) AS n FROM stability_notices WHERE repo=?", (REPO,)
+    ).fetchone()["n"] == 1
+
+
+def test_the_stability_table_is_added_to_a_database_that_predates_it(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` on open: a state.db written before this
+    guard existed must not need a migration step an operator has to run."""
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE spawns (repo TEXT, number INTEGER, round INTEGER, "
+        "head_sha TEXT, session TEXT PRIMARY KEY, task_ref TEXT, "
+        "spawned_at INTEGER)"
+    )
+    db.commit()
+    db.close()
+
+    with State(path) as st:
+        st.record_stability_notice(REPO, 7, 4, 3, 0)
+        assert st.stability_notice(REPO, 7)["rc_rounds"] == 3

@@ -243,6 +243,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   gap: 0.75rem; padding: 0.55rem 0; border-top: 1px solid var(--surface-border); }
 .inbox-kind { font-family: var(--mono); font-size: 0.75rem; color: var(--status-blocked); }
 .inbox-kind.cap-out { color: var(--status-cancelled); }
+.inbox-kind.stability-held { color: var(--status-cancelled); }
 .log {
   font-family: var(--mono); font-size: 0.75rem; line-height: 1.55;
   color: var(--text-tertiary); background: var(--bg-primary);

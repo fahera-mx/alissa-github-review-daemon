@@ -230,6 +230,32 @@ CREATE TABLE IF NOT EXISTS spawn_checks_holds (
     PRIMARY KEY (repo, number, round, head_sha)
 );
 
+-- The product-stability guard's memory (issue #105): the GRACE ROUND it has
+-- already spent on a PR, and how many operator re-entry grants it has cashed in
+-- to lift a hold.
+--
+-- One row per PR, replaced each time a notice-carrying round is queued, because
+-- what the guard needs is not a history but an answer to one question: has the
+-- reviewer already been TOLD the product is stable and requested changes
+-- anyway? `rc_rounds` is the request_changes count at the moment the notice was
+-- queued, so exactly one further request_changes round (rc_rounds + 1) is the
+-- grace round closing without a shipped change -- the hold condition. Two or
+-- more means stability was broken and re-established since, which earns a fresh
+-- grace round rather than an immediate hold.
+--
+-- `lifts` counts the grants already spent lifting a hold, and is carried
+-- forward across replacements: without it one ack would lift the same hold on
+-- every poll forever.
+CREATE TABLE IF NOT EXISTS stability_notices (
+    repo       TEXT    NOT NULL,
+    number     INTEGER NOT NULL,
+    round      INTEGER NOT NULL,
+    rc_rounds  INTEGER NOT NULL,
+    lifts      INTEGER NOT NULL DEFAULT 0,
+    noticed_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, number)
+);
+
 CREATE TABLE IF NOT EXISTS poll_snapshots (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                INTEGER NOT NULL,
@@ -925,6 +951,33 @@ class State:
             "DELETE FROM spawn_checks_holds "
             "WHERE repo=? AND number=? AND round=? AND head_sha=?",
             (repo, number, round_, head_sha),
+        )
+        self._db.commit()
+
+    # -- the product-stability guard (issue #105) --------------------------
+
+    def stability_notice(self, repo: str, number: int) -> "sqlite3.Row | None":
+        """The PR's stability-notice row, or None if it has never had one."""
+        return self._db.execute(
+            "SELECT * FROM stability_notices WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+
+    def record_stability_notice(
+        self, repo: str, number: int, round_: int, rc_rounds: int, lifts: int
+    ) -> None:
+        """Remember that round `round_` was queued carrying the notice.
+
+        REPLACE, not IGNORE: a second notice-carrying round (a re-enqueue of the
+        same round, or a round bought by an operator ack) supersedes the first,
+        and the hold condition is measured against the NEWEST one. `lifts` is
+        passed in rather than incremented here so the caller decides what the
+        write means -- the same grant must not be re-counted by a re-enqueue.
+        """
+        self._db.execute(
+            "INSERT OR REPLACE INTO stability_notices "
+            "(repo, number, round, rc_rounds, lifts, noticed_at) VALUES (?,?,?,?,?,?)",
+            (repo, number, int(round_), int(rc_rounds), int(lifts), int(time.time())),
         )
         self._db.commit()
 

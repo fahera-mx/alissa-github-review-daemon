@@ -343,6 +343,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
 | `ALISSA_POLL_INTERVAL` | *daemon default* (currently 60) | seconds between polls (≥10); **pass-through** — unset ⇒ library default |
 | `ALISSA_ROUND_CAP` | *daemon default* (currently 10) | CR9 round cap; **pass-through** — unset ⇒ library default |
+| `ALISSA_STABILITY_ROUNDS` | *daemon default* (currently 3) | **product-stability guard**: how many consecutive `request_changes` rounds with an *empty* shipped-product diff stop the loop. The first stable round is still queued, carrying a notice that tells the reviewer to approve or name the shipped `file:line` that is wrong; a `request_changes` on that round with the product still unmoved queues nothing further and pages the operator once per head, lifted by the same `alissa-review: re-enter +N` ack a cap-out uses. `0` disables the guard entirely. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.26.0` |
 | `ALISSA_REAP_GRACE_SECONDS` | *daemon default* (currently 1800) | how long a reviewer session must be idle **and** quiet before the reap sweep kills it; **pass-through** — unset ⇒ library default |
 | `ALISSA_REAP_SESSION_CAP` | *daemon default* (currently 6) | live reviewer sessions after a sweep above which the daemon logs page-worthy; **pass-through** — unset ⇒ library default |
 | `ALISSA_MAX_CONCURRENT_SESSIONS` | *daemon default* (currently 4) | spawn gate: at this many live reviewer sessions of the daemon's own grammar, an owed round waits for a slot instead of spawning (it burns no round number and no attempt, and pages nobody). Must be **≤ `ALISSA_REAP_SESSION_CAP`** — the daemon refuses a config whose alarm sits below its spawn limit. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.16.13` |
@@ -366,6 +367,7 @@ automatically; locally pass `--build-arg`):
 #### Config precedence: env var > daemon library default
 
 The optional tuning knobs `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`,
+`ALISSA_STABILITY_ROUNDS`,
 `ALISSA_REAP_GRACE_SECONDS`, `ALISSA_REAP_SESSION_CAP`,
 `ALISSA_MAX_CONCURRENT_SESSIONS`, `ALISSA_CHECKS_WAIT_SECONDS`,
 `ALISSA_CHECKS_SPAWN_WAIT_SECONDS`, `ALISSA_REVIEW_TASK_MISS_TTL_POLLS`,
@@ -629,7 +631,8 @@ guarantees a manifest and a `revloop.config.json` exist under
 
 **When `ALISSA_REVIEW_REPOS` is set it is authoritative**: the entrypoint
 regenerates both files from it on **every boot**, so changing the allowlist (or
-`ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`, …) and redeploying just applies — the
+`ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`, `ALISSA_STABILITY_ROUNDS`, …) and
+redeploying just applies — the
 files persist on the volume, so a "generate only if absent" rule would otherwise
 pin them to the first boot's values forever. Leave `ALISSA_REVIEW_REPOS` **unset**
 to instead run against a workspace you've mounted at `/workspace` as-is.

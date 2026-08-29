@@ -21,6 +21,7 @@ daemons over different workspaces on the same machine, each pointed with
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -127,6 +128,8 @@ CONFIG_KEYS = (
     "hub_template",
     "poll_interval",
     "round_cap",
+    "stability_rounds",
+    "stability_nonshipped_globs",
     "repos",
     "authors",
     "operators",
@@ -276,6 +279,105 @@ DEFAULT_CHECKS_SPAWN_WAIT_SECONDS = 15 * 60
 DEFAULT_REVIEW_TASK_MISS_TTL_POLLS = 10
 
 
+# -- the product-stability guard (issue #105) ---------------------------------
+#
+# How many consecutive `request_changes` rounds must move NOTHING outside
+# `stability_nonshipped_globs` before the loop stops spending rounds on a PR
+# whose shipped product has converged. Measured on the live fleet: of the PRs
+# sampled on 2026-08-28/29, none that was still unapproved at round 5 ever
+# needed a shipped-code change again -- studio #847 ran eleven further rounds
+# (~7 h, ~22 agent sessions) moving only `tests/**`.
+#
+# 3 rather than 1 because ONE empty round is ordinary: a round that only asked
+# for a comment to be reworded is a normal round, and holding on it would turn
+# the guard into a second cap. Three consecutive ones is a pattern.
+#
+# 0 disables the guard, and disables it COMPLETELY: no compare call, no
+# directive block, no hold, every decision bit-identical to the world before
+# this key existed. That is the escape hatch a deployment that dislikes the
+# guard uses, and it is why the gate is skipped whole rather than degraded into
+# a no-op.
+DEFAULT_STABILITY_ROUNDS = 3
+
+# Path globs whose movement is NOT product movement. Deliberately conservative:
+# a file that is not obviously a test, a doc or a generated artifact counts as
+# shipped, because the guard's two failure directions are not symmetric --
+# calling shipped code non-shipped can hold a PR that still needs work, while
+# calling a test file shipped only costs another round.
+DEFAULT_STABILITY_NONSHIPPED_GLOBS = (
+    "tests/**",
+    "test/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/*.md",
+    "docs/**",
+    "**/__snapshots__/**",
+    "**/_generated/**",
+)
+
+
+def glob_matches(path: str, pattern: str) -> bool:
+    """Does `path` match `pattern`, with `**` crossing directory separators?
+
+    Neither obvious implementation does what these globs mean:
+
+    * `pathlib.PurePosixPath.match` treats `**` as a single component, so
+      `**/*.test.*` misses `src/a/b/x.test.ts` -- the exact nesting the guard
+      has to recognise, and the miss is silent (the file reads as shipped and
+      the PR simply never stabilises);
+    * bare `fnmatch` goes the other way -- its `*` crosses `/` too, so `docs/*`
+      would swallow `docs/a/b/c` -- and, worse for the defaults here, `**/*.md`
+      then REQUIRES a `/` and does not match a top-level `README.md`.
+
+    So the pattern is matched SEGMENT by segment: `**` matches zero or more
+    whole segments (which is what makes `**/*.md` cover both `README.md` and
+    `docs/a/b.md`), and every other segment is an ordinary `fnmatch` pattern
+    that cannot cross a separator. A trailing `**` matches the whole remainder,
+    including none of it.
+
+    Case-SENSITIVE (`fnmatchcase`): `fnmatch.fnmatch` normalises by platform, so
+    the same config would classify `Docs/x.MD` one way on a developer's macOS
+    checkout and another in the Linux container. Repo paths are case-sensitive
+    on the side that matters -- GitHub's.
+    """
+    return _match_segments(
+        tuple(part for part in str(path).split("/") if part != ""),
+        tuple(str(pattern).split("/")),
+    )
+
+
+def _match_segments(
+    path_parts: "tuple[str, ...]", pat_parts: "tuple[str, ...]"
+) -> bool:
+    """The recursion behind `glob_matches`. Branching is bounded by the pattern:
+    only a `**` branches, the defaults carry at most one, and a pattern is
+    operator-written config rather than repo-controlled text."""
+    if not pat_parts:
+        return not path_parts
+    head, rest = pat_parts[0], pat_parts[1:]
+    if head == "**":
+        if not rest:
+            return True  # the whole remainder, including nothing
+        return any(
+            _match_segments(path_parts[i:], rest) for i in range(len(path_parts) + 1)
+        )
+    if not path_parts:
+        return False
+    if not fnmatch.fnmatchcase(path_parts[0], head):
+        return False
+    return _match_segments(path_parts[1:], rest)
+
+
+def is_nonshipped(path: str, globs: "tuple[str, ...]") -> bool:
+    """Whether a changed path is one the stability guard ignores.
+
+    An EMPTY glob tuple means nothing is non-shipped, so every changed file is
+    product movement and the guard can never hold -- the same fail-toward-rounds
+    direction every other unknown in the guard takes.
+    """
+    return any(glob_matches(path, pattern) for pattern in globs)
+
+
 def default_state_path(workspace_root: Path) -> Path:
     return Path(workspace_root) / ".revloop" / "state.db"
 
@@ -288,6 +390,15 @@ class Config:
     hub_template: str = "{root}/{repo}/main"
     poll_interval: int = 60
     round_cap: int = 10  # CR9 default
+
+    # How many consecutive request_changes rounds with an EMPTY shipped-product
+    # diff make the loop stop spawning plain rounds; see
+    # DEFAULT_STABILITY_ROUNDS. 0 disables the guard entirely.
+    stability_rounds: int = DEFAULT_STABILITY_ROUNDS
+
+    # The path globs that count as non-shipped when the guard measures that
+    # diff; see DEFAULT_STABILITY_NONSHIPPED_GLOBS and `glob_matches`.
+    stability_nonshipped_globs: tuple[str, ...] = DEFAULT_STABILITY_NONSHIPPED_GLOBS
 
     # Empty tuple means "every repo that requests a review from me".
     repos: tuple[str, ...] = ()
@@ -524,6 +635,20 @@ class Config:
         if cap < 1:
             raise ValueError(f"round_cap must be >= 1, got {cap}")
 
+        stability = int(raw.get("stability_rounds", cls.stability_rounds))
+        if stability < 0:
+            # 0 is legal and means "off", unlike round_cap's floor of 1: the
+            # guard is an ADDITION to the loop, so switching it off has to be
+            # expressible, and the value that expresses it is the one asking
+            # for zero stable rounds.
+            raise ValueError(f"stability_rounds must be >= 0, got {stability}")
+
+        nonshipped = _string_list(
+            raw.get("stability_nonshipped_globs", cls.stability_nonshipped_globs),
+            "stability_nonshipped_globs",
+            "path globs",
+        )
+
         interval = int(raw.get("poll_interval", 60))
         if interval < MIN_POLL_INTERVAL:
             raise ValueError(
@@ -637,6 +762,8 @@ class Config:
             hub_template=raw.get("hub_template", cls.hub_template),
             poll_interval=interval,
             round_cap=cap,
+            stability_rounds=stability,
+            stability_nonshipped_globs=nonshipped,
             repos=repos,
             authors=authors,
             operators=operators,

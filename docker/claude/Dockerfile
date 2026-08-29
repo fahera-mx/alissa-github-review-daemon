@@ -198,6 +198,12 @@ ARG ALISSA_REVIEW_SKILLS="alissa-code-workspace|alissa-code-review"
 # they are documented in the README, not duplicated here.
 ARG ALISSA_POLL_INTERVAL=""
 ARG ALISSA_ROUND_CAP=""
+# ALISSA_STABILITY_ROUNDS is pass-through for the same reason and by the same
+# mechanism: how many consecutive request_changes rounds with an EMPTY
+# shipped-product diff stop the loop (0 disables the guard entirely; the library
+# default is 3). It REQUIRES REVLOOP_VERSION >= 0.26.0 — an older library
+# refuses the unknown config key outright and the daemon will not start.
+ARG ALISSA_STABILITY_ROUNDS=""
 # Reviewer IDENTITY, and where its credential comes from (issue #51). Both are
 # pass-through (empty ARG default -> key omitted -> library default).
 #
@@ -302,6 +308,7 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_REVIEW_SKILLS=${ALISSA_REVIEW_SKILLS} \
     ALISSA_POLL_INTERVAL=${ALISSA_POLL_INTERVAL} \
     ALISSA_ROUND_CAP=${ALISSA_ROUND_CAP} \
+    ALISSA_STABILITY_ROUNDS=${ALISSA_STABILITY_ROUNDS} \
     ALISSA_REAP_GRACE_SECONDS=${ALISSA_REAP_GRACE_SECONDS} \
     ALISSA_REAP_SESSION_CAP=${ALISSA_REAP_SESSION_CAP} \
     ALISSA_MAX_CONCURRENT_SESSIONS=${ALISSA_MAX_CONCURRENT_SESSIONS} \

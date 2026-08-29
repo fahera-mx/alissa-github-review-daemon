@@ -42,6 +42,17 @@ SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}
 PER_PAGE = 100
 COMMENT_PAGE_LIMIT = 20
 
+# The compare endpoint's own file page. It serves at most 300 files per page
+# whatever `per_page` says, so the stop condition is a SHORT page rather than a
+# short `per_page` -- reading 100 back and stopping would silently truncate the
+# file list of any comparison with more than 100 changed files, and a truncated
+# file list is precisely how a shipped change would be missed and a still-moving
+# PR held. The page bound is the backstop: 10 pages is 3000 files, far past any
+# PR this loop reviews, and past it the read is refused rather than trusted (see
+# `compare_files`).
+COMPARE_FILE_PAGE = 300
+COMPARE_PAGE_LIMIT = 10
+
 # GitHub's OWN cap on the pull-request commits endpoint: it "lists a maximum of
 # 250 commits" and refers callers with more to the repository commits endpoint.
 # That, not a page count of ours, is where absence stops being provable -- a
@@ -1195,6 +1206,69 @@ class GitHub:
                 COMMENT_PAGE_LIMIT * PER_PAGE,
             )
         return out
+
+    def compare_files(
+        self, owner: str, repo: str, base_sha: str, head_sha: str
+    ) -> list[str]:
+        """Every path that differs between two commits, in the order GitHub
+        returns them.
+
+        Read on ONE path: the product-stability guard, which asks whether the
+        diff between the head a round judged N rounds ago and the head now
+        contains anything outside the non-shipped globs. That makes ABSENCE the
+        load-bearing answer, so the listing is paged to exhaustion and a listing
+        that runs past `COMPARE_PAGE_LIMIT` raises `TruncatedListing` rather
+        than returning a short list the caller would read as "nothing else
+        moved".
+
+        A RENAME contributes BOTH names. GitHub reports it as one entry whose
+        `filename` is the new path and whose `previous_filename` is the old one,
+        and only counting the new one loses exactly the case the guard must not
+        miss: `src/thing.ts` renamed to `tests/thing.test.ts` moved shipped
+        code, and reading only the destination makes it look like a test-only
+        change.
+
+        403 is NOT caught here (`forbidden_is_rate_limit=False` lets it through
+        as a CommandError): whether an unreadable comparison is fatal or merely
+        makes a guard inert is the caller's decision, not this client's -- and
+        this credential is the same PAT that cannot read check-runs, so it is a
+        live case rather than a theoretical one.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        for page in range(1, COMPARE_PAGE_LIMIT + 1):
+            payload = (
+                self._api(
+                    "-X",
+                    "GET",
+                    f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
+                    "-f",
+                    f"per_page={COMPARE_FILE_PAGE}",
+                    "-f",
+                    f"page={page}",
+                    forbidden_is_rate_limit=False,
+                )
+                or {}
+            )
+            files = payload.get("files") or []
+            for entry in files:
+                for key in ("filename", "previous_filename"):
+                    name = str(entry.get(key) or "")
+                    if name and name not in seen:
+                        seen.add(name)
+                        out.append(name)
+            if len(files) < COMPARE_FILE_PAGE:
+                return out
+        log.warning(
+            "%s/%s comparison %s...%s served %d file page(s) without ending — "
+            "the file list is not complete, so 'nothing shipped moved' cannot "
+            "be read from it",
+            owner, repo, base_sha[:8], head_sha[:8], COMPARE_PAGE_LIMIT,
+        )
+        raise TruncatedListing(
+            f"{owner}/{repo} comparison {base_sha[:8]}...{head_sha[:8]} exceeded "
+            f"{COMPARE_PAGE_LIMIT} file pages; absence cannot be proven from it"
+        )
 
     def update_comment(self, owner: str, repo: str, comment_id: int, body: str) -> None:
         self._api(
