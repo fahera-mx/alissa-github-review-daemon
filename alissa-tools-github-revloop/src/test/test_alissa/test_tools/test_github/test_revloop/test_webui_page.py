@@ -159,8 +159,8 @@ def test_inbox_settled_rows_ride_behind_a_collapsed_footer():
     this", and must not displace its empty state."""
     html = dashboard_page("c", "1.0.0")
     # both halves of the payload reach the renderer
-    assert "renderInbox(d.inbox, d.inbox_settled)" in html
-    assert "function renderInbox(items, settled)" in html
+    assert "renderInbox(d.inbox, d.inbox_settled," in html
+    assert "function renderInbox(items, settled," in html
     # the footer is emitted when there are settled rows -- and only then, so an
     # inbox with nothing filed away renders exactly as it does today
     assert "if (settled.length) {" in html
@@ -179,7 +179,8 @@ def test_inbox_clear_is_the_empty_state_of_the_live_half_only():
     that is the whole point of the split."""
     html = dashboard_page("c", "1.0.0")
     assert "items.length ? items.map(inboxRow).join('')" in html
-    assert '<div class="empty">Inbox clear.</div>' in html
+    assert '\'<div class="empty">\' + empty + \'</div>\'' in html
+    assert "'Inbox clear.'" in html
     # the empty state is chosen off `items`, never off a merged list
     assert "if (!items.length)" not in html
 
@@ -191,3 +192,16 @@ def test_live_and_settled_rows_share_one_row_builder():
     assert html.count("function inboxRow(it)") == 1
     assert html.count("map(inboxRow)") == 2
     assert '<div class="inbox-item"><span>' in html
+
+
+def test_inbox_clear_is_never_claimed_off_a_truncated_read():
+    """`Inbox clear.` positively asserts that nothing is owed. The ledger reads
+    are bounded, so when one comes back full the panel says what it actually
+    knows -- no live pages *among the rows read* (PR #109 round 1, [major])."""
+    html = dashboard_page("c", "1.0.0")
+    assert "function renderInbox(items, settled, truncated)" in html
+    assert "renderInbox(d.inbox, d.inbox_settled, d.inbox_truncated)" in html
+    assert "var empty = truncated" in html
+    assert "it was truncated, so an older page may still be outstanding." in html
+    # and the clear claim is the OTHER branch of that same choice
+    assert "      : 'Inbox clear.';" in html

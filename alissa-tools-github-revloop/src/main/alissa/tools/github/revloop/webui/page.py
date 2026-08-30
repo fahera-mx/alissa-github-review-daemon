@@ -524,10 +524,16 @@ _JS = r"""
   // <details> and never displaces the empty state. An inbox whose live half
   // is empty says "Inbox clear." even with a hundred settled rows behind it:
   // that is the whole point of the split.
-  function renderInbox(items, settled) {
+  function renderInbox(items, settled, truncated) {
     settled = settled || [];
+    // `Inbox clear.` is a positive claim that nothing is owed, so it may only
+    // be made off a COMPLETE read. When a ledger read came back at its bound
+    // there are older rows nobody looked at, and the panel says that instead.
+    var empty = truncated
+      ? 'No live pages in the ledger window read — it was truncated, so an older page may still be outstanding.'
+      : 'Inbox clear.';
     var body = items.length ? items.map(inboxRow).join('')
-      : '<div class="empty">Inbox clear.</div>';
+      : '<div class="empty">' + empty + '</div>';
     if (settled.length) {
       body += '<details class="inbox-settled"><summary>' +
         settled.length + ' settled — show</summary>' +
@@ -634,7 +640,7 @@ _JS = r"""
     sparkline(el('spark-duration'), d.sparklines.poll_duration_ms);
     sparkline(el('spark-active'), d.sparklines.active_sessions);
     renderPipeline(d.pipeline);
-    renderInbox(d.inbox, d.inbox_settled);
+    renderInbox(d.inbox, d.inbox_settled, d.inbox_truncated);
     renderSessions(d.sessions);
     renderTopProcs(d.top_procs);
     renderLog(d.log);

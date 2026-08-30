@@ -872,27 +872,35 @@ alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
   of the cap** → session → stage (`spawned` / `in-flight` / `deferred` /
   `queued` / `checks-held` / `stale-re-enqueued` / `converged` / `capped` /
   `escalated` / `skipped`). The
-  inbox pages the two things the daemon pages a human about: CR9 **cap-outs**
-  (from `escalations`) and **stalled** deferral episodes (from `pings`), both
-  linking to the PR. There is no worker-tasks panel — reviewers create no tasks —
-  and no maintenance edge.
+  inbox pages the three things the daemon pages a human about: CR9 **cap-outs**
+  (from `escalations`), **stalled** deferral episodes and **stability holds**
+  (both from `pings`, under their own kind prefixes), all linking to the PR.
+  There is no worker-tasks panel — reviewers create no tasks — and no
+  maintenance edge.
 - **Settled pages are filed away, not deleted.** `escalations` and `pings` are
   dedupe key stores the daemon must keep, so they are never pruned — and an
   inbox bounded only by row count therefore fills with pages whose PR merged
   days ago, until an operator learns to skim past it and misses the live rows
   too. The console splits them at read time, from the daemon's own exhaust and
   still without a single GitHub call: a page is **live** while its PR is in the
-  newest poll snapshot's items, and **settled** once it has left that candidate
-  set — merged, closed, or the review request withdrawn — because nothing the
-  console offers can act on it any more. A capped or stability-held PR that is
-  still open keeps its review request, so its page stays live: that is exactly
-  the one owed a re-entry ack. Settled rows move behind a collapsed
-  `N settled — show` footer and `Inbox clear.` is the empty state of the live
-  half only. Two guards keep the split from hiding real work: a page raised
-  within the last two poll intervals is live whatever the snapshot says (it may
-  simply predate the pass), and when there is no snapshot at all — a fresh boot,
-  an unreadable `state.db` — every row is live. Missing evidence never hides a
-  page.
+  newest poll snapshot's items, and **settled** once that pass no longer lists
+  it — ordinarily because the trigger cleared (merged, closed, or the review
+  request withdrawn), so nothing the console offers can act on it any more. A
+  capped or stability-held PR that is still open keeps its review request, so
+  its page stays live: that is exactly the one owed a re-entry ack. Settled rows
+  move behind a collapsed `N settled — show` footer and `Inbox clear.` is the
+  empty state of the live half only. Three guards keep the split from hiding
+  real work: a page raised within the last two poll intervals is live whatever
+  the snapshot says (it may simply predate the pass); when there is no snapshot
+  at all — a fresh boot, an unreadable `state.db` — every row is live; and the
+  ledgers are read several windows deeper than the panel renders, so a run of
+  settled rows cannot squeeze the live half out. When a read does come back at
+  its bound the payload says so and the panel drops the `Inbox clear.` claim,
+  which must mean *no live pages* and never *none among the rows I read*.
+  Missing evidence never hides a page. One caveat the split inherits rather than
+  creates: the daemon's own candidate listing is a single unpaginated search, so
+  past its page size a pass sees an arbitrary subset — TASK-1796886433 covers
+  closing that ceiling.
 - **Fail-closed auth.** `ALISSA_UI_PASSCODE` unset ⇒ refuse to start. Login is a
   constant-time compare behind a throttle; the session cookie is HMAC-signed with
   a key derived from the passcode **and** a per-boot nonce (so a restart logs

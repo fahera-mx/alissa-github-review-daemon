@@ -448,6 +448,8 @@ def test_dashboard_shape(tmp_path):
     assert len(d["inbox"]) == 3, "cap-out, stalled, stability-held"
     # every seeded page was raised moments ago, so none of them has settled
     assert d["inbox_settled"] == [] and d["inbox_settled_count"] == 0
+    # three rows is nowhere near a read bound, so the window was complete
+    assert d["inbox_truncated"] is False
     assert d["sessions"][0]["retry"]["number"] == 16
 
 
@@ -486,6 +488,7 @@ def test_dashboard_empty_state(tmp_path):
     assert d["sessions"] == []
     assert d["inbox"] == []
     assert d["inbox_settled"] == [] and d["inbox_settled_count"] == 0
+    assert d["inbox_truncated"] is False
 
 
 def test_dashboard_spends_no_github_budget_beyond_the_cached_checks(tmp_path):
@@ -628,15 +631,18 @@ def test_sessions_never_walks_proc_without_a_live_pane(tmp_path, monkeypatch):
 
 def test_inbox_is_bounded(tmp_path):
     """`escalations` and `pings` are never pruned, so an unbounded inbox would
-    keep every page ever raised on the dashboard forever."""
+    keep every page ever raised on the dashboard forever. Two bounds, not one:
+    the READ is capped at INBOX_READ_LIMIT (wide enough for the live/settled
+    split to have something to choose from) and what reaches the page is capped
+    again at INBOX_LIMIT."""
     src = make_sources(tmp_path, runner=_quiet_runner)
     with State(src.config.state_db) as st:
-        for n in range(sources_mod.INBOX_LIMIT + 20):
+        for n in range(sources_mod.INBOX_READ_LIMIT + 20):
             st.record_escalation("acme/widgets", 100 + n, f"sha{n}")
             st.record_ping("acme/widgets", 100 + n, f"stalled:s{n}")
     led = src.ledgers()
-    assert len(led["escalations"]) == sources_mod.INBOX_LIMIT
-    assert len(led["pings"]) == sources_mod.INBOX_LIMIT
+    assert len(led["escalations"]) == sources_mod.INBOX_READ_LIMIT
+    assert len(led["pings"]) == sources_mod.INBOX_READ_LIMIT
     assert len(src.dashboard()["inbox"]) == sources_mod.INBOX_LIMIT
 
 
@@ -826,19 +832,19 @@ def test_a_stability_ping_this_version_cannot_parse_is_dropped(tmp_path):
         [{"repo": "acme/widgets", "number": 21, "kind": "stability:only-a-head",
           "pinged_at": 4900}],
     )
-    assert inbox == {"live": [], "settled": []}
+    assert inbox == {"live": [], "settled": [], "truncated": False}
 
 
 def test_stability_pings_are_read_under_their_own_bound(tmp_path):
     """Their own filtered read, not a share of the stalled one: `read_pings`
     narrows in SQL, so a wave of one kind cannot evict the other."""
     with State(tmp_path / ".revloop" / "state.db") as st:
-        for i in range(sources_mod.INBOX_LIMIT + 5):
+        for i in range(sources_mod.INBOX_READ_LIMIT + 5):
             st.record_ping("acme/widgets", i, f"stability:head{i}:base{i}:0")
             st.record_ping("acme/widgets", i, f"stalled:session-{i}")
     src = make_sources(tmp_path)
     led = src.ledgers()
-    assert len(led["stability_pings"]) == sources_mod.INBOX_LIMIT
+    assert len(led["stability_pings"]) == sources_mod.INBOX_READ_LIMIT
     assert all(
         row["kind"].startswith("stability:") for row in led["stability_pings"]
     )
@@ -993,10 +999,9 @@ def test_telemetry_ping_kinds_reach_neither_list(tmp_path):
     src = make_sources(tmp_path)
     row = {"repo": "acme/widgets", "number": 4242,
            "kind": "activity-deferred:s", "pinged_at": 0}
-    assert src._inbox([], [row], [], live_prs=set()) == {"live": [],
-                                                         "settled": []}
-    assert src._inbox([], [row], [], live_prs=None) == {"live": [],
-                                                        "settled": []}
+    empty = {"live": [], "settled": [], "truncated": False}
+    assert src._inbox([], [row], [], live_prs=set()) == empty
+    assert src._inbox([], [row], [], live_prs=None) == empty
 
 
 def test_dashboard_partitions_the_inbox_and_counts_the_settled(tmp_path):
@@ -1058,3 +1063,69 @@ def test_a_row_too_malformed_to_key_degrades_instead_of_raising(tmp_path):
     src = make_sources(tmp_path)
     latest = {"ts": 1, "stages": [{"slug": "acme/widgets#16", "number": None}]}
     assert src._live_prs(latest, src._pipeline(latest)) == set()
+
+
+# -- the split must not empty the live half (PR #109 round 1, [major]) -------
+#
+# The split picks from whatever `ledgers()` read, so a read bounded at exactly
+# what the panel renders would make the live half "the live pages among the
+# newest INBOX_LIMIT rows" -- and a full window of settled rows would empty it
+# while a page is outstanding, with the console then positively asserting
+# `Inbox clear.`. Two guards: read wider than you render, and refuse the claim
+# when the read was truncated anyway.
+
+
+def test_a_live_page_survives_a_full_window_of_settled_ones(tmp_path):
+    """The reviewer's construction: every row newer than the live one has
+    settled. With the read bounded at what is rendered, the live page is row
+    INBOX_LIMIT+1 and never reaches the payload."""
+    src = make_sources(tmp_path, runner=_quiet_runner,
+                       wall=lambda: time.time() + 10_000)
+    with State(src.config.state_db) as st:
+        st.record_escalation("acme/widgets", 16, "livesha")     # PR in the snap
+        for n in range(sources_mod.INBOX_LIMIT + 20):           # all settled
+            st.record_escalation("acme/widgets", 500 + n, f"sha{n}")
+    d = src.dashboard()
+    # the CAP-OUT for #16 specifically -- #16 also has a stalled ping, so a
+    # bare number check would pass off the wrong row
+    assert (sources_mod.INBOX_CAP_OUT, 16) in {
+        (i["kind"], i["number"]) for i in d["inbox"]
+    }
+    assert d["inbox_settled_count"] == sources_mod.INBOX_LIMIT
+
+
+def test_a_truncated_read_is_reported_so_the_panel_cannot_claim_clear(tmp_path):
+    """`Inbox clear.` is a positive claim that nothing is owed; it may only be
+    made off a complete read. A wider window is still a window, so the payload
+    says when it hit the bound."""
+    src = make_sources(tmp_path, runner=_quiet_runner,
+                       wall=lambda: time.time() + 10_000)
+    with State(src.config.state_db) as st:
+        for n in range(sources_mod.INBOX_READ_LIMIT + 5):
+            st.record_escalation("acme/widgets", 500 + n, f"sha{n}")
+    d = src.dashboard()
+    assert d["inbox_truncated"] is True
+    # and the pages that displaced the window are all settled, so the live half
+    # is empty -- exactly the state the flag exists to qualify
+    assert [i for i in d["inbox"] if i["kind"] == sources_mod.INBOX_CAP_OUT] == []
+
+
+def test_truncation_is_reported_for_any_of_the_three_reads(tmp_path):
+    """Each store is read under its own bound, so ANY of them coming back full
+    means there are rows the split never saw."""
+    src = make_sources(tmp_path)
+    n = sources_mod.INBOX_READ_LIMIT
+    esc = [_escalation(i, at=i) for i in range(n)]
+    ping = [_stalled(i, at=i) for i in range(n)]
+    held = [_held(i, at=i) for i in range(n)]
+    assert src._inbox(esc, [], [], live_prs=set())["truncated"] is True
+    assert src._inbox([], ping, [], live_prs=set())["truncated"] is True
+    assert src._inbox([], [], held, live_prs=set())["truncated"] is True
+    # one row short of the bound is a complete read
+    assert src._inbox(esc[:-1], [], [], live_prs=set())["truncated"] is False
+
+
+def test_the_read_window_is_wider_than_the_rendered_one(tmp_path):
+    """Stated as a relation, not a number: the read must leave the split room
+    to fill the live half past a run of settled rows."""
+    assert sources_mod.INBOX_READ_LIMIT > sources_mod.INBOX_LIMIT
