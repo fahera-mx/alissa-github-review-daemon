@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -60,7 +61,7 @@ def seed(db_path):
 
 
 def make_sources(tmp_path, *, runner=None, http=None, clock=None, proc_root="/proc",
-                 cgroup_root="/sys/fs/cgroup", log_path=None):
+                 cgroup_root="/sys/fs/cgroup", log_path=None, wall=None):
     config = Config.build(tmp_path, {"repos": ["acme/widgets"]}, {})
     seed(config.state_db)
 
@@ -75,7 +76,10 @@ def make_sources(tmp_path, *, runner=None, http=None, clock=None, proc_root="/pr
         config=config, running_version="0.14.0", log_path=log_path,
         run=runner or default_run, http_get=http or default_http,
         proc_root=proc_root, cgroup_root=cgroup_root, clock=clk,
-        wall_clock=lambda: 5000.0,
+        # 5000 by default; `wall` overrides it for the tests that need the
+        # seeded ledger rows (stamped with the REAL clock by State) to read as
+        # old, which no fixed wall in the past can do.
+        wall_clock=wall or (lambda: 5000.0),
     )
 
 
@@ -319,7 +323,9 @@ def test_drift_unparseable_version_falls_back_to_equality(tmp_path):
 def test_inbox_pages_capouts_and_stalls_only(tmp_path):
     src = make_sources(tmp_path)
     led = src.ledgers()
-    inbox = src._inbox(led["escalations"], led["pings"], led["stability_pings"])
+    inbox = src._inbox(
+        led["escalations"], led["pings"], led["stability_pings"]
+    )["live"]
     kinds = [item["kind"] for item in inbox]
     # activity-deferred filtered
     assert sorted(kinds) == ["cap-out", "stability-held", "stalled"]
@@ -343,7 +349,7 @@ def test_inbox_ages_and_sorts_newest_first(tmp_path):
           "escalated_at": 1000}],
         [{"repo": "acme/widgets", "number": 16, "kind": "stalled:s",
           "pinged_at": 4900}],
-    )
+    )["live"]
     assert [i["age_seconds"] for i in inbox] == [100, 4000]  # wall clock 5000
 
 
@@ -440,6 +446,8 @@ def test_dashboard_shape(tmp_path):
     assert items[1]["retry"] is None
 
     assert len(d["inbox"]) == 3, "cap-out, stalled, stability-held"
+    # every seeded page was raised moments ago, so none of them has settled
+    assert d["inbox_settled"] == [] and d["inbox_settled_count"] == 0
     assert d["sessions"][0]["retry"]["number"] == 16
 
 
@@ -477,6 +485,7 @@ def test_dashboard_empty_state(tmp_path):
     assert d["pipeline"]["snapshot_ts"] is None
     assert d["sessions"] == []
     assert d["inbox"] == []
+    assert d["inbox_settled"] == [] and d["inbox_settled_count"] == 0
 
 
 def test_dashboard_spends_no_github_budget_beyond_the_cached_checks(tmp_path):
@@ -817,7 +826,7 @@ def test_a_stability_ping_this_version_cannot_parse_is_dropped(tmp_path):
         [{"repo": "acme/widgets", "number": 21, "kind": "stability:only-a-head",
           "pinged_at": 4900}],
     )
-    assert inbox == []
+    assert inbox == {"live": [], "settled": []}
 
 
 def test_stability_pings_are_read_under_their_own_bound(tmp_path):
@@ -834,3 +843,218 @@ def test_stability_pings_are_read_under_their_own_bound(tmp_path):
         row["kind"].startswith("stability:") for row in led["stability_pings"]
     )
     assert all(row["kind"].startswith("stalled:") for row in led["pings"])
+
+
+# -- settled inbox pages (issue #108) ---------------------------------------
+#
+# `escalations` and `pings` are dedupe key stores the daemon must keep, so they
+# are never pruned and the console cannot clear the inbox by deleting rows. It
+# has to tell backlog from exhaust at READ time, and from the local snapshot
+# alone -- a page load still costs the GitHub API nothing.
+
+
+def _escalation(number, at=0):
+    """A cap-out page. `at` is the wall stamp; the fixtures' clock reads 5000,
+    so the default is 5000s old -- far past any grace window here."""
+    return {"repo": "acme/widgets", "number": number, "head_sha": "aa",
+            "escalated_at": at}
+
+
+def _stalled(number, at=0):
+    return {"repo": "acme/widgets", "number": number, "kind": "stalled:s",
+            "pinged_at": at}
+
+
+def _held(number, at=0):
+    return {"repo": "acme/widgets", "number": number,
+            "kind": "stability:beefcafe1234:0ldbase99:0", "pinged_at": at}
+
+
+def _ledger_rows(db_path):
+    con = sqlite3.connect(db_path)
+    try:
+        return {
+            "escalations": con.execute(
+                "SELECT * FROM escalations ORDER BY number").fetchall(),
+            "pings": con.execute(
+                "SELECT * FROM pings ORDER BY number, kind").fetchall(),
+        }
+    finally:
+        con.close()
+
+
+def test_a_page_whose_pr_is_in_the_latest_snapshot_is_live(tmp_path):
+    """The trigger is still standing: the PR is open with a review pending, so
+    the pass still lists it and the page is still the operator's to answer."""
+    src = make_sources(tmp_path)
+    inbox = src._inbox([_escalation(12)], [], [],
+                       live_prs={("acme/widgets", 12)})
+    assert [i["number"] for i in inbox["live"]] == [12]
+    assert inbox["settled"] == []
+
+
+def test_a_page_whose_pr_left_the_candidate_set_is_settled(tmp_path):
+    """Absent from the newest pass = the trigger cleared (merged, closed, or
+    the review request withdrawn). Either way nothing this console offers can
+    act on it, so it is exhaust."""
+    src = make_sources(tmp_path)
+    inbox = src._inbox([_escalation(12)], [], [],
+                       live_prs={("acme/widgets", 99)})
+    assert inbox["live"] == []
+    assert [i["number"] for i in inbox["settled"]] == [12]
+
+
+def test_a_stalled_row_follows_the_same_liveness_rule(tmp_path):
+    """One rule for every page kind -- the question the split answers ("can I
+    still act on this?") does not depend on why the daemon paged."""
+    src = make_sources(tmp_path)
+    inbox = src._inbox([], [_stalled(16), _stalled(77)], [],
+                       live_prs={("acme/widgets", 16)})
+    assert [i["number"] for i in inbox["live"]] == [16]
+    assert [i["number"] for i in inbox["settled"]] == [77]
+
+
+def test_a_stability_hold_follows_the_same_liveness_rule(tmp_path):
+    """The third page kind (issue #105) postdates the issue that asked for this
+    split, and it is the kind most likely to outlive its PR: a hold is lifted
+    by an ack, not by the loop, so a merged held PR pages forever."""
+    src = make_sources(tmp_path)
+    inbox = src._inbox([], [], [_held(21), _held(88)],
+                       live_prs={("acme/widgets", 21)})
+    assert [i["number"] for i in inbox["live"]] == [21]
+    assert [i["number"] for i in inbox["settled"]] == [88]
+
+
+def test_a_page_raised_between_snapshots_stays_live(tmp_path):
+    """The oracle is the LATEST snapshot only, so a page raised after the
+    newest pass has no snapshot to appear in yet and would flicker into
+    `settled` for one refresh. The grace window is a strict `<`: a row exactly
+    at the bound has had a whole pass to show up."""
+    src = make_sources(tmp_path)
+    grace = sources_mod.INBOX_LIVE_GRACE_INTERVALS * src.config.poll_interval
+    assert grace > 0
+    inbox = src._inbox(
+        [_escalation(12, at=5000 - grace + 1),   # age grace-1 -> live
+         _escalation(13, at=5000 - grace)],      # age grace   -> settled
+        [], [], live_prs=set(),
+    )
+    assert [i["number"] for i in inbox["live"]] == [12]
+    assert [i["number"] for i in inbox["settled"]] == [13]
+
+
+def test_no_snapshot_means_every_row_is_live(tmp_path):
+    """Never hide a page on missing evidence -- the same rule the daemon's
+    liveness oracle uses for a failed listing. A fresh boot has no snapshot to
+    judge against, and an inbox that hides pages then is worse than one that
+    shows a few stale ones."""
+    src = make_sources(tmp_path)
+    assert src._live_prs(None, []) is None
+    inbox = src._inbox([_escalation(12)], [_stalled(16)], [], live_prs=None)
+    assert [i["number"] for i in inbox["live"]] == [12, 16]
+    assert inbox["settled"] == []
+
+
+def test_an_empty_poll_pass_is_evidence_not_a_missing_snapshot(tmp_path):
+    """A pass that found no candidates is a real answer: every page is settled.
+    Only the ABSENCE of a snapshot is the no-evidence case."""
+    src = make_sources(tmp_path)
+    assert src._live_prs({"ts": 1, "stages": []}, []) == set()
+
+
+def test_the_live_set_is_the_rendered_board_rows(tmp_path):
+    """Built from the pipeline items, not the raw stages, so the inbox and the
+    board can never disagree about what the pass had in hand."""
+    src = make_sources(tmp_path)
+    latest = src.snapshots()[0]
+    assert src._live_prs(latest, src._pipeline(latest)) == {
+        ("acme/widgets", 16), ("acme/widgets", 12),
+    }
+
+
+def test_settled_list_is_newest_first_and_bounded(tmp_path):
+    """The settled half is fed by the same never-pruned tables, so it needs the
+    same bound the live half has -- and it keeps the NEWEST rows, because a
+    page filed away yesterday is the one an operator might still want."""
+    src = make_sources(tmp_path)
+    rows = [_escalation(200 + n, at=n)
+            for n in range(sources_mod.INBOX_LIMIT + 20)]
+    inbox = src._inbox(rows, [], [], live_prs=set())
+    assert inbox["live"] == []
+    ages = [i["age_seconds"] for i in inbox["settled"]]
+    assert len(ages) == sources_mod.INBOX_LIMIT
+    assert ages == sorted(ages)                                  # newest first
+    assert ages[0] == 5000 - (sources_mod.INBOX_LIMIT + 19)      # the newest
+
+
+def test_telemetry_ping_kinds_reach_neither_list(tmp_path):
+    """`activity-deferred:*` is the dedupe key for a PR comment line, not an
+    operator page. Filing rows away is still rendering them, so the split must
+    not become a back door into the panel for the kind the inbox excludes."""
+    src = make_sources(tmp_path)
+    row = {"repo": "acme/widgets", "number": 4242,
+           "kind": "activity-deferred:s", "pinged_at": 0}
+    assert src._inbox([], [row], [], live_prs=set()) == {"live": [],
+                                                         "settled": []}
+    assert src._inbox([], [row], [], live_prs=None) == {"live": [],
+                                                        "settled": []}
+
+
+def test_dashboard_partitions_the_inbox_and_counts_the_settled(tmp_path):
+    """End to end. The seeded snapshot holds #16 and #12, so their pages stay
+    in `inbox`; #21 (a hold) and #99 (a cap-out) were never in a pass, so they
+    move to `inbox_settled`. The count rides along so the panel can render a
+    collapsed counter without re-deriving it."""
+    src = make_sources(tmp_path, runner=_quiet_runner,
+                       wall=lambda: time.time() + 10_000)
+    with State(src.config.state_db) as st:
+        st.record_escalation("acme/widgets", 99, "sha99")
+    d = src.dashboard()
+    assert {(i["kind"], i["number"]) for i in d["inbox"]} == {
+        (sources_mod.INBOX_CAP_OUT, 12), (sources_mod.INBOX_STALLED, 16),
+    }
+    assert {(i["kind"], i["number"]) for i in d["inbox_settled"]} == {
+        (sources_mod.INBOX_CAP_OUT, 99), (sources_mod.INBOX_STABILITY, 21),
+    }
+    assert d["inbox_settled_count"] == len(d["inbox_settled"]) == 2
+    # a settled row keeps the live row's shape -- the panel renders one markup
+    assert set(d["inbox_settled"][0]) == set(d["inbox"][0])
+
+
+def test_the_split_costs_no_github_call_and_writes_no_ledger_row(tmp_path):
+    """The console's contract, unchanged by the split: a page load spends no
+    GitHub budget beyond the cached rate meter, and the two dedupe key stores
+    are read-only to it -- pruning them would break the daemon's dedupe, which
+    is exactly why this is a read-time filter and not a delete."""
+    seen = []
+
+    def runner(argv, **kw):
+        seen.append(list(argv))
+        if argv[:3] == ["alissa", "tmux", "ls"]:
+            return "[]"
+        if argv[:3] == ["gh", "api", "rate_limit"]:
+            return "{}"
+        raise AssertionError(argv)
+
+    src = make_sources(tmp_path, runner=runner,
+                       wall=lambda: time.time() + 10_000)
+    with State(src.config.state_db) as st:
+        st.record_escalation("acme/widgets", 99, "sha99")
+    before = _ledger_rows(src.config.state_db)
+    d = src.dashboard()
+    assert d["inbox_settled_count"] == 2          # the split really ran
+    assert [a for a in seen if a and a[0] == "gh"] == [["gh", "api",
+                                                        "rate_limit"]]
+    assert _ledger_rows(src.config.state_db) == before
+
+
+def test_a_row_too_malformed_to_key_degrades_instead_of_raising(tmp_path):
+    """Every read path here degrades; none blanks the dashboard. A snapshot
+    item with no number simply does not join the live set (and a page with no
+    number cannot match one), which leaves the page live -- the safe side."""
+    assert sources_mod._pr_key("acme/widgets", 16) == ("acme/widgets", 16)
+    assert sources_mod._pr_key("acme/widgets", "16") == ("acme/widgets", 16)
+    assert sources_mod._pr_key("acme/widgets", None) is None
+    assert sources_mod._pr_key("acme/widgets", "not-a-number") is None
+    src = make_sources(tmp_path)
+    latest = {"ts": 1, "stages": [{"slug": "acme/widgets#16", "number": None}]}
+    assert src._live_prs(latest, src._pipeline(latest)) == set()

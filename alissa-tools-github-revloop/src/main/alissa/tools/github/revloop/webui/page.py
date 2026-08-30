@@ -244,6 +244,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .inbox-kind { font-family: var(--mono); font-size: 0.75rem; color: var(--status-blocked); }
 .inbox-kind.cap-out { color: var(--status-cancelled); }
 .inbox-kind.stability-held { color: var(--status-cancelled); }
+.inbox-settled > summary { cursor: pointer; list-style: none; padding: 0.55rem 0;
+  border-top: 1px solid var(--surface-border); color: var(--text-muted);
+  font-family: var(--mono); font-size: 0.75rem; }
+.inbox-settled > summary::-webkit-details-marker { display: none; }
+.inbox-settled .inbox-item { opacity: 0.55; }
 .log {
   font-family: var(--mono); font-size: 0.75rem; line-height: 1.55;
   color: var(--text-tertiary); background: var(--bg-primary);
@@ -504,16 +509,31 @@ _JS = r"""
     });
   }
 
-  function renderInbox(items) {
-    if (!items.length) { el('inbox').innerHTML = '<div class="empty">Inbox clear.</div>'; return; }
-    el('inbox').innerHTML = items.map(function (it) {
-      return '<div class="inbox-item"><span>' +
-        '<span class="inbox-kind ' + esc(it.kind) + '">' + esc(it.kind) + '</span> ' +
-        '<a href="' + esc(it.url) + '" target="_blank" rel="noopener">' +
-        esc(it.repo_slug) + '#' + esc(it.number) + '</a>' +
-        (it.detail ? ' <span class="muted mono">' + esc(it.detail) + '</span>' : '') +
-        '</span><span class="muted num">' + dur(it.age_seconds) + '</span></div>';
-    }).join('');
+  function inboxRow(it) {
+    return '<div class="inbox-item"><span>' +
+      '<span class="inbox-kind ' + esc(it.kind) + '">' + esc(it.kind) + '</span> ' +
+      '<a href="' + esc(it.url) + '" target="_blank" rel="noopener">' +
+      esc(it.repo_slug) + '#' + esc(it.number) + '</a>' +
+      (it.detail ? ' <span class="muted mono">' + esc(it.detail) + '</span>' : '') +
+      '</span><span class="muted num">' + dur(it.age_seconds) + '</span></div>';
+  }
+
+  // Two lists, one panel. `items` is what the operator still owes; `settled`
+  // is pages whose PR has left the poll's candidate set (merged, closed, or
+  // the review request withdrawn) -- exhaust, so it rides behind a collapsed
+  // <details> and never displaces the empty state. An inbox whose live half
+  // is empty says "Inbox clear." even with a hundred settled rows behind it:
+  // that is the whole point of the split.
+  function renderInbox(items, settled) {
+    settled = settled || [];
+    var body = items.length ? items.map(inboxRow).join('')
+      : '<div class="empty">Inbox clear.</div>';
+    if (settled.length) {
+      body += '<details class="inbox-settled"><summary>' +
+        settled.length + ' settled — show</summary>' +
+        settled.map(inboxRow).join('') + '</details>';
+    }
+    el('inbox').innerHTML = body;
   }
 
   function act(url, body, btn) {
@@ -614,7 +634,7 @@ _JS = r"""
     sparkline(el('spark-duration'), d.sparklines.poll_duration_ms);
     sparkline(el('spark-active'), d.sparklines.active_sessions);
     renderPipeline(d.pipeline);
-    renderInbox(d.inbox);
+    renderInbox(d.inbox, d.inbox_settled);
     renderSessions(d.sessions);
     renderTopProcs(d.top_procs);
     renderLog(d.log);
