@@ -1523,10 +1523,11 @@ class StabilityNotice:
     The bookkeeping travels WITH the text rather than being written when the
     gate decides, because the two are not the same event: the gate runs above
     the CI gate and `_ensure_hub`, either of which can still refuse the round.
-    Writing `lifts` there would spend an operator's re-entry grant on a round
-    that was never queued -- and the grant is the only thing that can lift the
-    hold, so spending one silently is the one bookkeeping error this guard
-    cannot afford.
+    Writing `grants_seen` there would spend an operator's re-entry grant on a
+    round that was never queued -- and the grant is the only thing that can lift
+    the hold, so spending one silently is the one bookkeeping error this guard
+    cannot afford. The seed strengthens that: a gate-time write would also seed
+    a fresh episode's ledger off a round the reviewer never received.
     """
 
     text: str
@@ -2319,9 +2320,19 @@ class ReviewWatcher:
         # capped out at 10, was granted +5, and went tests-only at round 13
         # would get five "grace" rounds and no hold -- the guard disarmed on
         # exactly the shape issue #105 cites (PR #106 round 1, minor). After the
-        # seed the predicate means what it should: only an ack posted AFTER this
-        # guard last spoke can lift the hold. Either way the write happens only
-        # once `_spawn` has actually queued the round.
+        # seed the predicate means what it should: only an ack THE LEDGER DID
+        # NOT ALREADY KNOW ABOUT can lift the hold. Deliberately not "posted
+        # after this guard last spoke", which claims more than the code
+        # enforces -- the seed reads `granted_rounds`, i.e. acks already
+        # collected into state, and `_collect_acks` runs from exactly two places
+        # (the cap-out branch and the `graced` branch here). So an ack posted
+        # while the loop is below its cap with no episode open is not recorded
+        # when it is posted; it is first discovered by a later `graced` scan and
+        # lifts the hold despite predating the notice. That is the doctrine
+        # working -- nothing consumed that grant, so it is genuinely unspent,
+        # and it errs toward extra rounds rather than a false hold (PR #106
+        # round 2, nit). Either way the write happens only once `_spawn` has
+        # actually queued the round.
         notice = STABILITY_NOTICE.format(
             base=base[:8],
             head=pr.head_sha[:8],
