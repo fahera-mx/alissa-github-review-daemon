@@ -805,7 +805,7 @@ def test_a_stability_notice_round_trips_and_carries_its_bookkeeping(ledger):
     row = ledger.stability_notice(REPO, 7)
 
     assert row is not None
-    assert (row["round"], row["rc_rounds"], row["lifts"]) == (4, 3, 0)
+    assert (row["round"], row["rc_rounds"], row["grants_seen"]) == (4, 3, 0)
 
 
 def test_a_later_notice_supersedes_the_first(ledger):
@@ -816,7 +816,7 @@ def test_a_later_notice_supersedes_the_first(ledger):
     ledger.record_stability_notice(REPO, 7, 5, 4, 1)
 
     row = ledger.stability_notice(REPO, 7)
-    assert (row["round"], row["rc_rounds"], row["lifts"]) == (5, 4, 1)
+    assert (row["round"], row["rc_rounds"], row["grants_seen"]) == (5, 4, 1)
     assert ledger._db.execute(
         "SELECT COUNT(*) AS n FROM stability_notices WHERE repo=?", (REPO,)
     ).fetchone()["n"] == 1

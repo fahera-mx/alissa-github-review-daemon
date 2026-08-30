@@ -48,8 +48,8 @@ from alissa.tools.github.revloop.alissa import (
 from alissa.tools.github.revloop.ghclient import (
     ACTIONS_FALLBACK_NOTE,
     CHECK_RUN_PAGE_LIMIT,
+    COMPARE_COMMITS_PER_PAGE,
     COMPARE_FILE_PAGE,
-    COMPARE_PAGE_LIMIT,
     CHECKS_GREEN,
     CHECKS_PENDING,
     CHECKS_RED,
@@ -8820,58 +8820,87 @@ def _compare_page(names, renames=()):
 
 
 def _compare_github(pages):
-    """A GitHub whose `_api` serves `pages` (one compare payload per page)."""
+    """A GitHub whose `_api` serves `pages` by page number.
+
+    Shaped to what api.github.com actually does, which is the whole of the
+    round-1 blocker: `files` rides on page 1 and page 2 carries NONE, however
+    many files the comparison has. A fixture that served files on every page --
+    the one this branch shipped first -- lets a reader that pages until a short
+    page look correct against a response the API never sends.
+    """
     gh = GitHub(login="alissa-app")
     calls = []
 
     def api(*args, **kwargs):
         calls.append(args)
-        page = int([a for a in args if a.startswith("page=")][0].split("=")[1])
-        return pages[page - 1] if page <= len(pages) else {"files": []}
+        page = [a for a in args if a.startswith("page=")]
+        n = int(page[0].split("=")[1]) if page else 1
+        return pages[n - 1] if n <= len(pages) else {"files": []}
 
     gh._api = api
     return gh, calls
 
 
-def test_compare_files_pages_and_counts_a_rename_both_ways():
-    """The compare endpoint serves at most COMPARE_FILE_PAGE files per page, so
-    a short page is the last one. A RENAME is one entry with two names, and only
-    reading the destination is how `src/thing.ts` -> `tests/thing.test.ts` would
-    look like a test-only change."""
-    first = _compare_page([f"src/f{i}.py" for i in range(COMPARE_FILE_PAGE)])
-    second = _compare_page(
-        ["tests/test_tail.py"], renames=[("src/thing.ts", "tests/thing.test.ts")]
+def test_compare_files_reads_one_page_and_counts_a_rename_both_ways():
+    """ONE request: `per_page` sizes the COMMITS array on this endpoint, and
+    the caller reads none of them. A RENAME is one entry with two names, and
+    only reading the destination is how `src/thing.ts` -> `tests/thing.test.ts`
+    would look like a test-only change."""
+    gh, calls = _compare_github(
+        [_compare_page(
+            ["src/a.py", "tests/b.py"],
+            renames=[("src/thing.ts", "tests/thing.test.ts")],
+        )]
     )
-    gh, calls = _compare_github([first, second])
 
     files = gh.compare_files(OWNER, REPO, "base", "head")
 
-    assert len(calls) == 2, "a full page is followed, a short page ends it"
-    assert files[0] == "src/f0.py"
-    assert "tests/test_tail.py" in files
-    assert "tests/thing.test.ts" in files and "src/thing.ts" in files
-    assert len(files) == COMPARE_FILE_PAGE + 3
-
-
-def test_compare_files_stops_on_the_first_short_page():
-    gh, calls = _compare_github([_compare_page(["src/a.py", "tests/b.py"])])
-
-    assert gh.compare_files(OWNER, REPO, "base", "head") == ["src/a.py", "tests/b.py"]
-    assert len(calls) == 1, "no speculative second fetch"
-
-
-def test_compare_files_refuses_to_answer_from_a_truncated_listing():
-    """ABSENCE is the load-bearing answer here, and a short list would be read
-    as 'nothing else moved'."""
-    pages = [
-        _compare_page([f"src/f{p}_{i}.py" for i in range(COMPARE_FILE_PAGE)])
-        for p in range(COMPARE_PAGE_LIMIT + 2)
+    assert len(calls) == 1, "the files array is not paginated — one call"
+    assert f"per_page={COMPARE_COMMITS_PER_PAGE}" in calls[0]
+    assert not any(a.startswith("page=") for a in calls[0]), "nothing to page"
+    assert files == [
+        "src/a.py", "tests/b.py", "tests/thing.test.ts", "src/thing.ts",
     ]
-    gh, calls = _compare_github(pages)
 
-    with pytest.raises(TruncatedListing):
+
+def test_compare_files_refuses_a_listing_at_the_api_cap():
+    """The measured shape, and the reason the first version of this was wrong:
+    page 1 serves the 300-file cap and page 2 serves NONE. A reader that stops
+    on a short page therefore stops on page 2 and hands back exactly 300 paths
+    as a complete diff — and `files` comes back in PATH ORDER, so what survives
+    is systematically the non-shipped early paths. ABSENCE is the answer this
+    feeds, so a listing at the cap is refused outright."""
+    at_cap = _compare_page([f"docs/f{i:04d}.md" for i in range(COMPARE_FILE_PAGE)])
+    gh, calls = _compare_github([at_cap, {"files": []}])
+
+    with pytest.raises(TruncatedListing, match="cap"):
         gh.compare_files(OWNER, REPO, "base", "head")
-    assert len(calls) == COMPARE_PAGE_LIMIT
+    assert len(calls) == 1, "no second call — there is no second page of files"
+
+
+def test_a_comparison_at_the_cap_makes_the_guard_inert_never_a_hold(
+    stability_config, caplog
+):
+    """End to end, in the direction that matters: a truncated comparison must
+    buy another round, not a hold. Before the round-1 fix this fixture held the
+    PR and paged an operator, because the 300 surviving paths were all
+    non-shipped while the real diff had moved shipped code."""
+    st = State(stability_config.state_db)
+    st.record_stability_notice(SLUG, NUMBER, 4, 3, 0)
+    reviews = stability_reviews() + [
+        review("CHANGES_REQUESTED", sha=STABILITY_HEAD, at="2026-07-18T20:00:00Z")
+    ]
+    w, gh, al = watcher(
+        stability_config, make_pr(sha=STABILITY_HEAD), reviews, state=st
+    )
+    gh.compare_error = TruncatedListing("reported 300 files, the API's cap")
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 5
+    assert operator_comments(gh) == [], "a listing we cannot read is not a hold"
+    assert caplog.text.count("stability guard inert") == 1
 
 
 def test_stability_re_established_after_a_break_earns_a_fresh_grace_round(
@@ -8901,3 +8930,78 @@ def test_stability_re_established_after_a_break_earns_a_fresh_grace_round(
     assert d.action is Action.SPAWNED and d.round == 8, "a fresh grace round"
     assert "PRODUCT-STABILITY NOTICE" in al2.enqueued[-1]["directive"]
     assert len(operator_comments(gh2)) == 0, "the stale notice must not hold it"
+
+
+# -- the grant pool the guard may spend (PR #106 round 1) -------------------
+#
+# `State.granted_rounds` is a LIFETIME sum the cap consumes only implicitly, so
+# a grant acked for a cap-out is still in that total when the stability guard
+# reads it. Seeding `grants_seen` at the first notice is what stops the guard
+# spending it a second time.
+
+
+def test_a_cap_out_grant_does_not_pre_authorise_a_stability_grace_round(
+    stability_config,
+):
+    """The disarming shape: a PR caps out, an operator grants +2, the PR then
+    goes tests-only. Without the seed the guard would keep queuing 'grace'
+    rounds until it had spent both — on exactly the long PR the guard exists
+    for."""
+    cfg = dataclasses.replace(stability_config, round_cap=3)
+    st = State(cfg.state_db)
+    st.record_grant(SLUG, NUMBER, 900, OPERATOR, 2)      # acked for the CAP-OUT
+    assert st.granted_rounds(SLUG, NUMBER) == 2
+
+    w, gh, al = watcher(cfg, make_pr(sha=STABILITY_HEAD), stability_reviews(), state=st)
+    gh.changed_files = ["tests/test_app.py"]
+    first = w.evaluate(OWNER, REPO, NUMBER)              # round 4, grace
+    assert first.action is Action.SPAWNED
+    assert st.stability_notice(SLUG, NUMBER)["grants_seen"] == 2, (
+        "the fresh episode seeds the acks already on the PR"
+    )
+
+    add_round(gh, al, sha=STABILITY_HEAD, at="2026-07-18T20:00:00Z")
+    held = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert held.action is Action.ESCALATED, (
+        "a grant acked before the guard ever spoke is not a stability lift"
+    )
+    assert len(al.enqueued) == 1
+
+
+def test_an_ack_posted_after_the_notice_still_lifts_the_hold(stability_config):
+    """The other side of the seed, and the case that already worked: an ack
+    given while the hold stands is a stability lift and buys exactly its
+    rounds."""
+    st = State(stability_config.state_db)
+    st.record_grant(SLUG, NUMBER, 901, OPERATOR, 1)      # a stale, earlier ack
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+
+    gh.seed_comment(OPERATOR, ACK)                       # a NEW ack, +1
+    lifted = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert lifted.action is Action.SPAWNED and lifted.round == 5
+    assert "PRODUCT-STABILITY NOTICE" in al.enqueued[-1]["directive"]
+    assert st.stability_notice(SLUG, NUMBER)["grants_seen"] == 2
+
+
+def test_a_grace_round_bought_by_a_fresh_ack_reports_the_raised_cap(
+    stability_config,
+):
+    """The cap reaches the reviewer's CR6 envelope as `Round k of cap M`, and
+    the round most likely to be read back later is the one an operator paid
+    for. It must be right on THIS pass, not one poll later."""
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held
+    gh.seed_comment(OPERATOR, "alissa-review: re-enter +2")
+
+    lifted = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert lifted.action is Action.SPAWNED
+    cap = stability_config.round_cap + 2
+    assert f"cap {cap}" in al.enqueued[-1]["directive"], (
+        "the ack was discovered inside the stability gate, below where "
+        "`cap` was computed"
+    )

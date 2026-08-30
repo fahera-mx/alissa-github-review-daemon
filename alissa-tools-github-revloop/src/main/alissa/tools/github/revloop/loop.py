@@ -1534,8 +1534,9 @@ class StabilityNotice:
     # condition is "exactly one more than this", i.e. the grace round came back
     # request_changes; see State.stability_notices.
     rc_rounds: int
-    # Re-entry grants spent lifting a hold, carried forward.
-    lifts: int
+    # The operator-ack total this guard has already accounted for: seeded from
+    # the PR's grants on a fresh episode, +1 on a lift. See the table comment.
+    grants_seen: int
 
 
 @dataclass(frozen=True)
@@ -1555,6 +1556,14 @@ class StabilityGate:
 
     hold: Decision | None = None
     notice: StabilityNotice | None = None
+    # The PR's ack total as THIS gate read it, set only on the path that
+    # actually scanned for acks and None everywhere else. `evaluate` computes
+    # `cap` before the gate runs, so an ack posted to lift a stability hold --
+    # which the cap's own scan never looks for, the loop being nowhere near the
+    # cap -- would otherwise reach `_spawn` unaccounted for, and the round an
+    # operator just paid for would carry a cap one grant too low into its CR6
+    # envelope (PR #106 round 1, minor).
+    granted: int | None = None
 
 
 def session_name(pr: PullRequest, round_: int) -> str:
@@ -2015,10 +2024,27 @@ class ReviewWatcher:
         # a round it was never going to run), and a HELD round gives its FIFO
         # place up exactly as a refused one does -- a seat a held round keeps is
         # one the oldest genuine waiter does not get.
+        #
+        # ABOVE the slot gate rather than below it, and the cost of that is
+        # accepted rather than unnoticed (PR #106 round 1, nit): a round waiting
+        # for a slot re-buys one comparison per poll. Below the gate the call
+        # would be saved, but a product-stable PR waiting behind a full fleet
+        # would report to the console as `queued` rather than `stability-held`,
+        # and the page for a loop that has genuinely stopped would be deferred
+        # until the fleet drained. One `contents: read` call against a PR that
+        # is waiting anyway buys a decision made on time; the held-PR
+        # short-circuit already removes the steady-state repeat.
         stability = self._gate_spawn_on_stability(pr, my_reviews, round_)
         if stability.hold is not None:
             self._waiting.pop((pr.full_name, pr.number), None)
             return stability.hold
+        if stability.granted is not None:
+            # The gate scanned for acks and may have found one the cap's own
+            # scan never looks for. `cap` was computed before it ran, so it is
+            # recomputed here -- the round an operator just paid for must carry
+            # the raised cap into its directive and its CR6 envelope on THIS
+            # pass, not on the next poll.
+            cap = self.config.round_cap + stability.granted
 
         held = self._gate_spawn(pr, round_)
         if held is not None:
@@ -2208,7 +2234,7 @@ class ReviewWatcher:
         # Already-known state, all of it local reads: has the grace round been
         # spent, and on what.
         row = self.state.stability_notice(pr.full_name, pr.number)
-        lifts = int(row["lifts"]) if row is not None else 0
+        seen = int(row["grants_seen"]) if row is not None else 0
         # Exactly ONE further request_changes round since the notice is the
         # grace round coming back unmoved. Two or more means stability was
         # broken and re-established since, which earns a fresh grace round
@@ -2224,7 +2250,7 @@ class ReviewWatcher:
             # holding the loop.
             granted = self._collect_acks(pr, granted)
             self._announce_grants(pr)
-            if lifts >= granted and self.state.pinged(
+            if seen >= granted and self.state.pinged(
                 pr.full_name, pr.number, stability_kind(pr.head_sha, base, granted)
             ):
                 # Held on this head already, and no unspent grant to lift it.
@@ -2237,7 +2263,8 @@ class ReviewWatcher:
                         Action.CAPPED,
                         f"product-stable since `{base[:8]}` — already held",
                         round_,
-                    )
+                    ),
+                    granted=granted,
                 )
 
         try:
@@ -2274,15 +2301,26 @@ class ReviewWatcher:
             # queued exactly as it was before this guard existed.
             return StabilityGate()
 
-        if graced and lifts >= granted:
+        if graced and seen >= granted:
             return StabilityGate(
                 hold=self._hold_on_stability(
                     pr, round_, base, changed, granted, rounds
-                )
+                ),
+                granted=granted,
             )
 
-        # The grace round -- either the first stable one, or one an operator's
-        # re-entry bought. `lifts` advances only in the second case, and only
+        # The grace round -- either the FIRST stable one of this episode, or one
+        # an operator's re-entry bought.
+        #
+        # A first notice SEEDS `grants_seen` with the PR's current ack total; a
+        # lift adds one. Seeding is what stops a grant acked for an earlier
+        # CAP-OUT from being spent here a second time: `granted_rounds` is a
+        # lifetime sum the cap never decrements, so without the seed a PR that
+        # capped out at 10, was granted +5, and went tests-only at round 13
+        # would get five "grace" rounds and no hold -- the guard disarmed on
+        # exactly the shape issue #105 cites (PR #106 round 1, minor). After the
+        # seed the predicate means what it should: only an ack posted AFTER this
+        # guard last spoke can lift the hold. Either way the write happens only
         # once `_spawn` has actually queued the round.
         notice = STABILITY_NOTICE.format(
             base=base[:8],
@@ -2297,8 +2335,9 @@ class ReviewWatcher:
             notice=StabilityNotice(
                 text=notice,
                 rc_rounds=len(rc),
-                lifts=lifts + 1 if graced else lifts,
-            )
+                grants_seen=seen + 1 if graced else granted,
+            ),
+            granted=granted if graced else None,
         )
 
     def _hold_on_stability(
@@ -4328,7 +4367,7 @@ class ReviewWatcher:
                     pr.number,
                     round_,
                     stability.rc_rounds,
-                    stability.lifts,
+                    stability.grants_seen,
                 )
 
         # AFTER the enqueue on purpose: the activity comment is telemetry and

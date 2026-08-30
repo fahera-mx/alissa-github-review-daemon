@@ -42,16 +42,32 @@ SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}
 PER_PAGE = 100
 COMMENT_PAGE_LIMIT = 20
 
-# The compare endpoint's own file page. It serves at most 300 files per page
-# whatever `per_page` says, so the stop condition is a SHORT page rather than a
-# short `per_page` -- reading 100 back and stopping would silently truncate the
-# file list of any comparison with more than 100 changed files, and a truncated
-# file list is precisely how a shipped change would be missed and a still-moving
-# PR held. The page bound is the backstop: 10 pages is 3000 files, far past any
-# PR this loop reviews, and past it the read is refused rather than trusted (see
+# The compare endpoint's HARD cap on the `files` array, and it is a cap, not a
+# page: `files` is not paginated at all. Measured against api.github.com on
+# python/cpython v3.11.0...v3.12.0 (PR #106 round 1, blocker):
+#
+#   per_page=300 page=1 -> {"commits": 300, "files": 300}
+#   per_page=300 page=2 -> {"commits": 300, "files":   0}
+#   per_page=100 page=1 -> {"commits": 100, "files": 300}
+#   per_page=1   page=1 -> {"commits":   1, "files": 300}
+#
+# So `per_page` sizes the COMMITS array and nothing else, and page 2 carries no
+# files because there is no second page of them. A reader that paged until a
+# short page would take that empty page 2 as "the listing ended" and hand back
+# exactly 300 paths as a complete diff -- and `files` comes back in PATH ORDER,
+# so what survives is the alphabetically first 300, which is where `docs/**` and
+# `**/*.md` live and where `src/**` does not. Truncation therefore does not
+# sample the diff, it systematically keeps the non-shipped files and drops the
+# shipped ones -- inverting the one invariant the stability guard rests on.
+#
+# Hence: ONE request, and a full 300 means "cannot prove absence" (see
 # `compare_files`).
 COMPARE_FILE_PAGE = 300
-COMPARE_PAGE_LIMIT = 10
+
+# `per_page` only sizes the commits array, which no caller here reads, so it is
+# asked for the smallest legal value rather than for a page that matches the
+# file cap. 300 commits per evaluation was payload nobody looked at.
+COMPARE_COMMITS_PER_PAGE = 1
 
 # GitHub's OWN cap on the pull-request commits endpoint: it "lists a maximum of
 # 250 commits" and refers callers with more to the repository commits endpoint.
@@ -1211,15 +1227,21 @@ class GitHub:
         self, owner: str, repo: str, base_sha: str, head_sha: str
     ) -> list[str]:
         """Every path that differs between two commits, in the order GitHub
-        returns them.
+        returns them (path order).
 
         Read on ONE path: the product-stability guard, which asks whether the
         diff between the head a round judged N rounds ago and the head now
-        contains anything outside the non-shipped globs. That makes ABSENCE the
-        load-bearing answer, so the listing is paged to exhaustion and a listing
-        that runs past `COMPARE_PAGE_LIMIT` raises `TruncatedListing` rather
-        than returning a short list the caller would read as "nothing else
-        moved".
+        contains anything outside the non-shipped globs. ABSENCE is therefore
+        the load-bearing answer, and this endpoint cannot support it past
+        COMPARE_FILE_PAGE files -- the array is capped, not paged, so a
+        comparison at the cap is indistinguishable from one just under it. At
+        the cap the read is REFUSED (`TruncatedListing`) rather than answered
+        short; the caller turns that into an inert guard and another round.
+
+        ONE request. An earlier version paged until a short page, which on this
+        endpoint always arrived on page 2 with zero files -- see
+        COMPARE_FILE_PAGE for the measurement and for why the truncation is
+        biased rather than random.
 
         A RENAME contributes BOTH names. GitHub reports it as one entry whose
         `filename` is the new path and whose `previous_filename` is the old one,
@@ -1234,41 +1256,40 @@ class GitHub:
         this credential is the same PAT that cannot read check-runs, so it is a
         live case rather than a theoretical one.
         """
+        payload = (
+            self._api(
+                "-X",
+                "GET",
+                f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
+                "-f",
+                f"per_page={COMPARE_COMMITS_PER_PAGE}",
+                forbidden_is_rate_limit=False,
+            )
+            or {}
+        )
+        files = payload.get("files") or []
+        if len(files) >= COMPARE_FILE_PAGE:
+            log.warning(
+                "%s/%s comparison %s...%s reported %d files, the API's "
+                "per-comparison cap — the file list is not complete, so "
+                "'nothing shipped moved' cannot be read from it",
+                owner, repo, base_sha[:8], head_sha[:8], len(files),
+            )
+            raise TruncatedListing(
+                f"{owner}/{repo} comparison {base_sha[:8]}...{head_sha[:8]} "
+                f"reported {len(files)} files, the API's per-comparison cap; "
+                f"absence cannot be proven from it"
+            )
+
         out: list[str] = []
         seen: set[str] = set()
-        for page in range(1, COMPARE_PAGE_LIMIT + 1):
-            payload = (
-                self._api(
-                    "-X",
-                    "GET",
-                    f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
-                    "-f",
-                    f"per_page={COMPARE_FILE_PAGE}",
-                    "-f",
-                    f"page={page}",
-                    forbidden_is_rate_limit=False,
-                )
-                or {}
-            )
-            files = payload.get("files") or []
-            for entry in files:
-                for key in ("filename", "previous_filename"):
-                    name = str(entry.get(key) or "")
-                    if name and name not in seen:
-                        seen.add(name)
-                        out.append(name)
-            if len(files) < COMPARE_FILE_PAGE:
-                return out
-        log.warning(
-            "%s/%s comparison %s...%s served %d file page(s) without ending — "
-            "the file list is not complete, so 'nothing shipped moved' cannot "
-            "be read from it",
-            owner, repo, base_sha[:8], head_sha[:8], COMPARE_PAGE_LIMIT,
-        )
-        raise TruncatedListing(
-            f"{owner}/{repo} comparison {base_sha[:8]}...{head_sha[:8]} exceeded "
-            f"{COMPARE_PAGE_LIMIT} file pages; absence cannot be proven from it"
-        )
+        for entry in files:
+            for key in ("filename", "previous_filename"):
+                name = str(entry.get(key) or "")
+                if name and name not in seen:
+                    seen.add(name)
+                    out.append(name)
+        return out
 
     def update_comment(self, owner: str, repo: str, comment_id: int, body: str) -> None:
         self._api(
