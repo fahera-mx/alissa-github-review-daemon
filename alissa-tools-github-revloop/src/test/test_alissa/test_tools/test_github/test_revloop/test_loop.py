@@ -17,6 +17,8 @@ import pytest
 
 from alissa.tools.github.revloop.config import (
     CONFIG_FILENAME,
+    DEFAULT_STABILITY_NONSHIPPED_GLOBS,
+    DEFAULT_STABILITY_ROUNDS,
     DEFAULT_CHECKS_SPAWN_WAIT_SECONDS,
     DEFAULT_CHECKS_WAIT_SECONDS,
     DEFAULT_MAX_CONCURRENT_SESSIONS,
@@ -26,6 +28,8 @@ from alissa.tools.github.revloop.config import (
     HUB_ADD,
     ON_MISSING_SKIP,
     Config,
+    glob_matches,
+    is_nonshipped,
     resolve_config_path,
 )
 from alissa.tools.github.revloop.alissa import (
@@ -44,6 +48,8 @@ from alissa.tools.github.revloop.alissa import (
 from alissa.tools.github.revloop.ghclient import (
     ACTIONS_FALLBACK_NOTE,
     CHECK_RUN_PAGE_LIMIT,
+    COMPARE_COMMITS_PER_PAGE,
+    COMPARE_FILE_PAGE,
     CHECKS_GREEN,
     CHECKS_PENDING,
     CHECKS_RED,
@@ -59,6 +65,7 @@ from alissa.tools.github.revloop.ghclient import (
     RateLimited,
     Review,
     ReviewerTokenUnset,
+    TruncatedListing,
     countable_rounds,
     rollup_of,
     verdict_marker,
@@ -81,6 +88,7 @@ from alissa.tools.github.revloop.loop import (
     POLL_ESCALATE_SECONDS,
     POLL_FAILURE_LOG_EVERY,
     REENTRY_GRAMMAR,
+    STABILITY_NOTICE,
     STALE_ROUND_SECONDS,
     STALLED_DEFER_MULTIPLE,
     VERDICT_POST_GRACE_SECONDS,
@@ -94,7 +102,9 @@ from alissa.tools.github.revloop.loop import (
     drift_probe_kind,
     identity_drift_kind,
     parse_reentry_ack,
+    parse_stability_kind,
     session_name,
+    stability_kind,
     stalled_kind,
     verdict_post_kind,
 )
@@ -152,6 +162,14 @@ class FakeGitHub:
         self.rollups: dict[str, CheckRollup] = {}
         self.default_rollup = CheckRollup(CHECKS_GREEN)
         self.rollup_reads: list[str] = []
+        # What `compare_files` answers, and what it was asked. The DEFAULT is a
+        # shipped file: every fixture with enough request_changes rounds to be
+        # measurable is "the product moved" unless a test says otherwise, so the
+        # guard is inert across the rest of this suite exactly as it is on a PR
+        # that is still being worked.
+        self.changed_files: list[str] = ["src/app.py"]
+        self.compares: list[tuple[str, str]] = []
+        self.compare_error: BaseException | None = None
 
     def pull_request(self, owner, repo, number):
         self.pr_fetches += 1
@@ -190,6 +208,16 @@ class FakeGitHub:
         if self.commits_error:
             raise self.commits_error
         return list(self.commits)
+
+    def compare_files(self, owner, repo, base_sha, head_sha):
+        """Mirrors GitHub.compare_files: the paths between two commits. Records
+        the PAIR it was asked about, because reading the wrong base is the way
+        this guard would go quietly wrong -- a comparison against the current
+        head is empty for every PR."""
+        self.compares.append((base_sha, head_sha))
+        if self.compare_error:
+            raise self.compare_error
+        return list(self.changed_files)
 
     def check_rollup(self, owner, repo, sha):
         """Mirrors GitHub.check_rollup: an answer about the SHA it is asked
@@ -8355,3 +8383,625 @@ def test_the_cap_alarm_still_fires_when_hand_spawns_push_past_it(config, caplog)
         w.sweep_sessions()
 
     assert any("CAP EXCEEDED" in r.getMessage() for r in caplog.records)
+
+
+# -- the product-stability guard (issue #105) ------------------------------
+#
+# The measured tail this exists to cut: studio #847 ran 16 rounds, of which
+# 6-16 moved nothing but `tests/**` -- ~7 hours and ~22 agent sessions on a
+# product that had not changed since round 5. The guard is mechanical because
+# the judgment call it replaces is made by a FRESH session every round, which
+# has no memory that the sentence under discussion has already been litigated
+# three times.
+#
+# Two stages, both pinned below: the first stable round is still queued, told
+# what was measured; only a request_changes that comes back anyway, with the
+# product still unmoved, stops the loop.
+
+STABILITY_HEAD = "s4"
+
+
+@pytest.fixture
+def stability_config(config):
+    """Cap far out of reach, so what these tests observe is the STABILITY guard
+    and never the round cap firing underneath it, plus one allowlisted operator
+    (the ack is the documented way out of a hold)."""
+    return dataclasses.replace(config, round_cap=10, operators=(OPERATOR,))
+
+
+def stability_reviews(n=3):
+    """`n` request_changes rounds, each judging its own head -- the shape a PR
+    has when the implementer pushes fixes between rounds. Distinct shas matter:
+    a guard that compared the CURRENT head against itself would find every PR
+    on earth product-stable."""
+    return [
+        review("CHANGES_REQUESTED", sha=f"s{i + 1}", at=f"2026-07-18T1{i}:00:00Z")
+        for i in range(n)
+    ]
+
+
+def _spawn_the_grace_round(cfg, st, *, changed=("tests/test_app.py",)):
+    """Get a PR to the state the hold is decided from: three stable rounds, the
+    grace round queued with its notice, and that round coming back
+    request_changes without the product moving."""
+    w, gh, al = watcher(
+        cfg, make_pr(sha=STABILITY_HEAD), stability_reviews(), state=st
+    )
+    gh.changed_files = list(changed)
+    first = w.evaluate(OWNER, REPO, NUMBER)
+    assert first.action is Action.SPAWNED and first.round == 4
+    add_round(gh, al, sha=STABILITY_HEAD, at="2026-07-18T20:00:00Z")
+    return w, gh, al
+
+
+# (a) the product moved -----------------------------------------------------
+
+
+def test_a_shipped_change_in_the_window_spawns_a_plain_round(stability_config):
+    """Three request_changes rounds are not enough on their own: what stops the
+    loop is three rounds in which the SHIPPED product did not move."""
+    w, gh, al = watcher(
+        stability_config, make_pr(sha=STABILITY_HEAD), stability_reviews()
+    )
+    gh.changed_files = ["src/app.py", "tests/test_app.py"]
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 4
+    assert gh.compares == [("s1", STABILITY_HEAD)], (
+        "the window's OLDEST head against the current one — comparing the "
+        "current head with itself is empty for every PR"
+    )
+    assert "PRODUCT-STABILITY NOTICE" not in al.enqueued[0]["directive"]
+
+
+# (b) the grace round -------------------------------------------------------
+
+
+def test_a_stable_window_still_spawns_but_carries_the_notice(stability_config):
+    w, gh, al = watcher(
+        stability_config, make_pr(sha=STABILITY_HEAD), stability_reviews()
+    )
+    gh.changed_files = ["tests/test_app.py", "src/a/b/x.test.ts", "docs/why.md"]
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 4, "the grace round runs"
+    directive = al.enqueued[0]["directive"]
+    assert "PRODUCT-STABILITY NOTICE" in directive
+    assert "`s1`" in directive and f"`{STABILITY_HEAD}`" in directive
+    assert "3 consecutive request_changes rounds" in directive
+    assert "tests/test_app.py" in directive and "docs/why.md" in directive
+    assert "MUST name the shipped file:line" in directive
+    assert len(operator_comments(gh)) == 0, "a notice is not a page"
+
+
+def test_the_notice_is_remembered_only_once_the_round_is_queued(stability_config):
+    """The gate runs above the CI gate and hub provisioning, either of which can
+    still refuse the round. A notice recorded there would count as the grace
+    round a hold is measured against -- and, with an operator's re-entry in
+    hand, would spend the grant on a round that never ran."""
+    st = State(stability_config.state_db)
+    cfg = dataclasses.replace(stability_config, hub_template="{root}/missing/main")
+    w, gh, al = watcher(
+        cfg, make_pr(sha=STABILITY_HEAD), stability_reviews(), state=st
+    )
+    gh.changed_files = ["tests/test_app.py"]
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED, "no hub — the round cannot start"
+    assert al.enqueued == []
+    assert st.stability_notice(SLUG, NUMBER) is None
+
+
+# (c) the hold --------------------------------------------------------------
+
+
+def test_a_request_changes_on_the_grace_round_holds_the_loop(stability_config):
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+
+    held = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert held.action is Action.ESCALATED
+    assert len(al.enqueued) == 1, "round 5 is never queued"
+    pages = operator_comments(gh)
+    assert len(pages) == 1
+    assert "product-stability hold" in pages[0].lower()
+    assert "`s2`" in pages[0] and f"`{STABILITY_HEAD}`" in pages[0], "both shas"
+    assert REENTRY_GRAMMAR in pages[0], "the way out is on the page"
+    assert st.pinged(SLUG, NUMBER, stability_kind(STABILITY_HEAD, "s2", 0))
+    activity = activity_comments(gh)[0].body
+    assert "product-stability hold" in activity
+
+
+def test_the_hold_pages_once_per_head_not_once_per_poll(stability_config):
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    compares = len(gh.compares)
+
+    second = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert second.action is Action.CAPPED
+    assert len(operator_comments(gh)) == 1, "a hold pages once, not every poll"
+    assert len(al.enqueued) == 1
+    assert len(gh.compares) == compares, (
+        "an already-paged hold is answered from the ledger — a PR that is by "
+        "definition not moving must not buy a comparison every poll"
+    )
+    assert activity_comments(gh)[0].body.count("product-stability hold") == 1
+
+
+# (d) the operator ack lifts it ---------------------------------------------
+
+
+def test_an_operator_ack_lifts_the_hold_for_the_granted_rounds(stability_config):
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held + paged
+    gh.seed_comment(OPERATOR, ACK)                       # +1
+
+    fifth = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert fifth.action is Action.SPAWNED and fifth.round == 5
+    assert "PRODUCT-STABILITY NOTICE" in al.enqueued[-1]["directive"], (
+        "a granted round is still a round on a stable product — it gets told so"
+    )
+    # ...and the grant is spent: round 5 comes back request_changes, still
+    # unmoved, and the loop holds again rather than running on the same ack.
+    add_round(gh, al, sha=STABILITY_HEAD, at="2026-07-18T21:00:00Z")
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+    assert len(al.enqueued) == 2, "exactly the one round that was granted"
+    assert len(operator_comments(gh)) == 2, "a consumed grant is a new decision"
+
+
+# (e) approve still converges -----------------------------------------------
+
+
+def test_an_approve_after_a_hold_converges_exactly_as_today(stability_config):
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held
+
+    gh._reviews.append(
+        review("APPROVED", sha=STABILITY_HEAD, at="2026-07-18T22:00:00Z")
+    )
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.CONVERGED
+    assert len(al.enqueued) == 1
+
+
+# (f) an unmeasurable window ------------------------------------------------
+
+
+def test_a_review_with_no_commit_id_makes_the_guard_inert(stability_config):
+    """Older review records carry no `commit_id`, and a window with no base is
+    not a window. Fail toward another round, never toward a hold."""
+    reviews = stability_reviews()
+    reviews[0] = dataclasses.replace(reviews[0], commit_id="")
+    w, gh, al = watcher(stability_config, make_pr(sha=STABILITY_HEAD), reviews)
+    gh.changed_files = []
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 4
+    assert gh.compares == [], "nothing to compare against"
+    assert "PRODUCT-STABILITY NOTICE" not in al.enqueued[0]["directive"]
+
+
+# (g) the off switch --------------------------------------------------------
+
+
+def test_stability_rounds_zero_is_the_pre_change_daemon(stability_config):
+    """0 disables the guard COMPLETELY: the same fixture that would be held
+    with the guard on takes the pre-change decision, and buys no comparison
+    call on the way to it."""
+    cfg = dataclasses.replace(stability_config, stability_rounds=0)
+    st = State(cfg.state_db)
+    w, gh, al = watcher(
+        cfg, make_pr(sha=STABILITY_HEAD), stability_reviews(), state=st
+    )
+    gh.changed_files = []                                # maximally "stable"
+
+    first = w.evaluate(OWNER, REPO, NUMBER)
+    add_round(gh, al, sha=STABILITY_HEAD, at="2026-07-18T20:00:00Z")
+    second = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert first.action is Action.SPAWNED and first.round == 4
+    assert second.action is Action.SPAWNED and second.round == 5
+    assert gh.compares == []
+    assert operator_comments(gh) == []
+    assert st.stability_notice(SLUG, NUMBER) is None
+    assert all(
+        "PRODUCT-STABILITY" not in e["directive"] for e in al.enqueued
+    )
+
+
+def test_the_stability_default_is_three_and_zero_is_legal(tmp_path):
+    assert DEFAULT_STABILITY_ROUNDS == 3
+    assert Config(workspace_root=tmp_path).stability_rounds == 3
+    assert Config.build(tmp_path, {"stability_rounds": 0}, {}).stability_rounds == 0
+    with pytest.raises(ValueError, match="stability_rounds must be >= 0"):
+        Config.build(tmp_path, {"stability_rounds": -1}, {})
+
+
+# (h) an unreadable comparison ----------------------------------------------
+
+
+def test_a_forbidden_compare_makes_the_guard_inert_with_one_warning(
+    stability_config, caplog
+):
+    """The deployed credential is the same fine-grained PAT that cannot read
+    check-runs. A guard that held the loop on a permission it never had would
+    be worse than the tail it exists to cut."""
+    w, gh, al = watcher(
+        stability_config, make_pr(sha=STABILITY_HEAD), stability_reviews()
+    )
+    gh.compare_error = CommandError(
+        ["gh", "api"], 1, "Resource not accessible by personal access token (HTTP 403)"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 4
+    assert "PRODUCT-STABILITY NOTICE" not in al.enqueued[0]["directive"]
+    assert caplog.text.count("stability guard inert") == 1
+    assert operator_comments(gh) == []
+
+
+def test_throttling_is_not_an_answer_about_the_diff(stability_config):
+    """RateLimited is raised on, exactly as every other read does: the poll
+    backs off rather than this PR quietly losing its guard for a window."""
+    w, gh, _ = watcher(
+        stability_config, make_pr(sha=STABILITY_HEAD), stability_reviews()
+    )
+    gh.compare_error = RateLimited("secondary rate limit")
+
+    with pytest.raises(RateLimited):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+
+# (i) a head move re-evaluates ----------------------------------------------
+
+
+def test_a_tests_only_push_re_holds_on_the_new_head_with_a_fresh_page(
+    stability_config,
+):
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held at s4
+
+    moved = make_pr(sha="s5")                            # a tests-only push
+    w2, gh2, al2 = watcher(
+        stability_config, moved, list(gh._reviews), state=st
+    )
+    gh2.changed_files = ["tests/test_app.py"]
+    d = w2.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.ESCALATED, "a new head is a new decision"
+    assert len(operator_comments(gh2)) == 1, "one page for the new head"
+    assert al2.enqueued == [], "still no round — the product still has not moved"
+    assert st.pinged(SLUG, NUMBER, stability_kind("s5", "s2", 0))
+
+
+def test_a_shipped_push_clears_the_hold_with_no_ack_at_all(stability_config):
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held at s4
+
+    moved = make_pr(sha="s5")
+    w2, gh2, al2 = watcher(stability_config, moved, list(gh._reviews), state=st)
+    gh2.changed_files = ["src/app.py"]                   # the product moved
+
+    d = w2.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 5
+    assert "PRODUCT-STABILITY NOTICE" not in al2.enqueued[0]["directive"]
+    assert operator_comments(gh2) == []
+
+
+# -- the hold's bookkeeping -------------------------------------------------
+
+
+def test_the_hold_is_not_taken_in_dry_run(stability_config):
+    """A diagnostic pass REPORTS the decision production would take and writes
+    nothing — no PR comment, no ping row. The grace round is seeded into the
+    ledger directly because a dry-run `_spawn` records none, exactly as it
+    records no spawn row."""
+    st = State(stability_config.state_db)
+    st.record_stability_notice(SLUG, NUMBER, 4, 3, 0)
+    cfg = dataclasses.replace(stability_config, dry_run=True)
+    reviews = stability_reviews() + [
+        review("CHANGES_REQUESTED", sha=STABILITY_HEAD, at="2026-07-18T20:00:00Z")
+    ]
+    w, gh, al = watcher(cfg, make_pr(sha=STABILITY_HEAD), reviews, state=st)
+    gh.changed_files = ["tests/test_app.py"]
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.ESCALATED, "the decision is still reported"
+    assert al.enqueued == []
+    assert gh.comments == [], "a diagnostic pass never writes to GitHub"
+    assert not st.pinged(SLUG, NUMBER, stability_kind(STABILITY_HEAD, "s2", 0))
+
+
+def test_every_stability_evaluation_is_logged_with_both_shas(
+    stability_config, caplog
+):
+    w, gh, _ = watcher(
+        stability_config, make_pr(sha=STABILITY_HEAD), stability_reviews()
+    )
+    gh.changed_files = ["tests/test_app.py", "src/app.py"]
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert "stability acme/widgets#7: s1...s4" in caplog.text
+    assert "2 changed path(s), 1 shipped" in caplog.text
+
+
+def test_the_stability_ping_kind_round_trips():
+    kind = stability_kind("head1234", "base5678", 2)
+    assert parse_stability_kind(kind) == ("head1234", "base5678", 2)
+    assert parse_stability_kind("stalled:review-x") is None
+    assert parse_stability_kind("stability:only:two") is None
+
+
+# -- the non-shipped globs --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,pattern,matches",
+    [
+        # ** crosses directory separators -- the whole point, and the thing
+        # PurePosixPath.match gets wrong
+        ("src/a/b/x.test.ts", "**/*.test.*", True),
+        ("src/a/b/x.spec.js", "**/*.spec.*", True),
+        ("x.test.ts", "**/*.test.*", True),          # ...including zero of them
+        ("README.md", "**/*.md", True),
+        ("docs/deep/why.md", "**/*.md", True),
+        ("tests/a/b/c.py", "tests/**", True),
+        ("src/__snapshots__/a/b.snap", "**/__snapshots__/**", True),
+        ("__snapshots__/b.snap", "**/__snapshots__/**", True),
+        # ...but a single * still does not
+        ("docs/a/b/c.md", "docs/*", False),
+        ("src/app.py", "tests/**", False),
+        ("src/tests.py", "tests/**", False),
+        ("src/x.testing.ts", "**/*.test.*", False),
+        # case-sensitive: GitHub's paths are
+        ("Docs/x.MD", "**/*.md", False),
+    ],
+)
+def test_the_glob_matcher_crosses_directories_only_for_double_star(
+    path, pattern, matches
+):
+    assert glob_matches(path, pattern) is matches
+
+
+def test_the_default_globs_classify_a_realistic_diff():
+    shipped = [
+        f for f in [
+            "src/app.py",
+            "src/a/b/x.test.ts",
+            "tests/test_app.py",
+            "README.md",
+            "docs/design/why.md",
+            "src/_generated/schema.py",
+            "src/thing.spec.js",
+            "src/testdata.py",
+        ]
+        if not is_nonshipped(f, DEFAULT_STABILITY_NONSHIPPED_GLOBS)
+    ]
+    assert shipped == ["src/app.py", "src/testdata.py"], (
+        "anything not obviously a test, doc or generated artifact is SHIPPED"
+    )
+
+
+def test_an_empty_glob_list_makes_everything_shipped():
+    """The fail-toward-rounds direction, one more time: a deployment that
+    empties the list gets a guard that can never hold."""
+    assert not is_nonshipped("tests/test_app.py", ())
+
+
+# -- GitHub.compare_files ---------------------------------------------------
+
+
+def _compare_page(names, renames=()):
+    files = [{"filename": n, "status": "modified"} for n in names]
+    files += [
+        {"filename": new, "previous_filename": old, "status": "renamed"}
+        for old, new in renames
+    ]
+    return {"files": files}
+
+
+def _compare_github(pages):
+    """A GitHub whose `_api` serves `pages` by page number.
+
+    Shaped to what api.github.com actually does, which is the whole of the
+    round-1 blocker: `files` rides on page 1 and page 2 carries NONE, however
+    many files the comparison has. A fixture that served files on every page --
+    the one this branch shipped first -- lets a reader that pages until a short
+    page look correct against a response the API never sends.
+    """
+    gh = GitHub(login="alissa-app")
+    calls = []
+
+    def api(*args, **kwargs):
+        calls.append(args)
+        page = [a for a in args if a.startswith("page=")]
+        n = int(page[0].split("=")[1]) if page else 1
+        return pages[n - 1] if n <= len(pages) else {"files": []}
+
+    gh._api = api
+    return gh, calls
+
+
+def test_compare_files_reads_one_page_and_counts_a_rename_both_ways():
+    """ONE request: `per_page` sizes the COMMITS array on this endpoint, and
+    the caller reads none of them. A RENAME is one entry with two names, and
+    only reading the destination is how `src/thing.ts` -> `tests/thing.test.ts`
+    would look like a test-only change."""
+    gh, calls = _compare_github(
+        [_compare_page(
+            ["src/a.py", "tests/b.py"],
+            renames=[("src/thing.ts", "tests/thing.test.ts")],
+        )]
+    )
+
+    files = gh.compare_files(OWNER, REPO, "base", "head")
+
+    assert len(calls) == 1, "the files array is not paginated — one call"
+    assert f"per_page={COMPARE_COMMITS_PER_PAGE}" in calls[0]
+    assert not any(a.startswith("page=") for a in calls[0]), "nothing to page"
+    assert files == [
+        "src/a.py", "tests/b.py", "tests/thing.test.ts", "src/thing.ts",
+    ]
+
+
+def test_compare_files_refuses_a_listing_at_the_api_cap():
+    """The measured shape, and the reason the first version of this was wrong:
+    page 1 serves the 300-file cap and page 2 serves NONE. A reader that stops
+    on a short page therefore stops on page 2 and hands back exactly 300 paths
+    as a complete diff — and `files` comes back in PATH ORDER, so what survives
+    is systematically the non-shipped early paths. ABSENCE is the answer this
+    feeds, so a listing at the cap is refused outright."""
+    at_cap = _compare_page([f"docs/f{i:04d}.md" for i in range(COMPARE_FILE_PAGE)])
+    gh, calls = _compare_github([at_cap, {"files": []}])
+
+    with pytest.raises(TruncatedListing, match="cap"):
+        gh.compare_files(OWNER, REPO, "base", "head")
+    assert len(calls) == 1, "no second call — there is no second page of files"
+
+
+def test_a_comparison_at_the_cap_makes_the_guard_inert_never_a_hold(
+    stability_config, caplog
+):
+    """End to end, in the direction that matters: a truncated comparison must
+    buy another round, not a hold. Before the round-1 fix this fixture held the
+    PR and paged an operator, because the 300 surviving paths were all
+    non-shipped while the real diff had moved shipped code."""
+    st = State(stability_config.state_db)
+    st.record_stability_notice(SLUG, NUMBER, 4, 3, 0)
+    reviews = stability_reviews() + [
+        review("CHANGES_REQUESTED", sha=STABILITY_HEAD, at="2026-07-18T20:00:00Z")
+    ]
+    w, gh, al = watcher(
+        stability_config, make_pr(sha=STABILITY_HEAD), reviews, state=st
+    )
+    gh.compare_error = TruncatedListing("reported 300 files, the API's cap")
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 5
+    assert operator_comments(gh) == [], "a listing we cannot read is not a hold"
+    assert caplog.text.count("stability guard inert") == 1
+
+
+def test_stability_re_established_after_a_break_earns_a_fresh_grace_round(
+    stability_config,
+):
+    """A hold needs a grace round the reviewer actually received. Once the
+    product moves, the notice already spent is stale — the next stable window
+    is a NEW episode and gets told before it is stopped, or the guard would
+    hold a reviewer that was never warned about THIS convergence."""
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held at s4
+
+    # the implementer pushes shipped code: the hold clears by itself
+    moved = make_pr(sha="s5")
+    w2, gh2, al2 = watcher(stability_config, moved, list(gh._reviews), state=st)
+    gh2.changed_files = ["src/app.py"]
+    assert w2.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED  # round 5
+
+    # rounds 5, 6, 7 all come back request_changes, nothing pushed after them
+    for i, hour in enumerate(("21", "22", "23")):
+        add_round(gh2, al2, sha="s5", at=f"2026-07-18T{hour}:00:00Z")
+    gh2.changed_files = ["tests/test_app.py"]            # stable again
+
+    d = w2.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 8, "a fresh grace round"
+    assert "PRODUCT-STABILITY NOTICE" in al2.enqueued[-1]["directive"]
+    assert len(operator_comments(gh2)) == 0, "the stale notice must not hold it"
+
+
+# -- the grant pool the guard may spend (PR #106 round 1) -------------------
+#
+# `State.granted_rounds` is a LIFETIME sum the cap consumes only implicitly, so
+# a grant acked for a cap-out is still in that total when the stability guard
+# reads it. Seeding `grants_seen` at the first notice is what stops the guard
+# spending it a second time.
+
+
+def test_a_cap_out_grant_does_not_pre_authorise_a_stability_grace_round(
+    stability_config,
+):
+    """The disarming shape: a PR caps out, an operator grants +2, the PR then
+    goes tests-only. Without the seed the guard would keep queuing 'grace'
+    rounds until it had spent both — on exactly the long PR the guard exists
+    for."""
+    cfg = dataclasses.replace(stability_config, round_cap=3)
+    st = State(cfg.state_db)
+    st.record_grant(SLUG, NUMBER, 900, OPERATOR, 2)      # acked for the CAP-OUT
+    assert st.granted_rounds(SLUG, NUMBER) == 2
+
+    w, gh, al = watcher(cfg, make_pr(sha=STABILITY_HEAD), stability_reviews(), state=st)
+    gh.changed_files = ["tests/test_app.py"]
+    first = w.evaluate(OWNER, REPO, NUMBER)              # round 4, grace
+    assert first.action is Action.SPAWNED
+    assert st.stability_notice(SLUG, NUMBER)["grants_seen"] == 2, (
+        "the fresh episode seeds the acks already on the PR"
+    )
+
+    add_round(gh, al, sha=STABILITY_HEAD, at="2026-07-18T20:00:00Z")
+    held = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert held.action is Action.ESCALATED, (
+        "a grant acked before the guard ever spoke is not a stability lift"
+    )
+    assert len(al.enqueued) == 1
+
+
+def test_an_ack_posted_after_the_notice_still_lifts_the_hold(stability_config):
+    """The other side of the seed, and the case that already worked: an ack
+    given while the hold stands is a stability lift and buys exactly its
+    rounds."""
+    st = State(stability_config.state_db)
+    st.record_grant(SLUG, NUMBER, 901, OPERATOR, 1)      # a stale, earlier ack
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.ESCALATED
+
+    gh.seed_comment(OPERATOR, ACK)                       # a NEW ack, +1
+    lifted = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert lifted.action is Action.SPAWNED and lifted.round == 5
+    assert "PRODUCT-STABILITY NOTICE" in al.enqueued[-1]["directive"]
+    assert st.stability_notice(SLUG, NUMBER)["grants_seen"] == 2
+
+
+def test_a_grace_round_bought_by_a_fresh_ack_reports_the_raised_cap(
+    stability_config,
+):
+    """The cap reaches the reviewer's CR6 envelope as `Round k of cap M`, and
+    the round most likely to be read back later is the one an operator paid
+    for. It must be right on THIS pass, not one poll later."""
+    st = State(stability_config.state_db)
+    w, gh, al = _spawn_the_grace_round(stability_config, st)
+    w.evaluate(OWNER, REPO, NUMBER)                      # held
+    gh.seed_comment(OPERATOR, "alissa-review: re-enter +2")
+
+    lifted = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert lifted.action is Action.SPAWNED
+    cap = stability_config.round_cap + 2
+    assert f"cap {cap}" in al.enqueued[-1]["directive"], (
+        "the ack was discovered inside the stability gate, below where "
+        "`cap` was computed"
+    )

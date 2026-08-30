@@ -40,6 +40,9 @@ def seed(db_path):
                         head_sha="cafe1234", session=SESSION, task_ref="TASK-9")
         st.record_escalation("acme/widgets", 12, "deadbeefcafe")
         st.record_ping("acme/widgets", 16, "stalled:" + SESSION)
+        # the product-stability hold (issue #105): its own operator page,
+        # carrying both shas in the kind
+        st.record_ping("acme/widgets", 21, "stability:beefcafe1234:0ldbase99:0")
         # telemetry dedupe, NOT an operator page -- must not reach the inbox
         st.record_ping("acme/widgets", 16, "activity-deferred:" + SESSION)
         st.record_snapshot(
@@ -133,7 +136,9 @@ def test_state_read_degrades_on_lock(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sources_mod, "State", LockedState)
     assert src.snapshots() == []
-    assert src.ledgers() == {"escalations": [], "pings": []}
+    assert src.ledgers() == {
+        "escalations": [], "pings": [], "stability_pings": []
+    }
     # the retry mutation degrades to a clean failure, not a 500 -- and says
     # "state unavailable", never "no ledger row" (that is an operator-error
     # outcome, and conflating them would corrupt the audit trail)
@@ -314,15 +319,21 @@ def test_drift_unparseable_version_falls_back_to_equality(tmp_path):
 def test_inbox_pages_capouts_and_stalls_only(tmp_path):
     src = make_sources(tmp_path)
     led = src.ledgers()
-    inbox = src._inbox(led["escalations"], led["pings"])
+    inbox = src._inbox(led["escalations"], led["pings"], led["stability_pings"])
     kinds = [item["kind"] for item in inbox]
-    assert sorted(kinds) == ["cap-out", "stalled"]  # activity-deferred filtered
+    # activity-deferred filtered
+    assert sorted(kinds) == ["cap-out", "stability-held", "stalled"]
     by_kind = {item["kind"]: item for item in inbox}
     # every reviewer-edge reference is a PR reference
     assert by_kind["cap-out"]["url"] == "https://github.com/acme/widgets/pull/12"
     assert by_kind["stalled"]["url"] == "https://github.com/acme/widgets/pull/16"
     assert by_kind["cap-out"]["detail"] == "deadbeef"        # short head sha
     assert by_kind["stalled"]["detail"] == SESSION           # the stalled session
+    # BOTH shas, in the order the hold is stated in: the head the product
+    # stopped moving at, then the head it is still sitting at. One sha would
+    # say "held" without saying since when.
+    assert by_kind["stability-held"]["detail"] == "0ldbase9…beefcafe"
+    assert by_kind["stability-held"]["url"] == "https://github.com/acme/widgets/pull/21"
 
 
 def test_inbox_ages_and_sorts_newest_first(tmp_path):
@@ -428,7 +439,7 @@ def test_dashboard_shape(tmp_path):
     # a capped PR carries no round -> nothing to retry
     assert items[1]["retry"] is None
 
-    assert len(d["inbox"]) == 2
+    assert len(d["inbox"]) == 3, "cap-out, stalled, stability-held"
     assert d["sessions"][0]["retry"]["number"] == 16
 
 
@@ -500,7 +511,9 @@ def test_reads_never_create_the_state_db(tmp_path):
                   wall_clock=lambda: 5000.0)
     assert src.state_present() is False
     assert src.snapshots() == []
-    assert src.ledgers() == {"escalations": [], "pings": []}
+    assert src.ledgers() == {
+        "escalations": [], "pings": [], "stability_pings": []
+    }
     assert src.spawn_pairs([SESSION]) == {}
     assert not config.state_db.exists()
     assert not config.state_db.parent.exists()
@@ -789,3 +802,35 @@ def test_dashboard_scans_proc_once_for_both_panels(tmp_path, monkeypatch):
     d = src.dashboard()
     assert len(builds) == 1
     assert d["sessions"][0]["rss_bytes"] is not None and d["top_procs"]
+
+
+# -- the product-stability hold in the inbox (issue #105) -------------------
+
+
+def test_a_stability_ping_this_version_cannot_parse_is_dropped(tmp_path):
+    """The inbox is read to decide whether to act on a PR, so a row this
+    version cannot read is dropped rather than rendered half-parsed."""
+    src = make_sources(tmp_path)
+    inbox = src._inbox(
+        [],
+        [],
+        [{"repo": "acme/widgets", "number": 21, "kind": "stability:only-a-head",
+          "pinged_at": 4900}],
+    )
+    assert inbox == []
+
+
+def test_stability_pings_are_read_under_their_own_bound(tmp_path):
+    """Their own filtered read, not a share of the stalled one: `read_pings`
+    narrows in SQL, so a wave of one kind cannot evict the other."""
+    with State(tmp_path / ".revloop" / "state.db") as st:
+        for i in range(sources_mod.INBOX_LIMIT + 5):
+            st.record_ping("acme/widgets", i, f"stability:head{i}:base{i}:0")
+            st.record_ping("acme/widgets", i, f"stalled:session-{i}")
+    src = make_sources(tmp_path)
+    led = src.ledgers()
+    assert len(led["stability_pings"]) == sources_mod.INBOX_LIMIT
+    assert all(
+        row["kind"].startswith("stability:") for row in led["stability_pings"]
+    )
+    assert all(row["kind"].startswith("stalled:") for row in led["pings"])

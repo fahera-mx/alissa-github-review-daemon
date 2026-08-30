@@ -14,7 +14,10 @@
 #   * PASS-THROUGH (optional tuning knobs) — emitted ONLY when the env var is
 #     set. When unset the key is omitted entirely and the daemon library applies
 #     its own current default. These are pure tuning values where the library is
-#     the authority: poll_interval, round_cap, checks_wait_seconds (how long a
+#     the authority: poll_interval, round_cap, stability_rounds (how many
+#     consecutive request_changes rounds with an empty shipped-product diff stop
+#     the loop -- a property of how the reviewed repos are worked, not of the
+#     image, and 0 switches the guard off entirely), checks_wait_seconds (how long a
 #     round holds its approve for an unsettled CI rollup, per condition waited on
 #     -- so up to 2x it if an unreadable hold becomes a pending one; a property
 #     of the watched repos' CI, not of the image), checks_spawn_wait_seconds (how
@@ -83,6 +86,7 @@ render_revloop_config() {
     --arg     agent  "${ALISSA_AGENT_PROFILE:-claude}" \
     --arg     poll   "${ALISSA_POLL_INTERVAL:-}" \
     --arg     cap    "${ALISSA_ROUND_CAP:-}" \
+    --arg     stab   "${ALISSA_STABILITY_ROUNDS:-}" \
     --arg     grace  "${ALISSA_REAP_GRACE_SECONDS:-}" \
     --arg     scap   "${ALISSA_REAP_SESSION_CAP:-}" \
     --arg     gate   "${ALISSA_MAX_CONCURRENT_SESSIONS:-}" \
@@ -95,6 +99,7 @@ render_revloop_config() {
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
      + (if $poll  == "" then {} else { poll_interval:      ($poll  | tonumber) } end)
      + (if $cap   == "" then {} else { round_cap:          ($cap   | tonumber) } end)
+     + (if $stab  == "" then {} else { stability_rounds:   ($stab  | tonumber) } end)
      + (if $grace == "" then {} else { reap_grace_seconds: ($grace | tonumber) } end)
      + (if $scap  == "" then {} else { reap_session_cap:   ($scap  | tonumber) } end)
      + (if $gate  == "" then {} else { max_concurrent_sessions: ($gate  | tonumber) } end)

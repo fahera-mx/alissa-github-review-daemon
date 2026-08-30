@@ -739,7 +739,8 @@ if [ -n "$(repos_lines)" ]; then
   } > "${MANIFEST}"
 
   # The generated config PASSES THROUGH optional tuning keys: an unset
-  # ALISSA_POLL_INTERVAL / ALISSA_ROUND_CAP is omitted so the daemon library's
+  # ALISSA_POLL_INTERVAL / ALISSA_ROUND_CAP / ALISSA_STABILITY_ROUNDS is omitted
+  # so the daemon library's
   # own default applies (env var > library default, no shadowing entrypoint
   # layer). Structural keys (on_missing_hub, agent_profile) are always emitted.
   # See revloop-config.sh for the precedence contract and per-key rationale.

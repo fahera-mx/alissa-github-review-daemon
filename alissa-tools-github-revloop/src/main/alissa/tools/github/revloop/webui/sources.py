@@ -56,7 +56,12 @@ from typing import Callable
 
 from ..alissa import REVIEW_SESSION_PREFIX
 from ..config import Config
-from ..loop import ESCALATION_STALLED, STALE_ROUND_SECONDS
+from ..loop import (
+    ESCALATION_STABILITY,
+    ESCALATION_STALLED,
+    STALE_ROUND_SECONDS,
+    parse_stability_kind,
+)
 from ..proc import CommandError, run as proc_run
 from ..state import State
 from ..version import Version
@@ -85,6 +90,12 @@ RETRY_AGE_BUFFER = 60
 # telemetry, not an operator page -- so it is deliberately NOT an inbox item.
 INBOX_CAP_OUT = "cap-out"
 INBOX_STALLED = "stalled"
+# The product-stability hold (issue #105). Its own kind rather than a shade of
+# `cap-out`: both stop the loop and both are lifted by the same re-entry ack,
+# but the operator's question is different -- a cap-out asks "is ten rounds
+# enough?", a stability hold says "the product has not moved since <sha>", and
+# the two shas are the whole of what makes that checkable.
+INBOX_STABILITY = "stability-held"
 
 # How many INBOX ITEMS reach the payload. `escalations` and `pings` are never
 # pruned (their rows are the daemon's dedupe keys), so the console bounds its
@@ -95,6 +106,7 @@ INBOX_LIMIT = 50
 # The kind prefix that makes a ping row an operator page. `read_pings` matches
 # it in SQL; `_inbox` re-checks it to split the session out of the kind.
 PING_STALLED_PREFIX = f"{ESCALATION_STALLED}:"
+PING_STABILITY_PREFIX = f"{ESCALATION_STABILITY}:"
 
 # retry_now outcomes. Distinguishing "no row" from "the write was lost" keeps
 # the audit line honest: both degrade to a failed action, only one means the
@@ -249,11 +261,20 @@ class Sources:
         the console pages on. The spawn ledger is deliberately not here: it is
         a lookup table read by key, not a display list bounded by recency --
         `sessions` reads it for exactly the session names it renders."""
-        empty: "dict[str, list]" = {"escalations": [], "pings": []}
+        empty: "dict[str, list]" = {
+            "escalations": [], "pings": [], "stability_pings": []
+        }
         return self._read_state(empty, lambda st: {
             "escalations": st.read_escalations(INBOX_LIMIT),
             "pings": st.read_pings(
                 INBOX_LIMIT, kind_prefix=PING_STALLED_PREFIX
+            ),
+            # A SECOND bounded read rather than one unfiltered one: `read_pings`
+            # narrows to a single prefix in SQL so its limit bounds the rows the
+            # console actually renders, and the telemetry kinds interleaved with
+            # both pages would otherwise evict them.
+            "stability_pings": st.read_pings(
+                INBOX_LIMIT, kind_prefix=PING_STABILITY_PREFIX
             ),
         })
 
@@ -569,7 +590,11 @@ class Sources:
                 "round_cap": self.config.round_cap,
                 "items": self._pipeline(latest),
             },
-            "inbox": self._inbox(ledgers["escalations"], ledgers["pings"]),
+            "inbox": self._inbox(
+                ledgers["escalations"],
+                ledgers["pings"],
+                ledgers.get("stability_pings", []),
+            ),
             "sessions": sessions,
             # Host-wide, not per session: when the memory tile says the charge
             # IS resident, this is what names the holder.
@@ -607,7 +632,10 @@ class Sources:
         return items
 
     def _inbox(
-        self, escalations: "list[dict]", pings: "list[dict]"
+        self,
+        escalations: "list[dict]",
+        pings: "list[dict]",
+        stability_pings: "list[dict] | None" = None,
     ) -> "list[dict]":
         """The operator inbox: everything the daemon paged a human about, in
         one list, newest first.
@@ -652,6 +680,28 @@ class Sources:
                     "repo_slug": row["repo"],
                     "number": row["number"],
                     "detail": detail,
+                    "age_seconds": max(0, now - int(row["pinged_at"])),
+                    "url": f"https://github.com/{row['repo']}/pull/{row['number']}",
+                }
+            )
+        for row in stability_pings or []:
+            parsed = parse_stability_kind(str(row["kind"]))
+            if parsed is None:
+                # A row this version does not understand is dropped rather than
+                # rendered half-parsed: the inbox is read to decide whether to
+                # act on a PR, and "stability-held at ???" invites the wrong
+                # action.
+                continue
+            head, base, _granted = parsed
+            out.append(
+                {
+                    "kind": INBOX_STABILITY,
+                    "repo_slug": row["repo"],
+                    "number": row["number"],
+                    # Both shas, in the order the hold is stated in: the head
+                    # the product stopped moving at, then the head it is still
+                    # at. One sha would say "held" without saying since when.
+                    "detail": f"{base[:8]}…{head[:8]}",
                     "age_seconds": max(0, now - int(row["pinged_at"])),
                     "url": f"https://github.com/{row['repo']}/pull/{row['number']}",
                 }

@@ -42,6 +42,7 @@ assert_eq() {
 
 echo "== pass-through: optional knobs omitted when env unset =="
 out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
+        -u ALISSA_STABILITY_ROUNDS \
         -u ALISSA_REAP_GRACE_SECONDS -u ALISSA_REAP_SESSION_CAP \
         -u ALISSA_MAX_CONCURRENT_SESSIONS \
         -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
@@ -49,6 +50,8 @@ out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
         bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
 assert_key_absent "${out}" poll_interval "poll_interval omitted when ALISSA_POLL_INTERVAL unset"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP unset"
+assert_key_absent "${out}" stability_rounds \
+  "stability_rounds omitted when ALISSA_STABILITY_ROUNDS unset"
 assert_key_absent "${out}" reap_grace_seconds "reap_grace_seconds omitted when ALISSA_REAP_GRACE_SECONDS unset"
 assert_key_absent "${out}" reap_session_cap   "reap_session_cap omitted when ALISSA_REAP_SESSION_CAP unset"
 assert_key_absent "${out}" checks_wait_seconds \
@@ -85,14 +88,23 @@ assert_eq "${out}" '.reviewer_token_env' '"REVLOOP_REVIEWER_GH_TOKEN"' \
   "reviewer_token_env carries the variable NAME"
 
 echo "== empty-string env is treated as unset (Dockerfile bakes empty ENV) =="
-out="$(ALISSA_ROUND_CAP="" ALISSA_POLL_INTERVAL="" render_revloop_config "${REPOS}")"
+out="$(ALISSA_ROUND_CAP="" ALISSA_POLL_INTERVAL="" ALISSA_STABILITY_ROUNDS="" \
+       render_revloop_config "${REPOS}")"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP is empty"
+assert_key_absent "${out}" stability_rounds \
+  "stability_rounds omitted when ALISSA_STABILITY_ROUNDS is empty"
 assert_key_absent "${out}" poll_interval "poll_interval omitted when ALISSA_POLL_INTERVAL is empty"
 
 echo "== override: set env still wins, emitted as a JSON number =="
-out="$(ALISSA_ROUND_CAP=7 ALISSA_POLL_INTERVAL=90 render_revloop_config "${REPOS}")"
+out="$(ALISSA_ROUND_CAP=7 ALISSA_POLL_INTERVAL=90 ALISSA_STABILITY_ROUNDS=5 \
+       render_revloop_config "${REPOS}")"
 assert_eq "${out}" '.round_cap'     '7'  "round_cap override present as number"
+assert_eq "${out}" '.stability_rounds' '5' \
+  "stability_rounds override present as number"
 assert_eq "${out}" '.poll_interval' '90' "poll_interval override present as number"
+out="$(ALISSA_STABILITY_ROUNDS=0 render_revloop_config "${REPOS}")"
+assert_eq "${out}" '.stability_rounds' '0' \
+  "stability_rounds=0 (guard OFF) is emitted, not treated as unset"
 out="$(ALISSA_REAP_GRACE_SECONDS=900 ALISSA_REAP_SESSION_CAP=3 render_revloop_config "${REPOS}")"
 assert_eq "${out}" '.reap_grace_seconds' '900' "reap_grace_seconds override present as number"
 assert_eq "${out}" '.reap_session_cap'   '3'   "reap_session_cap override present as number"
@@ -145,7 +157,8 @@ assert_eq "${out}" '.agent_profile'  '"custom"' "agent_profile override wins"
 
 echo "== cross-check: omitted keys resolve to the LIBRARY default =="
 if python3 -c 'import alissa.tools.github.revloop.config' 2>/dev/null; then
-  # ALISSA_CHECKS_WAIT_SECONDS, ALISSA_CHECKS_SPAWN_WAIT_SECONDS,
+  # ALISSA_STABILITY_ROUNDS, ALISSA_CHECKS_WAIT_SECONDS,
+  # ALISSA_CHECKS_SPAWN_WAIT_SECONDS,
   # ALISSA_MAX_CONCURRENT_SESSIONS, ALISSA_REVIEW_TASK_MISS_TTL_POLLS and
   # ALISSA_TASK_LIST_SELF_SCOPE are unset here
   # too: the library this cross-check imports is the Dockerfile-PINNED release,
@@ -153,6 +166,7 @@ if python3 -c 'import alissa.tools.github.revloop.config' 2>/dev/null; then
   # into the config would then fail the cross-check for a version skew rather
   # than for a default drift.
   out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
+          -u ALISSA_STABILITY_ROUNDS \
           -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
           -u ALISSA_MAX_CONCURRENT_SESSIONS \
           -u ALISSA_REVIEW_TASK_MISS_TTL_POLLS -u ALISSA_TASK_LIST_SELF_SCOPE \

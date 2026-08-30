@@ -8,6 +8,21 @@
   "poll_interval": 60,
   "round_cap": 10,
 
+  "_stability_rounds": "PRODUCT-STABILITY GUARD (CR9 converged-by-stability). Once the shipped-product diff between the head judged this many `request_changes` rounds ago and the current head is EMPTY — nothing outside `stability_nonshipped_globs` moved — the next round is queued carrying a PRODUCT-STABILITY NOTICE telling the reviewer to approve or name the shipped file:line that is still wrong. If that grace round comes back `request_changes` with the product still unmoved, the daemon queues nothing further, pages the operator once per head, and waits for the same `alissa-review: re-enter +N` ack the cap-out uses. A push that moves a shipped file clears the hold by itself. Measured need: on the sampled fleet, no PR unapproved at round 5 ever needed a shipped-code change again, while one ran eleven further rounds moving only tests. 0 DISABLES the guard entirely — no comparison call, no directive block, no hold — and leaves every decision identical to the world before it existed.",
+  "stability_rounds": 3,
+
+  "_stability_nonshipped_globs": "Path globs whose movement is NOT product movement, for the guard above. `**` crosses directory separators (so `**/*.test.*` matches `src/a/b/x.test.ts` and `**/*.md` matches a top-level README.md); every other segment is an ordinary fnmatch pattern that cannot cross one. Deliberately conservative: anything not obviously a test, a doc or a generated artifact counts as SHIPPED, because calling shipped code non-shipped can hold a PR that still needs work while calling a test file shipped only costs another round. Comment-only hunks inside shipped files are not detected — a shipped file that changed at all is product movement. Replacing this list replaces it entirely.",
+  "stability_nonshipped_globs": [
+    "tests/**",
+    "test/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/*.md",
+    "docs/**",
+    "**/__snapshots__/**",
+    "**/_generated/**"
+  ],
+
   "_repos": "Allowlist of owner/repo; empty means every repo that requests a review. --repo replaces this list rather than extending it.",
   "repos": [],
 

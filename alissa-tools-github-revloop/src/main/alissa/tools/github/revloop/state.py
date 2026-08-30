@@ -230,6 +230,39 @@ CREATE TABLE IF NOT EXISTS spawn_checks_holds (
     PRIMARY KEY (repo, number, round, head_sha)
 );
 
+-- The product-stability guard's memory (issue #105): the GRACE ROUND it has
+-- already spent on a PR, and how many operator re-entry grants it has cashed in
+-- to lift a hold.
+--
+-- One row per PR, replaced each time a notice-carrying round is queued, because
+-- what the guard needs is not a history but an answer to one question: has the
+-- reviewer already been TOLD the product is stable and requested changes
+-- anyway? `rc_rounds` is the request_changes count at the moment the notice was
+-- queued, so exactly one further request_changes round (rc_rounds + 1) is the
+-- grace round closing without a shipped change -- the hold condition. Two or
+-- more means stability was broken and re-established since, which earns a fresh
+-- grace round rather than an immediate hold.
+--
+-- `grants_seen` is the operator-ack total this guard has ALREADY accounted for
+-- and will not lift a hold on again. A fresh episode seeds it with the PR's
+-- current `granted_rounds`; each lift adds one. Both halves are load-bearing:
+-- without the increment one ack would lift the same hold on every poll forever,
+-- and without the SEED an ack given earlier for a CAP-OUT would be spent a
+-- second time here -- `granted_rounds` is a lifetime SUM that the cap consumes
+-- only implicitly, so it still holds those rounds (PR #106 round 1, minor).
+-- Seeded rather than derived from `completed - round_cap`: that arithmetic
+-- double-counts in the other direction once a lifted round pushes `completed`
+-- past the cap, re-arming the guard a round early.
+CREATE TABLE IF NOT EXISTS stability_notices (
+    repo        TEXT    NOT NULL,
+    number      INTEGER NOT NULL,
+    round       INTEGER NOT NULL,
+    rc_rounds   INTEGER NOT NULL,
+    grants_seen INTEGER NOT NULL DEFAULT 0,
+    noticed_at  INTEGER NOT NULL,
+    PRIMARY KEY (repo, number)
+);
+
 CREATE TABLE IF NOT EXISTS poll_snapshots (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                INTEGER NOT NULL,
@@ -925,6 +958,38 @@ class State:
             "DELETE FROM spawn_checks_holds "
             "WHERE repo=? AND number=? AND round=? AND head_sha=?",
             (repo, number, round_, head_sha),
+        )
+        self._db.commit()
+
+    # -- the product-stability guard (issue #105) --------------------------
+
+    def stability_notice(self, repo: str, number: int) -> "sqlite3.Row | None":
+        """The PR's stability-notice row, or None if it has never had one."""
+        return self._db.execute(
+            "SELECT * FROM stability_notices WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+
+    def record_stability_notice(
+        self, repo: str, number: int, round_: int, rc_rounds: int, grants_seen: int
+    ) -> None:
+        """Remember that round `round_` was queued carrying the notice.
+
+        REPLACE, not IGNORE: a second notice-carrying round (a re-enqueue of the
+        same round, or a round bought by an operator ack) supersedes the first,
+        and the hold condition is measured against the NEWEST one.
+        `grants_seen` is passed in rather than computed here so the caller
+        decides what the write means -- a fresh episode SEEDS it, a lift
+        increments it, and a bare re-enqueue must do neither.
+        """
+        self._db.execute(
+            "INSERT OR REPLACE INTO stability_notices "
+            "(repo, number, round, rc_rounds, grants_seen, noticed_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                repo, number, int(round_), int(rc_rounds), int(grants_seen),
+                int(time.time()),
+            ),
         )
         self._db.commit()
 

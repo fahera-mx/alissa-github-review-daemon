@@ -115,6 +115,8 @@ variable `ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why.
 | `hub_template` | `{root}/{repo}/main` | reviewer cwd — the pristine `main/` mirror (CR6: reviewers never write) |
 | `poll_interval` | `60` | seconds; must be ≥10 |
 | `round_cap` | `10` | CR9 cap; never queues round cap+1 |
+| `stability_rounds` | `3` | **product-stability guard** (CR9 converged-by-stability): once the shipped-product diff between the head judged this many `request_changes` rounds ago and the current head is *empty*, the next round is queued carrying a **PRODUCT-STABILITY NOTICE**; if that grace round comes back `request_changes` with the product still unmoved, no further round is queued, the operator is paged once per head, and the same `alissa-review: re-enter +N` ack lifts it. A push that moves a shipped file clears the hold by itself. `0` disables the guard entirely — no comparison call, no notice, no hold |
+| `stability_nonshipped_globs` | `tests/**`, `test/**`, `**/*.test.*`, `**/*.spec.*`, `**/*.md`, `docs/**`, `**/__snapshots__/**`, `**/_generated/**` | what the guard above does **not** count as product movement. `**` crosses directory separators (so `**/*.test.*` matches `src/a/b/x.test.ts`, and `**/*.md` matches a top-level `README.md`); every other segment is an ordinary `fnmatch` pattern that cannot. Anything unmatched is **shipped** — a shipped file that changed *at all* is movement, comment-only hunks included |
 | `repos` | `[]` | allowlist of `owner/repo`; empty = all |
 | `authors` | `[]` | allowlist of GitHub logins whose PRs are reviewed; empty = all. A **scope filter, not the security boundary** — see *Who the loop serves* |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
@@ -393,6 +395,8 @@ Leave it on `skip` unless you want unattended clones.
 | approve (GitHub state or verdict envelope) **for the current head** | converged, no-op |
 | approve, but new commits landed since it was written | **not** converged — the approval is head-bound, so the next round is owed |
 | converged, and the daemon's own review request is *still* pending | that request is withdrawn, so the closed round leaves the poll set — see below |
+| the shipped diff has been empty for `stability_rounds` `request_changes` rounds | the round still spawns, carrying the **product-stability notice**: approve, or name the shipped `file:line` that is still wrong |
+| …and that grace round comes back `request_changes`, product still unmoved | **held** — no further round, one operator page per head, `stability-held` in the console; a shipped-file push or a re-entry ack lifts it |
 | `round_cap` reviews, no approve | comment cap-out on the PR, escalate, stop |
 | new commits after a cap-out | re-escalate (head moved, decision is about the new state) |
 | operator ack on a capped PR | grant N more rounds, log it, append to the activity comment |
