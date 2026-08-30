@@ -448,8 +448,10 @@ def test_dashboard_shape(tmp_path):
     assert len(d["inbox"]) == 3, "cap-out, stalled, stability-held"
     # every seeded page was raised moments ago, so none of them has settled
     assert d["inbox_settled"] == [] and d["inbox_settled_count"] == 0
-    # three rows is nowhere near a read bound, so the window was complete
+    # three rows is nowhere near a read bound, so the window was complete --
+    # and nothing was dropped by the per-half cap either
     assert d["inbox_truncated"] is False
+    assert d["inbox_settled_dropped"] == 0
     assert d["sessions"][0]["retry"]["number"] == 16
 
 
@@ -489,6 +491,7 @@ def test_dashboard_empty_state(tmp_path):
     assert d["inbox"] == []
     assert d["inbox_settled"] == [] and d["inbox_settled_count"] == 0
     assert d["inbox_truncated"] is False
+    assert d["inbox_settled_dropped"] == 0
 
 
 def test_dashboard_spends_no_github_budget_beyond_the_cached_checks(tmp_path):
@@ -832,7 +835,8 @@ def test_a_stability_ping_this_version_cannot_parse_is_dropped(tmp_path):
         [{"repo": "acme/widgets", "number": 21, "kind": "stability:only-a-head",
           "pinged_at": 4900}],
     )
-    assert inbox == {"live": [], "settled": [], "truncated": False}
+    assert inbox == {"live": [], "settled": [], "settled_dropped": 0,
+                     "truncated": False}
 
 
 def test_stability_pings_are_read_under_their_own_bound(tmp_path):
@@ -999,7 +1003,8 @@ def test_telemetry_ping_kinds_reach_neither_list(tmp_path):
     src = make_sources(tmp_path)
     row = {"repo": "acme/widgets", "number": 4242,
            "kind": "activity-deferred:s", "pinged_at": 0}
-    empty = {"live": [], "settled": [], "truncated": False}
+    empty = {"live": [], "settled": [], "settled_dropped": 0,
+             "truncated": False}
     assert src._inbox([], [row], [], live_prs=set()) == empty
     assert src._inbox([], [row], [], live_prs=None) == empty
 
@@ -1055,7 +1060,12 @@ def test_the_split_costs_no_github_call_and_writes_no_ledger_row(tmp_path):
 def test_a_row_too_malformed_to_key_degrades_instead_of_raising(tmp_path):
     """Every read path here degrades; none blanks the dashboard. A snapshot
     item with no number simply does not join the live set (and a page with no
-    number cannot match one), which leaves the page live -- the safe side."""
+    number cannot match one), which leaves the page live -- the safe side.
+
+    The classification is asserted, not just the two helpers: this docstring
+    described the safe side for a round while `_inbox` did the opposite, and a
+    test that documents behaviour the code does not have is worse than no test
+    -- it is what stops the next reader noticing (PR #109 round 2, [minor])."""
     assert sources_mod._pr_key("acme/widgets", 16) == ("acme/widgets", 16)
     assert sources_mod._pr_key("acme/widgets", "16") == ("acme/widgets", 16)
     assert sources_mod._pr_key("acme/widgets", None) is None
@@ -1063,6 +1073,15 @@ def test_a_row_too_malformed_to_key_degrades_instead_of_raising(tmp_path):
     src = make_sources(tmp_path)
     latest = {"ts": 1, "stages": [{"slug": "acme/widgets#16", "number": None}]}
     assert src._live_prs(latest, src._pipeline(latest)) == set()
+    # ...and the page itself: a snapshot IS present, it does not name this row,
+    # and the row is far past the grace window -- every reason to settle it
+    # except the one that matters, which is that the console cannot key it.
+    unkeyable = {"repo": "acme/widgets", "number": None,
+                 "head_sha": "deadbeef", "escalated_at": 0}
+    split = src._inbox([unkeyable], [], [],
+                       live_prs={("acme/widgets", 16)})
+    assert [i["number"] for i in split["live"]] == [None]
+    assert split["settled"] == []
 
 
 # -- the split must not empty the live half (PR #109 round 1, [major]) -------
@@ -1129,3 +1148,44 @@ def test_the_read_window_is_wider_than_the_rendered_one(tmp_path):
     """Stated as a relation, not a number: the read must leave the split room
     to fill the live half past a run of settled rows."""
     assert sources_mod.INBOX_READ_LIMIT > sources_mod.INBOX_LIMIT
+
+
+# -- the second, quieter truncation (PR #109 round 2, [nit]) -----------------
+#
+# `inbox_truncated` reports a READ that came back at its bound. The per-half
+# `[:INBOX_LIMIT]` cap drops rows well inside a read that never got near its
+# bound, so the flag says nothing about it and `inbox_settled_count` alone
+# would understate a real backlog with no signal anywhere on the panel.
+
+
+def test_the_settled_cap_reports_what_it_dropped(tmp_path):
+    """Both numbers true of what they label: the count is what expanding the
+    footer reveals, `settled_dropped` is what never reached the payload."""
+    src = make_sources(tmp_path)
+    n = sources_mod.INBOX_LIMIT + 7
+    split = src._inbox([_escalation(i) for i in range(n)], [], [],
+                       live_prs={("acme/widgets", 999)})
+    assert len(split["settled"]) == sources_mod.INBOX_LIMIT
+    assert split["settled_dropped"] == 7
+    # and the read itself was nowhere near its bound -- this is the whole point
+    assert split["truncated"] is False
+    # nothing dropped reports zero, not None: the footer suffix is additive
+    assert src._inbox([_escalation(1)], [], [],
+                      live_prs={("acme/widgets", 999)})["settled_dropped"] == 0
+
+
+def test_the_dropped_count_reaches_the_payload(tmp_path):
+    """End to end: the panel renders the suffix off the payload, not off a
+    length it re-derives."""
+    src = make_sources(tmp_path, runner=_quiet_runner,
+                       wall=lambda: time.time() + 10_000)
+    with State(src.config.state_db) as st:
+        for i in range(sources_mod.INBOX_LIMIT + 3):
+            st.record_escalation("acme/widgets", 500 + i, f"sha{i}")
+    d = src.dashboard()
+    assert d["inbox_settled_count"] == sources_mod.INBOX_LIMIT
+    # the 53 seeded here plus the fixture's own settled stability hold, less
+    # what the payload kept
+    assert d["inbox_settled_dropped"] == 54 - sources_mod.INBOX_LIMIT
+    # dropped by the per-half cap, NOT by a read bound -- the flag stays False
+    assert d["inbox_truncated"] is False

@@ -647,7 +647,12 @@ class Sources:
             # candidate set. Kept in the payload (the operator can still audit
             # what was raised) but out of the list that means "you owe this".
             "inbox_settled": inbox["settled"],
+            # Post-cap on purpose: the counter has to match the rows expanding
+            # the footer actually reveals. What the cap dropped rides beside
+            # it rather than inside it, so both numbers are true of the thing
+            # they label.
             "inbox_settled_count": len(inbox["settled"]),
+            "inbox_settled_dropped": inbox["settled_dropped"],
             # At least one ledger read came back at its bound, so there are
             # older rows this payload never looked at. The panel refuses to
             # claim `Inbox clear.` on a window it knows was truncated.
@@ -703,7 +708,10 @@ class Sources:
         ones: `review_requests` issues a single unpaginated `search/issues`
         call, so past its page size a pass sees an arbitrary subset, and one
         ranked by relevance rather than age, so the subset is not even stable
-        between calls (TASK-1796886433 covers closing that ceiling). A capped
+        between calls (TASK-1796886433 covers closing that ceiling), and a
+        repo dropped from `config.watches` stops being walked at all, which
+        settles its outstanding pages by operator action rather than by
+        anything the PR did. A capped
         (or stability-held) PR that is still open keeps its review request and
         so stays in the set: its page is exactly the one that needs a re-entry
         ack, and it must not be filed away.
@@ -762,12 +770,21 @@ class Sources:
         live -- see `_live_prs`.
 
         `truncated` reports that at least one of the reads came back AT its
-        bound, so there are older rows the split never saw. The page needs it
-        for one thing and it is the whole reason it exists: an empty `live`
-        half off a truncated window means "no live pages among the rows I
-        read", which is not what `Inbox clear.` claims. Widening the read (see
-        INBOX_READ_LIMIT) makes that rare; it cannot make it impossible, and a
-        panel that positively asserts nothing is owed had better be right.
+        bound, so there are older rows the split never saw. The reason it
+        exists is the empty case: an empty `live` half off a truncated window
+        means "no live pages among the rows I read", which is not what `Inbox
+        clear.` claims. It qualifies the non-empty case too, though -- a
+        partial list of live pages reads as complete unless the panel says
+        otherwise -- so the page renders it both ways. Widening the read (see
+        INBOX_READ_LIMIT) makes truncation rare; it cannot make it impossible,
+        and a panel that positively asserts nothing is owed had better be
+        right.
+
+        `settled_dropped` is the settled rows the INBOX_LIMIT cap left out of
+        the payload. It is a second, quieter truncation than `truncated`: it
+        happens inside a read that may never have reached its bound, so the
+        flag says nothing about it, and `len(settled)` alone would understate
+        a real backlog with no signal anywhere.
         """
         now = int(self._wall())
         grace = INBOX_LIVE_GRACE_INTERVALS * self.config.poll_interval
@@ -831,7 +848,15 @@ class Sources:
             if (
                 live_prs is None
                 or item["age_seconds"] < grace
-                or (key is not None and key in live_prs)
+                # A row this cannot key is missing evidence ABOUT THE ROW, and
+                # missing evidence never hides a page -- the same rule the
+                # None snapshot gets one clause up. Filing an unkeyable row
+                # away would be the console asserting something it does not
+                # know. Low reachability (both `number` columns are INTEGER
+                # NOT NULL), so this rests on caller discipline rather than on
+                # the schema, which is exactly why it is written down here.
+                or key is None
+                or key in live_prs
             ):
                 live.append(item)
             else:
@@ -839,5 +864,10 @@ class Sources:
         return {
             "live": live[:INBOX_LIMIT],
             "settled": settled[:INBOX_LIMIT],
+            # The settled rows the per-half cap left out. A SECOND truncation,
+            # and a quieter one: it happens inside a read that may never have
+            # hit its bound, so `truncated` says nothing about it and the
+            # count alone would silently understate.
+            "settled_dropped": max(0, len(settled) - INBOX_LIMIT),
             "truncated": truncated,
         }

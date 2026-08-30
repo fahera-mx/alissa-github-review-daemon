@@ -888,19 +888,25 @@ alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
   request withdrawn), so nothing the console offers can act on it any more. A
   capped or stability-held PR that is still open keeps its review request, so
   its page stays live: that is exactly the one owed a re-entry ack. Settled rows
-  move behind a collapsed `N settled — show` footer and `Inbox clear.` is the
-  empty state of the live half only. Three guards keep the split from hiding
-  real work: a page raised within the last two poll intervals is live whatever
-  the snapshot says (it may simply predate the pass); when there is no snapshot
-  at all — a fresh boot, an unreadable `state.db` — every row is live; and the
-  ledgers are read several windows deeper than the panel renders, so a run of
-  settled rows cannot squeeze the live half out. When a read does come back at
-  its bound the payload says so and the panel drops the `Inbox clear.` claim,
-  which must mean *no live pages* and never *none among the rows I read*.
-  Missing evidence never hides a page. One caveat the split inherits rather than
-  creates: the daemon's own candidate listing is a single unpaginated search, so
-  past its page size a pass sees an arbitrary subset — TASK-1796886433 covers
-  closing that ceiling.
+  move behind a collapsed `N settled — show` footer — which stays open across
+  the ten-second refresh once an operator expands it, since the half exists to
+  be audited — and `Inbox clear.` is the empty state of the live half only.
+  Four guards keep the split from hiding real work: a page raised within the
+  last two poll intervals is live whatever the snapshot says (it may simply
+  predate the pass); when there is no snapshot at all — a fresh boot, an
+  unreadable `state.db` — every row is live; a row the console cannot key at
+  all is live, because that is missing evidence about the row; and the ledgers
+  are read several windows deeper than the panel renders, so a run of settled
+  rows cannot squeeze the live half out. When a read does come back at its
+  bound the payload says so, and the panel both drops the `Inbox clear.` claim
+  — which must mean *no live pages* and never *none among the rows I read* —
+  and marks a non-empty list as short, which would otherwise read as complete.
+  The footer's own count is what expanding it reveals, with anything the
+  per-half cap left out named beside it (`+N not shown`) rather than folded
+  into it. Missing evidence never hides a page. One caveat the split inherits
+  rather than creates: the daemon's own candidate listing is a single
+  unpaginated search, so past its page size a pass sees an arbitrary subset —
+  TASK-1796886433 covers closing that ceiling.
 - **Fail-closed auth.** `ALISSA_UI_PASSCODE` unset ⇒ refuse to start. Login is a
   constant-time compare behind a throttle; the session cookie is HMAC-signed with
   a key derived from the passcode **and** a per-boot nonce (so a restart logs

@@ -249,6 +249,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   font-family: var(--mono); font-size: 0.75rem; }
 .inbox-settled > summary::-webkit-details-marker { display: none; }
 .inbox-settled .inbox-item { opacity: 0.55; }
+.inbox-note { color: var(--text-muted); font-size: 0.75rem; font-family: var(--mono);
+  padding: 0.55rem 0; border-top: 1px solid var(--surface-border); }
 .log {
   font-family: var(--mono); font-size: 0.75rem; line-height: 1.55;
   color: var(--text-tertiary); background: var(--bg-primary);
@@ -524,8 +526,20 @@ _JS = r"""
   // <details> and never displaces the empty state. An inbox whose live half
   // is empty says "Inbox clear." even with a hundred settled rows behind it:
   // that is the whole point of the split.
-  function renderInbox(items, settled, truncated) {
+  function renderInbox(items, settled, truncated, dropped) {
     settled = settled || [];
+    dropped = dropped || 0;
+    // The panel re-renders every poll and the innerHTML assignment below
+    // destroys this subtree, taking the <details> node with it -- and its
+    // `open` is the OPERATOR's state, not the payload's. So read it off the
+    // live node first and fold it back into the string being built, rather
+    // than re-applying it after the write (which would flash the footer shut
+    // for a frame on every poll). No prior node -- the first render, or an
+    // inbox that had nothing settled last time -- reads false, which is how
+    // collapsed-by-default survives this: the `open` here is never
+    // unconditional. Fifty rows are not readable in ten seconds.
+    var prior = el('inbox').querySelector('details.inbox-settled');
+    var open = !!(prior && prior.open);
     // `Inbox clear.` is a positive claim that nothing is owed, so it may only
     // be made off a COMPLETE read. When a ledger read came back at its bound
     // there are older rows nobody looked at, and the panel says that instead.
@@ -534,9 +548,20 @@ _JS = r"""
       : 'Inbox clear.';
     var body = items.length ? items.map(inboxRow).join('')
       : '<div class="empty">' + empty + '</div>';
+    // A truncated read qualifies the LIST as much as its absence: a partial
+    // list of live pages reads as complete unless the panel says otherwise,
+    // so the qualifier rides with the rows and not only with the empty state.
+    if (items.length && truncated) {
+      body += '<div class="inbox-note">ledger window truncated — older pages were not read</div>';
+    }
     if (settled.length) {
-      body += '<details class="inbox-settled"><summary>' +
-        settled.length + ' settled — show</summary>' +
+      // Two true numbers, not one: `settled.length` is what expanding the
+      // footer actually reveals, and `dropped` is what the per-half cap left
+      // out of the payload -- a drop that happens well inside a read that
+      // never hit its bound, so `truncated` does not cover it.
+      body += '<details class="inbox-settled"' + (open ? ' open' : '') + '><summary>' +
+        settled.length + ' settled' +
+        (dropped ? ' (+' + dropped + ' not shown)' : '') + ' — show</summary>' +
         settled.map(inboxRow).join('') + '</details>';
     }
     el('inbox').innerHTML = body;
@@ -640,7 +665,8 @@ _JS = r"""
     sparkline(el('spark-duration'), d.sparklines.poll_duration_ms);
     sparkline(el('spark-active'), d.sparklines.active_sessions);
     renderPipeline(d.pipeline);
-    renderInbox(d.inbox, d.inbox_settled, d.inbox_truncated);
+    renderInbox(d.inbox, d.inbox_settled, d.inbox_truncated,
+                d.inbox_settled_dropped);
     renderSessions(d.sessions);
     renderTopProcs(d.top_procs);
     renderLog(d.log);
