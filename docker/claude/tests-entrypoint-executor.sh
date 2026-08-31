@@ -17,6 +17,12 @@
 #                                            structural flags; no worker, no
 #                                            daemon, no revloop.config.json;
 #                                            identity + agent profile on the volume
+#                                            (model pin = the baked default, since
+#                                            the boot env carries no
+#                                            ALISSA_AGENT_MODEL)
+#   2b. the model pin is a DEFAULT        -> an explicit alias / full id lands
+#                                            verbatim; `default` and empty omit
+#                                            the flag instead of re-defaulting
 #   3. executor id required + validated   -> empty dies, bad slug dies
 #   4. the pass-through knobs             -> label / concurrency / interval only
 #                                            appear when they are set
@@ -200,6 +206,16 @@ wait_boot() {
 }
 
 EXECUTOR_UP="starting alissa bridge start"
+
+# The claude profile's rendered `command:` line from the executor's copy of
+# agents.yaml, value only. BASE_CMD mirrors the entrypoint's step-2e constant:
+# a model pin is exactly BASE_CMD plus `--model <value>`, and no pin is exactly
+# BASE_CMD — so every model assertion compares the WHOLE line.
+BASE_CMD="claude --dangerously-skip-permissions --permission-mode acceptEdits"
+profile_cmd() {
+  sed -n -E 's/^[[:space:]]*command:[[:space:]]*//p' \
+    "${WORKSPACE}/.alissa-config/agents.yaml" 2>/dev/null | head -n 1
+}
 DAEMON_UP="alissa worker is running"
 
 # -----------------------------------------------------------------------------
@@ -265,10 +281,55 @@ assert_contains "${LOG2}" "identity file ${WORKSPACE}/.alissa-config/bridge-exec
   "the executor identity file is placed on the volume"
 assert_file "${WORKSPACE}/.alissa-config/agents.yaml" \
   "the resolved agents.yaml is copied to the executor's config dir"
-assert_contains "${WORKSPACE}/.alissa-config/agents.yaml" "--model opus" \
-  "...with the model pin applied, exactly as the daemon role gets it"
+# start_boot runs under `env -i` with no ALISSA_AGENT_MODEL, so this is the
+# UNSET path: the pin must be the baked default, not an alias.
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model claude-fable-5" \
+  "...with the model pin applied (unset -> default claude-fable-5), exactly as the daemon role gets it"
+assert_contains "${LOG2}" "reviewer model: claude-fable-5 (ALISSA_AGENT_MODEL)" \
+  "...and the boot log names the default"
 assert_not_contains "${WORKSPACE}/.alissa-config/agents.yaml" "disable_alissa_code" \
   "...and WITHOUT disable_alissa_code, so job sessions still launch via alissa code"
+
+# -----------------------------------------------------------------------------
+info ""
+info "2b. the model pin is a DEFAULT, not a constant -> explicit values pass through"
+# -----------------------------------------------------------------------------
+# Case 2 proved the baked default on the unset path. A default is only worth
+# having if the operator can still override it, so each boot below sets
+# ALISSA_AGENT_MODEL explicitly and reads back the rendered `command:` line
+# (only that line — the agents.yaml header comment itself mentions `--model` and
+# the default, so a whole-file grep would pass vacuously).
+model_boot() {  # <log> <ALISSA_AGENT_MODEL assignment>
+  reset_spies
+  start_boot "$1" CONTAINER_ROLE=executor ALISSA_BRIDGE_EXECUTOR=1 "$2"
+  wait_boot "$1" 30 "${EXECUTOR_UP}"
+}
+
+LOG2B="${TMPROOT}/model-alias.log"
+model_boot "${LOG2B}" ALISSA_AGENT_MODEL=opus
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model opus" \
+  "an explicit alias (opus) is pinned verbatim, not re-defaulted"
+assert_contains "${LOG2B}" "reviewer model: opus (ALISSA_AGENT_MODEL)" \
+  "...and the log names the explicit value"
+
+LOG2C="${TMPROOT}/model-fullid.log"
+model_boot "${LOG2C}" ALISSA_AGENT_MODEL=claude-opus-4-8
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model claude-opus-4-8" \
+  "a full model id passes through unchanged (no allowlist)"
+
+LOG2D="${TMPROOT}/model-default.log"
+model_boot "${LOG2D}" ALISSA_AGENT_MODEL=default
+assert_eq "$(profile_cmd)" "${BASE_CMD}" \
+  "ALISSA_AGENT_MODEL=default omits --model (account default)"
+assert_contains "${LOG2D}" "reviewer model: account default (ALISSA_AGENT_MODEL='default')" \
+  "...and the log says so"
+
+LOG2E="${TMPROOT}/model-empty.log"
+model_boot "${LOG2E}" ALISSA_AGENT_MODEL=
+assert_eq "$(profile_cmd)" "${BASE_CMD}" \
+  "an explicitly EMPTY value is an opt-out: --model omitted, NOT re-defaulted"
+assert_contains "${LOG2E}" "reviewer model: account default (ALISSA_AGENT_MODEL='')" \
+  "...and the log says so"
 
 # -----------------------------------------------------------------------------
 info ""
