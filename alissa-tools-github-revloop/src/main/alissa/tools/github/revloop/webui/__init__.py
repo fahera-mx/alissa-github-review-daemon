@@ -5,10 +5,12 @@ budget of its own beyond two cached checks.
 Ported from the devloop's worker console (`alissa.tools.github.devloop.webui`,
 its PR #38) and adapted to reviewer semantics: the unit of work is a PR round,
 not an issue attempt, so the pipeline board is PR-centric (PR ref → round k of
-the cap → session → stage), the operator inbox pages cap-outs and stalled
-deferrals, and there is no worker-tasks panel (reviewers create no tasks) and
-no maintenance edge. Module shapes are copied deliberately -- family precedent
-is copy-adapt per repo; a shared-webui package is a separate, deferred lane.
+the cap → session → stage), the operator inbox pages cap-outs, stalled
+deferrals and stability holds, split live from settled so a page whose PR has
+left the newest poll's candidate set files itself away, and there is no
+worker-tasks panel (reviewers create no tasks) and no maintenance edge. Module
+shapes are copied deliberately -- family precedent is copy-adapt per repo; a
+shared-webui package is a separate, deferred lane.
 
 The daemon (loop.py) already persists everything the console needs: every poll
 pass writes one `poll_snapshots` row (UI-1, PR #35) carrying the pass timing,

@@ -151,3 +151,109 @@ def test_dashboard_keeps_a_partial_cgroup_read():
     html = dashboard_page("c", "1.0.0")
     assert ("mem.charged != null || mem.resident != null || mem.reclaimable != null"
             in html)
+
+
+def test_inbox_settled_rows_ride_behind_a_collapsed_footer():
+    """Settled pages -- the PR has left the poll's candidate set -- are exhaust,
+    not backlog (issue #108). They must not sit in the list that means "you owe
+    this", and must not displace its empty state."""
+    html = dashboard_page("c", "1.0.0")
+    # both halves of the payload reach the renderer
+    assert "renderInbox(d.inbox, d.inbox_settled," in html
+    assert "function renderInbox(items, settled," in html
+    # the footer is emitted when there are settled rows -- and only then, so an
+    # inbox with nothing filed away renders exactly as it does today
+    assert "if (settled.length) {" in html
+    # collapsed by default -- but the property is "no UNCONDITIONAL `open`",
+    # not "the substring never appears": the footer has to be able to emit
+    # `open` to survive the re-render (see the test below), and on a FIRST
+    # render there is no prior node, so the state read is false and the
+    # ternary picks the empty branch.
+    assert "'<details class=\"inbox-settled\"' + (open ? ' open' : '')" in html
+    assert '<details class="inbox-settled" open' not in html
+    # the footer counts the settled rows it is hiding
+    assert "settled.length + ' settled' +" in html
+    assert "' — show</summary>'" in html
+    # and they are visibly filed away, not just tucked under a heading
+    assert ".inbox-settled .inbox-item { opacity:" in html
+
+
+def test_inbox_clear_is_the_empty_state_of_the_live_half_only():
+    """A hundred settled pages behind the fold must still read as "clear" --
+    that is the whole point of the split."""
+    html = dashboard_page("c", "1.0.0")
+    assert "items.length ? items.map(inboxRow).join('')" in html
+    assert '\'<div class="empty">\' + empty + \'</div>\'' in html
+    assert "'Inbox clear.'" in html
+    # the empty state is chosen off `items`, never off a merged list
+    assert "if (!items.length)" not in html
+
+
+def test_live_and_settled_rows_share_one_row_builder():
+    """A settled row is the same row, filed away: one builder, so the live list
+    cannot drift from the settled one (and the live markup is unchanged)."""
+    html = dashboard_page("c", "1.0.0")
+    assert html.count("function inboxRow(it)") == 1
+    assert html.count("map(inboxRow)") == 2
+    assert '<div class="inbox-item"><span>' in html
+
+
+def test_inbox_clear_is_never_claimed_off_a_truncated_read():
+    """`Inbox clear.` positively asserts that nothing is owed. The ledger reads
+    are bounded, so when one comes back full the panel says what it actually
+    knows -- no live pages *among the rows read* (PR #109 round 1, [major])."""
+    html = dashboard_page("c", "1.0.0")
+    assert "function renderInbox(items, settled, truncated, dropped)" in html
+    assert "renderInbox(d.inbox, d.inbox_settled, d.inbox_truncated," in html
+    assert "var empty = truncated" in html
+    assert "it was truncated, so an older page may still be outstanding." in html
+    # and the clear claim is the OTHER branch of that same choice
+    assert "      : 'Inbox clear.';" in html
+
+
+def test_the_settled_footer_survives_the_ten_second_re_render():
+    """`setInterval(load, 10000)` -> render() -> renderInbox() -> innerHTML,
+    which destroys the <details> node and with it the OPERATOR's open state.
+    Fifty rows are not readable in ten seconds, so the audit half this PR
+    ships would be unreadable in a browser (PR #109 round 2, [major])."""
+    html = dashboard_page("c", "1.0.0")
+    # the state is read off the LIVE node, before the write that destroys it
+    assert "var prior = el('inbox').querySelector('details.inbox-settled');" in html
+    assert "var open = !!(prior && prior.open);" in html
+    # ...and folded into the string being built, not re-applied afterwards --
+    # a post-write restore flashes the footer shut for a frame every poll
+    assert html.index("var open = !!(prior") < html.index(
+        "'<details class=\"inbox-settled\"' + (open ? ' open' : '')"
+    ) < html.index("el('inbox').innerHTML = body;")
+    # the read degrades instead of throwing: renderInbox runs on every poll and
+    # an exception here takes the whole render() with it
+    assert "prior && prior.open" in html
+    # the re-render this defends against is still the 10s one
+    assert "setInterval(load, 10000)" in html
+
+
+def test_a_truncated_read_marks_a_non_empty_live_list_as_short():
+    """Truncation qualifies the LIST as much as its absence: a partial list of
+    live pages reads as complete unless the panel says so (round 2, [minor])."""
+    html = dashboard_page("c", "1.0.0")
+    assert "if (items.length && truncated) {" in html
+    assert "ledger window truncated — older pages were not read" in html
+    assert ".inbox-note {" in html
+    # the note rides with the rows, above the settled footer, and is NOT the
+    # empty state (which has its own, different, sentence)
+    assert html.index("if (items.length && truncated) {") < html.index(
+        "if (settled.length) {"
+    )
+    assert "it was truncated, so an older page may still be outstanding." in html
+
+
+def test_the_footer_names_the_settled_rows_the_cap_dropped():
+    """`settled.length` is what expanding the footer reveals; `dropped` is what
+    the per-half cap left out. Both true of what they label, so the count
+    cannot silently understate a backlog (round 2, [nit])."""
+    html = dashboard_page("c", "1.0.0")
+    assert "dropped = dropped || 0;" in html
+    assert "(dropped ? ' (+' + dropped + ' not shown)' : '')" in html
+    # zero dropped renders exactly the old summary -- the suffix is additive
+    assert "settled.length + ' settled' +" in html
+    assert "' — show</summary>'" in html

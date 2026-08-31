@@ -103,6 +103,28 @@ INBOX_STABILITY = "stability-held"
 # clears stops being an inbox. The ping read applies the kind filter in SQL, so
 # this counts pages and not the telemetry rows interleaved with them.
 INBOX_LIMIT = 50
+# How many rows each ledger read materialises for the live/settled split to
+# choose from. It has to be WIDER than what is rendered. The split picks from
+# whatever the read returned, so reading exactly INBOX_LIMIT rows would make
+# the live half not "every live page, capped at INBOX_LIMIT" but "the live
+# pages that happen to be among the newest INBOX_LIMIT rows of a never-pruned
+# store" -- and a full window of settled rows would empty it while a page is
+# outstanding, which is the failure this whole split exists to prevent, reached
+# from the other side. Four windows deep gives the live half room to fill past
+# a long run of settled rows (`escalations` is keyed per head, so one PR that
+# caps out across five pushes spends five slots). The read is still bounded, so
+# the never-pruned tables still cannot grow an unbounded payload, and what
+# reaches the page is capped at INBOX_LIMIT per half exactly as before. A wider
+# window is still a window, so `inbox_truncated` covers the residual case.
+INBOX_READ_LIMIT = INBOX_LIMIT * 4
+# How many poll intervals a freshly raised page is live for regardless of the
+# snapshot. The liveness test reads the LATEST snapshot, so a page raised
+# between two passes has no snapshot to appear in yet and would flicker into
+# `settled` for one refresh; two intervals covers the raise-to-next-pass gap
+# with a pass to spare. Erring long is the safe direction -- the failure this
+# split exists to prevent is an operator skipping the inbox, and a settled row
+# shown one refresh too long costs nothing.
+INBOX_LIVE_GRACE_INTERVALS = 2
 # The kind prefix that makes a ping row an operator page. `read_pings` matches
 # it in SQL; `_inbox` re-checks it to split the session out of the kind.
 PING_STALLED_PREFIX = f"{ESCALATION_STALLED}:"
@@ -114,6 +136,23 @@ PING_STABILITY_PREFIX = f"{ESCALATION_STABILITY}:"
 RETRY_OK = "retried"
 RETRY_NO_ROW = "no ledger row"
 RETRY_UNAVAILABLE = "state unavailable"
+
+
+def _pr_key(repo: object, number: object) -> "tuple[str, int] | None":
+    """The identity the inbox and the pipeline board compare PRs by.
+
+    The two sides reach this from different stores -- an inbox row's `number`
+    comes out of sqlite, a board row's out of a snapshot's JSON -- so the key
+    is normalised rather than compared as-is, and a row too malformed to key
+    (a null number) returns None instead of raising: every read path here
+    degrades, it never blanks the dashboard.
+    """
+    if not isinstance(number, (int, str)):
+        return None
+    try:
+        return (str(repo), int(number))
+    except ValueError:
+        return None
 
 
 def is_managed(name: "str | None") -> bool:
@@ -257,24 +296,27 @@ class Sources:
         return self._read_state([], lambda st: st.read_snapshots(limit))
 
     def ledgers(self) -> dict:
-        """The two INBOX tables, each bounded to INBOX_LIMIT rows of the kind
-        the console pages on. The spawn ledger is deliberately not here: it is
-        a lookup table read by key, not a display list bounded by recency --
-        `sessions` reads it for exactly the session names it renders."""
+        """The two INBOX tables, each bounded to INBOX_READ_LIMIT rows of the
+        kind the console pages on -- deliberately wider than the INBOX_LIMIT
+        the payload renders, because `_inbox` splits live from settled inside
+        whatever this returns and a window of settled rows must not be able to
+        squeeze the live half out. The spawn ledger is deliberately not here:
+        it is a lookup table read by key, not a display list bounded by recency
+        -- `sessions` reads it for exactly the session names it renders."""
         empty: "dict[str, list]" = {
             "escalations": [], "pings": [], "stability_pings": []
         }
         return self._read_state(empty, lambda st: {
-            "escalations": st.read_escalations(INBOX_LIMIT),
+            "escalations": st.read_escalations(INBOX_READ_LIMIT),
             "pings": st.read_pings(
-                INBOX_LIMIT, kind_prefix=PING_STALLED_PREFIX
+                INBOX_READ_LIMIT, kind_prefix=PING_STALLED_PREFIX
             ),
             # A SECOND bounded read rather than one unfiltered one: `read_pings`
             # narrows to a single prefix in SQL so its limit bounds the rows the
             # console actually renders, and the telemetry kinds interleaved with
             # both pages would otherwise evict them.
             "stability_pings": st.read_pings(
-                INBOX_LIMIT, kind_prefix=PING_STABILITY_PREFIX
+                INBOX_READ_LIMIT, kind_prefix=PING_STABILITY_PREFIX
             ),
         })
 
@@ -542,6 +584,16 @@ class Sources:
         # and still working (in_flight) and one whose respawn is deferred
         # behind a session that still shows life (deferred).
         chrono = list(reversed(snaps))
+        # The board rows and the inbox liveness test read the SAME item set --
+        # built once, so the two panels can never disagree about which PRs the
+        # newest pass still had in hand.
+        items = self._pipeline(latest)
+        inbox = self._inbox(
+            ledgers["escalations"],
+            ledgers["pings"],
+            ledgers.get("stability_pings", []),
+            live_prs=self._live_prs(latest, items),
+        )
         sparklines = {
             "poll_duration_ms": [s["duration_ms"] for s in chrono],
             "active_sessions": [s["in_flight"] + s["deferred"] for s in chrono],
@@ -588,13 +640,23 @@ class Sources:
                 "snapshot_ts": latest["ts"] if latest else None,
                 "duration_ms": latest["duration_ms"] if latest else None,
                 "round_cap": self.config.round_cap,
-                "items": self._pipeline(latest),
+                "items": items,
             },
-            "inbox": self._inbox(
-                ledgers["escalations"],
-                ledgers["pings"],
-                ledgers.get("stability_pings", []),
-            ),
+            "inbox": inbox["live"],
+            # Exhaust, not backlog: pages whose PR has left the poll's
+            # candidate set. Kept in the payload (the operator can still audit
+            # what was raised) but out of the list that means "you owe this".
+            "inbox_settled": inbox["settled"],
+            # Post-cap on purpose: the counter has to match the rows expanding
+            # the footer actually reveals. What the cap dropped rides beside
+            # it rather than inside it, so both numbers are true of the thing
+            # they label.
+            "inbox_settled_count": len(inbox["settled"]),
+            "inbox_settled_dropped": inbox["settled_dropped"],
+            # At least one ledger read came back at its bound, so there are
+            # older rows this payload never looked at. The panel refuses to
+            # claim `Inbox clear.` on a window it knows was truncated.
+            "inbox_truncated": inbox["truncated"],
             "sessions": sessions,
             # Host-wide, not per session: when the memory tile says the charge
             # IS resident, this is what names the holder.
@@ -631,12 +693,51 @@ class Sources:
             items.append(item)
         return items
 
+    def _live_prs(
+        self, latest: "dict | None", items: "list[dict]"
+    ) -> "set[tuple[str, int]] | None":
+        """The `(repo, number)` set an inbox page must still be in to be worth
+        an operator's attention, or None when there is no evidence either way.
+
+        The daemon's newest poll pass is the oracle: every PR with a review
+        pending from the reviewer identity is a candidate, so a page whose PR
+        is absent from the latest snapshot is one that pass did not list.
+        Ordinarily that means the trigger cleared -- the PR merged, closed, or
+        the review request was withdrawn -- and nothing the console offers can
+        act on it any more. Those three are the ordinary causes, NOT the only
+        ones: `review_requests` issues a single unpaginated `search/issues`
+        call, so past its page size a pass sees an arbitrary subset, and one
+        ranked by relevance rather than age, so the subset is not even stable
+        between calls (TASK-1796886433 covers closing that ceiling), and a
+        repo dropped from `config.watches` stops being walked at all, which
+        settles its outstanding pages by operator action rather than by
+        anything the PR did. A capped
+        (or stability-held) PR that is still open keeps its review request and
+        so stays in the set: its page is exactly the one that needs a re-entry
+        ack, and it must not be filed away.
+
+        Derived from the rendered board rows rather than the raw stages, so
+        the inbox and the pipeline panel cannot disagree about what the pass
+        had in hand. None (no snapshot at all -- a fresh boot, an unreadable
+        state.db) means "no evidence", and the caller treats every row as
+        live: the same rule the daemon's liveness oracle uses for a failed
+        listing, because hiding a page on missing evidence is the one
+        unrecoverable direction.
+        """
+        if not latest:
+            return None
+        keys = (
+            _pr_key(item.get("repo_slug"), item.get("number")) for item in items
+        )
+        return {key for key in keys if key is not None}
+
     def _inbox(
         self,
         escalations: "list[dict]",
         pings: "list[dict]",
         stability_pings: "list[dict] | None" = None,
-    ) -> "list[dict]":
+        live_prs: "set[tuple[str, int]] | None" = None,
+    ) -> dict:
         """The operator inbox: everything the daemon paged a human about, in
         one list, newest first.
 
@@ -653,11 +754,44 @@ class Sources:
         process -- a caller that passed unfiltered rows still gets an inbox of
         pages only, just a shorter one.
 
-        Bounded twice over: each reader is already capped at INBOX_LIMIT rows
-        (newest first), and the merged list is capped again, so the payload
-        cannot grow without bound as the two never-pruned tables accumulate.
+        Bounded twice over: each reader is already capped at INBOX_READ_LIMIT
+        rows (newest first), and each returned list is capped again at
+        INBOX_LIMIT, so the payload cannot grow without bound as the
+        never-pruned tables accumulate.
+
+        Returns the rows split two ways -- `live` (what the operator still
+        owes) and `settled` (the PR has left the poll's candidate set, so the
+        page is exhaust). `escalations` and `pings` are dedupe key stores and
+        must never be pruned, so this read-time split is the only place the
+        distinction can be made, and it is made from the local snapshot alone:
+        a page load still costs the GitHub API nothing. A row raised less than
+        INBOX_LIVE_GRACE_INTERVALS poll intervals ago is live whatever the
+        snapshot says, and `live_prs` of None (no snapshot) means every row is
+        live -- see `_live_prs`.
+
+        `truncated` reports that at least one of the reads came back AT its
+        bound, so there are older rows the split never saw. The reason it
+        exists is the empty case: an empty `live` half off a truncated window
+        means "no live pages among the rows I read", which is not what `Inbox
+        clear.` claims. It qualifies the non-empty case too, though -- a
+        partial list of live pages reads as complete unless the panel says
+        otherwise -- so the page renders it both ways. Widening the read (see
+        INBOX_READ_LIMIT) makes truncation rare; it cannot make it impossible,
+        and a panel that positively asserts nothing is owed had better be
+        right.
+
+        `settled_dropped` is the settled rows the INBOX_LIMIT cap left out of
+        the payload. It is a second, quieter truncation than `truncated`: it
+        happens inside a read that may never have reached its bound, so the
+        flag says nothing about it, and `len(settled)` alone would understate
+        a real backlog with no signal anywhere.
         """
         now = int(self._wall())
+        grace = INBOX_LIVE_GRACE_INTERVALS * self.config.poll_interval
+        truncated = any(
+            len(rows) >= INBOX_READ_LIMIT
+            for rows in (escalations, pings, stability_pings or [])
+        )
         out: list[dict] = []
         for row in escalations:
             out.append(
@@ -707,4 +841,33 @@ class Sources:
                 }
             )
         out.sort(key=lambda item: item["age_seconds"])
-        return out[:INBOX_LIMIT]
+        live: list[dict] = []
+        settled: list[dict] = []
+        for item in out:
+            key = _pr_key(item["repo_slug"], item["number"])
+            if (
+                live_prs is None
+                or item["age_seconds"] < grace
+                # A row this cannot key is missing evidence ABOUT THE ROW, and
+                # missing evidence never hides a page -- the same rule the
+                # None snapshot gets one clause up. Filing an unkeyable row
+                # away would be the console asserting something it does not
+                # know. Low reachability (both `number` columns are INTEGER
+                # NOT NULL), so this rests on caller discipline rather than on
+                # the schema, which is exactly why it is written down here.
+                or key is None
+                or key in live_prs
+            ):
+                live.append(item)
+            else:
+                settled.append(item)
+        return {
+            "live": live[:INBOX_LIMIT],
+            "settled": settled[:INBOX_LIMIT],
+            # The settled rows the per-half cap left out. A SECOND truncation,
+            # and a quieter one: it happens inside a read that may never have
+            # hit its bound, so `truncated` says nothing about it and the
+            # count alone would silently understate.
+            "settled_dropped": max(0, len(settled) - INBOX_LIMIT),
+            "truncated": truncated,
+        }
