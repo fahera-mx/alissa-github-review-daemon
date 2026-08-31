@@ -285,9 +285,11 @@ ARG ALISSA_TASK_LIST_SELF_SCOPE=""
 ARG ALISSA_AGENT_PROFILE="claude"
 # Reviewer model pinned into the agents.yaml claude command at boot (the reviewer
 # is the quality gate, so it must not silently fall back to a smaller model on a
-# usage-throttled account). Alias (`opus`/`sonnet`) or full id (`claude-opus-4-8`);
+# usage-throttled account). Default `claude-fable-5`: the most capable generally
+# available Claude model, one tier above Opus (operator decision 2026-08-30).
+# Alias (`opus`/`sonnet`) or full id (`claude-opus-4-8`) pass through verbatim;
 # `default` or empty omits the --model flag. See the entrypoint (step 2e) + README.
-ARG ALISSA_AGENT_MODEL="opus"
+ARG ALISSA_AGENT_MODEL="claude-fable-5"
 ARG ALISSA_ON_MISSING_HUB="add"
 # Worker reconcile tick, seconds.
 ARG ALISSA_WORKER_INTERVAL="2"

@@ -172,7 +172,7 @@ fi
 
 # --- baked ARG->ENV knob defaults ---
 eq "ALISSA_AGENT_PROFILE"   "claude"     "${ALISSA_AGENT_PROFILE-<unset>}"
-eq "ALISSA_AGENT_MODEL"     "opus"       "${ALISSA_AGENT_MODEL-<unset>}"
+eq "ALISSA_AGENT_MODEL"     "claude-fable-5" "${ALISSA_AGENT_MODEL-<unset>}"
 eq "ALISSA_ON_MISSING_HUB"  "add"        "${ALISSA_ON_MISSING_HUB-<unset>}"
 eq "ALISSA_WORKER_INTERVAL" "2"          "${ALISSA_WORKER_INTERVAL-<unset>}"
 eq "ALISSA_WORKSPACE_ROOT"  "/workspace" "${ALISSA_WORKSPACE_ROOT-<unset>}"
