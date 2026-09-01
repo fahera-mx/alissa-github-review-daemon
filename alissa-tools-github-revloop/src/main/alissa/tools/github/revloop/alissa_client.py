@@ -44,6 +44,29 @@ ENV_TOKEN = "ALISSA_API_TOKEN"
 MAX_EVENTS_PER_POST = 200
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect instead of following it (PR #113 round 1).
+
+    The default handler copies the request's headers — `Authorization`
+    included — onto the redirected request, ACROSS HOSTS, so a 30x from
+    whatever `alissa_endpoint` names would hand the bearer token to the
+    redirect target (and 301/302/303 would downgrade the POST to a GET that
+    ingests nothing while reading as success). A redirected ingest cannot
+    succeed anyway, so refusal beats strip-and-follow: returning None makes
+    urllib raise the 30x as an HTTPError, which the taxonomy reports like any
+    other unexpected status.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# One opener for the module: default handlers with only the redirect
+# behaviour replaced, built once because handler construction is not free
+# and every client shares the same policy.
+_opener = urllib.request.build_opener(_RefuseRedirects())
+
+
 class AlissaError(Exception):
     """Base of the taxonomy. `status` is 0 for a transport failure (there was
     no HTTP response to carry one)."""
@@ -105,7 +128,7 @@ class AlissaClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with _opener.open(req, timeout=self._timeout) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             raise self._classify(exc) from None

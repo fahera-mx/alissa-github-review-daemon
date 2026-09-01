@@ -31,6 +31,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 # A POSIX-ish environment variable name -- what `reviewer_token_env` must be.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -177,6 +178,34 @@ DEFAULT_ALISSA_ENDPOINT = "https://api.alissa.app"
 # typo is indistinguishable from the default it was trying to change.
 _ENV_TRUE = frozenset({"1", "true", "yes", "on"})
 _ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+# Hosts a cleartext `alissa_endpoint` is allowed to name. The loop-events
+# client sends a bearer token with every POST, so a non-https endpoint puts
+# that token on the wire — refused at load, except toward the machine itself
+# (a local stub or port-forward, which is how the client is tested against a
+# fake ingest).
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _validate_alissa_endpoint(endpoint: str) -> str:
+    """`endpoint`, or a ValueError naming why it cannot carry a credential.
+
+    https is the rule; http is allowed only toward loopback. Anything else —
+    a bare host, another scheme, an unparsable value — is refused at load,
+    where the operator reads `config error`, rather than discovered as a
+    token on a cleartext hop (PR #113 round 1, minor).
+    """
+    parts = urlsplit(endpoint)
+    if parts.scheme == "https":
+        return endpoint
+    if parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS:
+        return endpoint
+    raise ValueError(
+        f"alissa_endpoint must be an https:// URL (or http:// toward "
+        f"loopback — localhost, 127.0.0.1, ::1 — for a local stub): the "
+        f"loop-events client sends a bearer token with every request, and a "
+        f"cleartext endpoint puts it on the wire. Got {endpoint!r}"
+    )
 
 
 def env_loop_events_enabled(
@@ -681,7 +710,9 @@ class Config:
         # "" falls back to the default rather than building a client with an
         # empty base — the same unset-means-default reading every optional
         # string key here has.
-        endpoint = endpoint.strip() or cls.alissa_endpoint
+        endpoint = _validate_alissa_endpoint(
+            endpoint.strip() or cls.alissa_endpoint
+        )
 
         mode = raw.get("on_missing_review_task", ON_MISSING_SPAWN)
         if mode not in _MISSING_MODES:

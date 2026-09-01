@@ -175,7 +175,7 @@ def test_an_abandoned_round_emits_round_abandoned_with_the_reason(
     assert event["data"] == {"headSha": HEAD}
 
 
-def test_a_cap_out_emits_round_capped_with_the_newest_spawned_round(
+def test_a_cap_out_emits_round_capped_with_the_round_at_cap_time(
     ledger, clock
 ):
     clock()
@@ -189,10 +189,33 @@ def test_a_cap_out_emits_round_capped_with_the_newest_spawned_round(
     )
     clock()
     ledger.record_escalation(REPO, 7, HEAD)
+    capped_at = clock.now()
+    # A round spawned AFTER the cap-out (an operator re-entry) must not
+    # retro-write the cap-out's round on a later re-derivation/backfill.
+    clock()
+    ledger.record_spawn(
+        repo=REPO, number=7, round_=4, head_sha=HEAD, session="s4",
+        task_ref=None,
+    )
     (event,) = by_kind(derive_events(ledger), "round.capped")
-    assert event["dedupeKey"] == f"revloop:round.capped:{REPO}:7:{HEAD}"
+    assert event["dedupeKey"] == (
+        f"revloop:round.capped:{REPO}:7:{HEAD}:{capped_at}"
+    )
     assert event["round"] == 3
     assert event["data"] == {"headSha": HEAD}
+
+
+def test_a_re_cap_out_on_the_same_head_derives_a_distinct_key(ledger, clock):
+    """[major, round 1] A grant consumed without an approve re-escalates the
+    SAME head — a new decision the loop pages separately, so its event must
+    not be swallowed as a server-side duplicate of the first cap-out."""
+    clock()
+    ledger.record_escalation(REPO, 7, HEAD)
+    first = by_kind(derive_events(ledger), "round.capped")[0]["dedupeKey"]
+    clock()
+    ledger.record_escalation(REPO, 7, HEAD)  # REPLACEs the row in place
+    second = by_kind(derive_events(ledger), "round.capped")[0]["dedupeKey"]
+    assert first != second
 
 
 def test_a_cap_out_with_no_spawn_row_omits_the_round(ledger, clock):
@@ -216,8 +239,12 @@ def test_a_stability_ping_emits_stability_hold_with_the_notice_numbers(
     ledger, clock
 ):
     clock()
+    # grants_seen deliberately DIFFERS from the ping kind's granted total:
+    # grantsSeen must come from the kind (episode-correct even on a
+    # backfill), while rcRounds/round come from the notice join, which is
+    # documented as current-at-derivation (round-1 minor).
     ledger.record_stability_notice(REPO, 7, round_=5, rc_rounds=4,
-                                   grants_seen=1)
+                                   grants_seen=9)
     clock()
     base = "b" * 40
     ledger.record_ping(REPO, 7, loop_module.stability_kind(HEAD, base, 1))
@@ -228,7 +255,7 @@ def test_a_stability_ping_emits_stability_hold_with_the_notice_numbers(
     assert event["round"] == 5
     assert event["data"]["headSha"] == HEAD
     assert event["data"]["rcRounds"] == 4
-    assert event["data"]["grantsSeen"] == 1
+    assert event["data"]["grantsSeen"] == 1  # the kind's, not the notice's
 
 
 def test_checks_held_derives_from_both_gates_with_distinct_keys(
@@ -257,14 +284,19 @@ def test_a_grant_and_a_reap_derive_their_events(ledger, clock):
     ledger.record_grant(REPO, 7, comment_id=987, author="RHDZMOTA", rounds=2)
     clock()
     ledger.record_reap("review-widgets-pr7-r1-zz")
+    reaped_at = clock.now()
     events = derive_events(ledger)
     (grant,) = by_kind(events, "grant")
     assert grant["dedupeKey"] == f"revloop:grant:{REPO}:7:987"
     assert grant["data"] == {"author": "RHDZMOTA", "rounds": 2}
     (reap,) = by_kind(events, "reap")
-    assert reap["dedupeKey"] == "revloop:reap:review-widgets-pr7-r1-zz"
+    # The stamp is in the key so the event does not lean on session-name
+    # nonce-uniqueness holding forever (round-1 nit).
+    assert reap["dedupeKey"] == (
+        f"revloop:reap:review-widgets-pr7-r1-zz:{reaped_at}"
+    )
     assert reap["session"] == "review-widgets-pr7-r1-zz"
-    assert "repo" not in reap  # reaps are keyed by session alone
+    assert "repo" not in reap  # the reaps table carries no repo/PR
 
 
 def test_comment_dedupe_ping_kinds_derive_no_event(ledger, clock):
@@ -341,7 +373,10 @@ def test_batches_split_at_the_ingest_cap(ledger, clock):
     assert len(client.events) == MAX_EVENTS_PER_POST + 5
 
 
-def test_a_successful_pass_advances_the_watermark(ledger, clock):
+def test_a_quiet_ledger_makes_no_request_at_all(ledger, clock):
+    """[minor, round 1] The inclusive watermark must not turn into a standing
+    re-POST: with nothing new, the boundary row's key is remembered and the
+    pass derives an empty batch — no request, no log line."""
     clock()
     ledger.record_reap("s1")
     clock()
@@ -351,11 +386,28 @@ def test_a_successful_pass_advances_the_watermark(ledger, clock):
     assert emitter.emit_once() is True
     assert {e["session"] for e in client.events} == {"s1", "s2"}
 
-    # Next pass: only the boundary second's row is re-sent (inclusive
-    # watermark), and it lands as a server-side duplicate by design.
+    client.batches.clear()
+    assert emitter.emit_once() is True
+    assert client.batches == []
+
+
+def test_a_newcomer_in_the_watermark_second_is_still_sent(ledger, clock):
+    """The other edge of the inclusive boundary: a row that lands in the SAME
+    second as the watermark after the pass that set it must go out on the
+    next pass — its key is not in the remembered set."""
+    clock()
+    ledger.record_reap("s1")
+    client = FakeClient()
+    emitter = LoopEventsEmitter(ledger, client)
+    assert emitter.emit_once() is True
+    ledger.record_reap("s2")  # same clock second as s1
     client.batches.clear()
     assert emitter.emit_once() is True
     assert {e["session"] for e in client.events} == {"s2"}
+    # ...and exactly once: the set grew without moving the watermark.
+    client.batches.clear()
+    assert emitter.emit_once() is True
+    assert client.batches == []
 
 
 def test_a_failed_post_warns_once_and_the_next_pass_resends(
@@ -377,14 +429,35 @@ def test_a_failed_post_warns_once_and_the_next_pass_resends(
     assert {e["session"] for e in client.events} == {"s1"}
 
 
-def test_an_auth_failure_is_also_one_warn_never_a_raise(ledger, clock, caplog):
+def test_an_auth_failure_warns_once_and_latches_the_emitter_off(
+    ledger, clock, caplog
+):
+    """[minor, round 1] Auth failures are permanent and operator-fixable, so
+    they get ONE warn and no further attempts this process — not an
+    identical WARN per poll for the daemon's whole life."""
     clock()
     ledger.record_reap("s1")
-    emitter = LoopEventsEmitter(
-        ledger, FakeClient(fail_with=AlissaAuthError(0, "no token"))
-    )
+    client = FakeClient(fail_with=AlissaAuthError(0, "no token"))
+    calls = {"n": 0}
+    original = client.post_loop_events
+
+    def counting(events):
+        calls["n"] += 1
+        return original(events)
+
+    client.post_loop_events = counting
+    emitter = LoopEventsEmitter(ledger, client)
     with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
         assert emitter.emit_once() is False
+        # Later passes return immediately: no derivation retry, no request,
+        # no second warning — the restart that fixes the token re-arms.
+        client.fail_with = None
+        assert emitter.emit_once() is False
+        assert emitter.emit_once() is False
+    assert calls["n"] == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "restart" in warnings[0].getMessage()
 
 
 def test_an_empty_ledger_posts_nothing(ledger):
@@ -489,17 +562,27 @@ class FakeResponse(io.BytesIO):
         return False
 
 
+class FakeOpener:
+    """Stands in for the module's redirect-refusing opener."""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def open(self, req, timeout=None):
+        return self._fn(req, timeout=timeout)
+
+
 def test_the_client_sends_the_bearer_token_and_honors_the_timeout(
     monkeypatch,
 ):
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None):
         seen["req"] = req
         seen["timeout"] = timeout
         return FakeResponse(b'{"accepted": 1, "duplicates": 0}')
 
-    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module, "_opener", FakeOpener(fake_open))
     client = AlissaClient(token="tok-123", base="https://api.example/",
                           timeout=7)
     result = client.post_loop_events([{"kind": "reap"}])
@@ -518,11 +601,11 @@ def test_the_client_reads_the_env_token_when_none_is_passed(monkeypatch):
     monkeypatch.setenv(client_module.ENV_TOKEN, "from-env")
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None):
         seen["auth"] = req.get_header("Authorization")
         return FakeResponse(b"{}")
 
-    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module, "_opener", FakeOpener(fake_open))
     AlissaClient().post_loop_events([])
     assert seen["auth"] == "Bearer from-env"
 
@@ -530,10 +613,10 @@ def test_the_client_reads_the_env_token_when_none_is_passed(monkeypatch):
 def test_a_missing_token_is_an_auth_error_before_any_network(monkeypatch):
     monkeypatch.delenv(client_module.ENV_TOKEN, raising=False)
 
-    def explode(*a, **kw):  # pragma: no cover - must not be reached
+    def explode(req, timeout=None):  # pragma: no cover - must not be reached
         raise AssertionError("network was touched")
 
-    monkeypatch.setattr(client_module.urllib.request, "urlopen", explode)
+    monkeypatch.setattr(client_module, "_opener", FakeOpener(explode))
     with pytest.raises(AlissaAuthError):
         AlissaClient().post_loop_events([{"kind": "reap"}])
 
@@ -541,27 +624,46 @@ def test_a_missing_token_is_an_auth_error_before_any_network(monkeypatch):
 @pytest.mark.parametrize(
     "status,exc_type",
     [(401, AlissaAuthError), (403, AlissaAuthError),
-     (429, AlissaTransient), (503, AlissaTransient), (400, AlissaError)],
+     (429, AlissaTransient), (503, AlissaTransient), (400, AlissaError),
+     (302, AlissaError)],  # a refused redirect surfaces as its own status
 )
 def test_http_errors_classify_onto_the_taxonomy(monkeypatch, status, exc_type):
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None):
         raise urllib.error.HTTPError(
             req.full_url, status, "err", None,
             io.BytesIO(b'{"error": "CODE", "message": "m"}'),
         )
 
-    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module, "_opener", FakeOpener(fake_open))
     with pytest.raises(exc_type):
         AlissaClient(token="t").post_loop_events([])
 
 
 def test_a_transport_failure_is_transient(monkeypatch):
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None):
         raise urllib.error.URLError("dns says no")
 
-    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module, "_opener", FakeOpener(fake_open))
     with pytest.raises(AlissaTransient):
         AlissaClient(token="t").post_loop_events([])
+
+
+def test_the_module_opener_refuses_redirects(monkeypatch):
+    """[minor, round 1] The default redirect handler would replay the
+    Authorization header toward wherever Location points (across hosts) and
+    downgrade the POST to a GET. The module's opener must refuse instead."""
+    handler = client_module._RefuseRedirects()
+    req = urllib.request.Request("https://api.alissa.app/v1/loop-events")
+    assert handler.redirect_request(
+        req, io.BytesIO(b""), 302, "Found", {},
+        "https://evil.example/collect",
+    ) is None
+    # ...and the opener the client actually uses carries that handler.
+    installed = [
+        h for h in client_module._opener.handlers
+        if isinstance(h, client_module._RefuseRedirects)
+    ]
+    assert installed, "the module opener must install _RefuseRedirects"
 
 
 def test_an_oversized_batch_is_refused_as_a_code_defect():
@@ -651,3 +753,26 @@ def test_a_non_string_endpoint_is_refused_and_empty_means_default(tmp_path):
         Config.build(tmp_path, {"alissa_endpoint": 8080}, environ={})
     config = Config.build(tmp_path, {"alissa_endpoint": "  "}, environ={})
     assert config.alissa_endpoint == DEFAULT_ALISSA_ENDPOINT
+
+
+@pytest.mark.parametrize("bad", [
+    "http://staging.example",       # cleartext toward a real host
+    "ftp://api.alissa.app",         # not an HTTP scheme at all
+    "api.alissa.app",               # no scheme — urllib would choke later
+])
+def test_a_cleartext_or_schemeless_endpoint_is_refused_at_load(tmp_path, bad):
+    """[minor, round 1] The client sends a bearer token with every POST, so a
+    non-https endpoint puts it on the wire — refused where the operator
+    reads `config error`, not discovered on the network."""
+    with pytest.raises(ValueError, match="https"):
+        Config.build(tmp_path, {"alissa_endpoint": bad}, environ={})
+
+
+@pytest.mark.parametrize("ok", [
+    "http://localhost:8080",
+    "http://127.0.0.1:9999",
+    "https://staging.example",
+])
+def test_https_and_loopback_http_endpoints_are_accepted(tmp_path, ok):
+    config = Config.build(tmp_path, {"alissa_endpoint": ok}, environ={})
+    assert config.alissa_endpoint == ok
