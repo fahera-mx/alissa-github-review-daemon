@@ -196,15 +196,19 @@ def _validate_alissa_endpoint(endpoint: str) -> str:
     token on a cleartext hop (PR #113 round 1, minor).
     """
     parts = urlsplit(endpoint)
-    if parts.scheme == "https":
+    # A host is required on BOTH branches (PR #113 round 2, nit): a bare
+    # "https://" parses with the right scheme and no host, and would then
+    # fail on the wire as a per-pass transient WARN — the exact symptom this
+    # load-time check exists to prevent.
+    if parts.scheme == "https" and parts.hostname:
         return endpoint
     if parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS:
         return endpoint
     raise ValueError(
-        f"alissa_endpoint must be an https:// URL (or http:// toward "
-        f"loopback — localhost, 127.0.0.1, ::1 — for a local stub): the "
-        f"loop-events client sends a bearer token with every request, and a "
-        f"cleartext endpoint puts it on the wire. Got {endpoint!r}"
+        f"alissa_endpoint must be an https:// URL with a host (or http:// "
+        f"toward loopback — localhost, 127.0.0.1, ::1 — for a local stub): "
+        f"the loop-events client sends a bearer token with every request, "
+        f"and a cleartext endpoint puts it on the wire. Got {endpoint!r}"
     )
 
 

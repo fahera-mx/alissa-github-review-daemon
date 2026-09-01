@@ -145,7 +145,16 @@ def _verdict_events(rows: "list[dict]") -> "list[tuple[int, dict]]":
     A row with neither `posted_at` nor `abandoned_at` is an OPEN obligation —
     the round's native verdict has not landed — and emits nothing until it
     closes one way or the other. `data.verdict` is omitted (never invented)
-    on rows that predate the ledger's verdict column."""
+    on rows that predate the ledger's verdict column.
+
+    COVERAGE BOUND (PR #113 round 2, major): `verdict_posts` is the
+    per-round OBLIGATION record, not the per-round record — a row exists
+    only when the reviewer session defaulted and the daemon posted the
+    native fallback verdict itself. On a fleet whose sessions post every
+    review, these two kinds are expected to be EMPTY; issue #112 maps them
+    to this table and puts the round bookkeeping a session-covering source
+    needs out of scope, so the widening is TASK-1086576582, and the README's
+    telemetry table states the bound where an operator will read it."""
     out = []
     for row in rows:
         repo, number = row["repo"], int(row["number"])

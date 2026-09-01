@@ -279,6 +279,17 @@ def test_checks_held_derives_from_both_gates_with_distinct_keys(
     assert all(e["data"]["headSha"] == HEAD for e in events)
 
 
+def test_read_grants_refuses_a_partial_filter(ledger):
+    """[nit, round 2] repo-without-number must not fall through to the
+    unfiltered read — a superset answer is the quiet kind of wrong."""
+    with pytest.raises(ValueError, match="partial"):
+        ledger.read_grants(REPO)
+    with pytest.raises(ValueError, match="partial"):
+        ledger.read_grants(number=7)
+    assert ledger.read_grants() == []          # unfiltered form
+    assert ledger.read_grants(REPO, 7) == []   # paired form
+
+
 def test_a_grant_and_a_reap_derive_their_events(ledger, clock):
     clock()
     ledger.record_grant(REPO, 7, comment_id=987, author="RHDZMOTA", rounds=2)
@@ -759,6 +770,10 @@ def test_a_non_string_endpoint_is_refused_and_empty_means_default(tmp_path):
     "http://staging.example",       # cleartext toward a real host
     "ftp://api.alissa.app",         # not an HTTP scheme at all
     "api.alissa.app",               # no scheme — urllib would choke later
+    "https://",                     # right scheme, no host (round-2 nit) —
+                                    # would fail on the wire as a per-pass
+                                    # transient WARN instead of at load
+    "https:///v1",                  # schemed-but-hostless variant
 ])
 def test_a_cleartext_or_schemeless_endpoint_is_refused_at_load(tmp_path, bad):
     """[minor, round 1] The client sends a bearer token with every POST, so a

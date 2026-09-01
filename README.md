@@ -861,9 +861,9 @@ built from the ledger's own keys:
 | kind | ledger source | payload |
 | --- | --- | --- |
 | `round.spawned` | `spawns` | `session`, `round`, `data.headSha`, `data.taskRef` |
-| `round.verdict` | `verdict_posts` once `posted_at` is set | `round`, `data.verdict` (`approve` \| `request_changes`), `data.headSha`, `data.reviewUrl`, `data.attempts`, `data.checksHeldMs` when the round was held |
-| `round.abandoned` | `verdict_posts` once `abandoned_at` is set | `round`, `reason` (= `last_error`), `data.headSha` |
-| `round.capped` | `escalations` (CR9 cap-outs) | `round` (the PR's newest spawned round), `data.headSha` |
+| `round.verdict` | `verdict_posts` once `posted_at` is set | `round`, `data.verdict` (`approve` \| `request_changes`), `data.headSha`, `data.reviewUrl`, `data.attempts`, `data.checksHeldMs` when the round was held. **Coverage bound**: `verdict_posts` is the per-round *obligation* record — a row exists only when the daemon had to post the native fallback verdict itself, i.e. when the reviewer session did not submit its own review. On a fleet whose sessions post every review (0 of the last 58 rounds on this repo took the fallback path), this series is **expected to be empty**; covering session-posted rounds is TASK-1086576582 |
+| `round.abandoned` | `verdict_posts` once `abandoned_at` is set | `round`, `reason` (= `last_error`), `data.headSha`. Same coverage bound as `round.verdict` |
+| `round.capped` | `escalations` (CR9 cap-outs) | `round` (the newest spawn **at or before** `escalated_at` — the round in flight when the cap was recorded; omitted when no spawn row qualifies), `data.headSha` |
 | `stability.hold` | `stability:` pings, enriched from `stability_notices` | `data.headSha`, `data.rcRounds`, `data.grantsSeen` |
 | `stalled` | `stalled:<session>` pings | `session` |
 | `checks.held` | `checks-unsettled:` pings **and** `spawn_checks_holds` | `round`, `data.headSha`, `data.gate` (`verdict` \| `spawn`) |

@@ -798,7 +798,18 @@ class State:
         rarest rows in this ledger (one per operator comment, ever), so the
         full read is bounded by how often a human types the ack grammar. The
         per-PR form keeps its original callers unchanged.
+
+        A PARTIAL filter is refused (PR #113 round 2, nit): `repo` without
+        `number` would otherwise fall through to the unfiltered read and
+        answer with every PR's grants — a superset, not an error, which is
+        the quiet kind of wrong. The paired and unfiltered forms are the
+        only two forms.
         """
+        if (repo is None) != (number is None):
+            raise ValueError(
+                "read_grants takes repo AND number (one PR) or neither "
+                "(every PR) — a partial filter would silently read every PR"
+            )
         sql = (
             "SELECT repo, number, comment_id, author, rounds, granted_at "
             "FROM grants"
