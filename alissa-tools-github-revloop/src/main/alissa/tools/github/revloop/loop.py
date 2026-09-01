@@ -56,6 +56,7 @@ from .ghclient import (
     countable_rounds,
     verdict_marker,
 )
+from .loop_events import LoopEventsEmitter, build_emitter
 from .proc import CommandError
 from .state import State
 
@@ -1604,6 +1605,14 @@ class ReviewWatcher:
             task_list_bow_id=config.task_list_bow_id,
         )
         self.state = state or State(config.state_db)
+        # The Studio loop-telemetry push (issue #112), or None when the knob
+        # is off — the disabled default costs nothing: no client, no read, no
+        # log line. Built through the seam so tests swap in a fake client.
+        self._loop_events: LoopEventsEmitter | None = (
+            build_emitter(self.state, endpoint=config.alissa_endpoint)
+            if config.loop_events_enabled
+            else None
+        )
         # (repo, number, comment id) of every re-entry directive already
         # refused in this process -- see _log_ignored_ack.
         self._ignored_acks: set[tuple[str, int, int]] = set()
@@ -2896,7 +2905,9 @@ class ReviewWatcher:
             else f" — CI gate: the rollup at {judged[:8]} is {gate.state}, so the "
             f"{verdict} envelope did not post as an APPROVE"
         )
-        self.state.record_verdict_post(pr.full_name, pr.number, round_, url)
+        self.state.record_verdict_post(
+            pr.full_name, pr.number, round_, url, verdict=verdict
+        )
         log.info(
             "%s round %d closed: native %s review submitted as %s (%s)%s",
             pr.slug, round_, event, self.github.login, url or "no url", gate_note,
@@ -4810,7 +4821,33 @@ class ReviewWatcher:
         self._write_snapshot(
             results, reaped, duration_ms=int((time.monotonic() - started) * 1000)
         )
+        self._emit_loop_events()
         return results
+
+    def _emit_loop_events(self) -> None:
+        """Push this pass's loop telemetry to Studio, when enabled (issue
+        #112). Last thing in the pass, after the snapshot, so the batch sees
+        every ledger row the pass wrote.
+
+        Skipped in dry-run even when enabled: the ledger holds no new rows
+        from a dry-run pass, and while re-emitting old ones would be harmless
+        (idempotent keys), an outbound POST is still an act — and dry-run's
+        contract is decide-and-log only.
+
+        The emitter itself never raises for an API condition (one WARN, the
+        pass completes); the guard here is the same never-fatal promise held
+        against a code defect, so telemetry can never take down a poll.
+        """
+        if self._loop_events is None or self.config.dry_run:
+            return
+        try:
+            self._loop_events.emit_once()
+        except Exception as exc:
+            log.warning(
+                "loop-events: emitter failed unexpectedly (%s: %s) — "
+                "telemetry is best-effort, the pass completes",
+                type(exc).__name__, exc,
+            )
 
     def _note_ledger_unwritable(self) -> None:
         """Report a pass refused because the ledger cannot record it.

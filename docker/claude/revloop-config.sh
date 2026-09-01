@@ -28,9 +28,14 @@
 #     latency-for-reads trade that depends on how a deployment creates its review
 #     tasks, not on the image), task_list_self_scope (whether this actor owns
 #     EVERY review task it has to find -- a property of the deployment's actor
-#     layout; the only BOOLEAN pass-through here, accepted as 1/0, true/false,
+#     layout; a BOOLEAN pass-through, accepted as 1/0, true/false,
 #     yes/no or on/off and REFUSED as anything else, because a silently-false
 #     typo would be indistinguishable from the default it is trying to change),
+#     loop_events_enabled (whether the daemon pushes loop telemetry to Studio
+#     once per pass, issue #112 -- the other boolean pass-through, same accepted
+#     spellings and same refusal; the library also reads
+#     ALISSA_REV_LOOP_EVENTS_ENABLED directly and the env wins, so the render
+#     is belt to that brace),
 #     operators (an EMPTY operator
 #     allowlist is the library's fail-closed default -- emitting `[]` would say
 #     the same thing, but omitting it keeps "unset means the library decides"
@@ -94,6 +99,7 @@ render_revloop_config() {
     --arg     swait  "${ALISSA_CHECKS_SPAWN_WAIT_SECONDS:-}" \
     --arg     missttl "${ALISSA_REVIEW_TASK_MISS_TTL_POLLS:-}" \
     --arg     selfsc  "${ALISSA_TASK_LIST_SELF_SCOPE:-}" \
+    --arg     levents "${ALISSA_REV_LOOP_EVENTS_ENABLED:-}" \
     --arg     rlogin "${ALISSA_REVIEWER_LOGIN:-}" \
     --arg     rtoken "${ALISSA_REVIEWER_TOKEN_ENV:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
@@ -110,6 +116,11 @@ render_revloop_config() {
          if . == "1" or . == "true" or . == "yes" or . == "on" then true
          elif . == "0" or . == "false" or . == "no" or . == "off" then false
          else error("ALISSA_TASK_LIST_SELF_SCOPE must be a boolean (1/0, true/false, yes/no, on/off)")
+         end) } end)
+     + (if $levents == "" then {} else { loop_events_enabled: ($levents | ascii_downcase |
+         if . == "1" or . == "true" or . == "yes" or . == "on" then true
+         elif . == "0" or . == "false" or . == "no" or . == "off" then false
+         else error("ALISSA_REV_LOOP_EVENTS_ENABLED must be a boolean (1/0, true/false, yes/no, on/off)")
          end) } end)
      + (if $rlogin == "" then {} else { reviewer_login:     $rlogin } end)
      + (if $rtoken == "" then {} else { reviewer_token_env: $rtoken } end)

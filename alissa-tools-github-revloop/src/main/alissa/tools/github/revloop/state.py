@@ -144,6 +144,13 @@ CREATE TABLE IF NOT EXISTS verdict_posts (
     -- waited one bound when it waited two. NULL until (and unless) the promotion
     -- happens; the bound then reads `checks_pending_at or checks_held_at`.
     checks_pending_at INTEGER,
+    -- WHAT the round's verdict was ('approve' | 'request_changes'), stamped
+    -- when the post lands (issue #112). The ledger did not need it -- GitHub's
+    -- reviews list answers "what was decided" -- but the loop-events emitter
+    -- derives `round.verdict` from THIS table at end of pass, long after the
+    -- envelope read that knew the answer. NULL on rows that predate the
+    -- column; the emitter omits the field rather than inventing one.
+    verdict       TEXT,
     review_url    TEXT,
     last_error    TEXT,
     PRIMARY KEY (repo, number, round)
@@ -308,6 +315,7 @@ _ADDED_COLUMNS = {
         ("checks_held_at", "INTEGER"),
         ("checks_held_state", "TEXT"),
         ("checks_pending_at", "INTEGER"),
+        ("verdict", "TEXT"),
     ),
 }
 
@@ -779,21 +787,68 @@ class State:
             (repo, number),
         ).fetchone()
 
-    def read_grants(self, repo: str, number: int) -> list[dict]:
-        """One PR's grant rows, newest first (like every reader here).
+    def read_grants(
+        self, repo: "str | None" = None, number: "int | None" = None
+    ) -> list[dict]:
+        """Grant rows, newest first (like every reader here) — one PR's when
+        `repo`/`number` are given, every PR's when they are not.
 
-        Deliberately narrow: no unfiltered form and no `limit` until something
-        needs them. The console does not read this table yet -- showing "this
-        PR was re-entered by @x" in the operator inbox wants rendering as well
-        as data, so it lands as its own change rather than as unused
-        parameters here.
+        The unfiltered form exists for the loop-events emitter (issue #112),
+        which derives one `grant` event per honoured ack: grants are the
+        rarest rows in this ledger (one per operator comment, ever), so the
+        full read is bounded by how often a human types the ack grammar. The
+        per-PR form keeps its original callers unchanged.
         """
-        return self._read_rows(
+        sql = (
             "SELECT repo, number, comment_id, author, rounds, granted_at "
-            "FROM grants WHERE repo=? AND number=? "
-            "ORDER BY granted_at DESC, rowid DESC",
+            "FROM grants"
+        )
+        params: tuple = ()
+        if repo is not None and number is not None:
+            sql += " WHERE repo=? AND number=?"
+            params = (repo, number)
+        sql += " ORDER BY granted_at DESC, rowid DESC"
+        return self._read_rows(sql, None, params)
+
+    # -- loop-events readers (issue #112) ----------------------------------
+    #
+    # Full-table reads for the telemetry emitter, which derives events from
+    # the ledger at end of pass and filters by timestamp itself. Each is a
+    # plain projection, newest first like every reader here; none takes a
+    # `limit`, because the emitter's bound is its own watermark and a SQL
+    # truncation would silently drop exactly the oldest rows a fresh daemon's
+    # backfill exists to send.
+
+    def read_reaps(self) -> list[dict]:
+        """Reap rows (one per session the sweep killed), newest first."""
+        return self._read_rows(
+            "SELECT session, reaped_at FROM reaps "
+            "ORDER BY reaped_at DESC, rowid DESC",
             None,
-            (repo, number),
+        )
+
+    def read_stability_notices(self) -> list[dict]:
+        """Stability-notice rows (one per PR, the guard's memory), newest
+        first. The emitter joins these onto `stability:` pings for the
+        rcRounds/grantsSeen payload; the row is REPLACEd per episode, so the
+        join reads the newest episode's numbers — which is also what the
+        guard itself decides from."""
+        return self._read_rows(
+            "SELECT repo, number, round, rc_rounds, grants_seen, noticed_at "
+            "FROM stability_notices ORDER BY noticed_at DESC, number DESC",
+            None,
+        )
+
+    def read_spawn_checks_holds(self) -> list[dict]:
+        """Pre-spawn CI holds currently in the ledger, newest first. Rows are
+        deleted when their wait ends (see `clear_spawn_checks_hold`), so this
+        is the waits in flight plus the residue of rounds that never started
+        — the emitter reports a hold while it exists, and a hold that begins
+        and ends between two passes is simply not observed (best-effort)."""
+        return self._read_rows(
+            "SELECT repo, number, round, head_sha, first_at "
+            "FROM spawn_checks_holds ORDER BY first_at DESC, number DESC",
+            None,
         )
 
     # -- native verdict posts ----------------------------------------------
@@ -1034,16 +1089,24 @@ class State:
         return int(row["n"]) if row else 0
 
     def record_verdict_post(
-        self, repo: str, number: int, round_: int, review_url: str
+        self, repo: str, number: int, round_: int, review_url: str,
+        verdict: "str | None" = None,
     ) -> None:
         """Mark the round's native verdict as landed. Bookkeeping and evidence
         only: GitHub's reviews list stays the authority on whether a native
         verdict exists, so a row lost behind the daemon's back costs one
-        duplicate post, never a round that silently counts as closed."""
+        duplicate post, never a round that silently counts as closed.
+
+        `verdict` is the round's parsed envelope verdict ('approve' or
+        'request_changes'), remembered for the loop-events emitter (issue
+        #112), which reports rounds long after the envelope read that knew the
+        answer. Optional so existing callers and tests keep their shape; None
+        leaves the column NULL and the emitter omits the field."""
         self._db.execute(
-            "UPDATE verdict_posts SET posted_at = ?, review_url = ?, last_error = NULL "
+            "UPDATE verdict_posts SET posted_at = ?, review_url = ?, "
+            "verdict = ?, last_error = NULL "
             "WHERE repo=? AND number=? AND round=?",
-            (int(time.time()), review_url, repo, number, round_),
+            (int(time.time()), review_url, verdict, repo, number, round_),
         )
         self._db.commit()
 
@@ -1052,7 +1115,8 @@ class State:
         return self._read_rows(
             "SELECT repo, number, round, first_seen_at, head_sha, attempts, "
             "last_attempt_at, posted_at, abandoned_at, checks_held_at, "
-            "checks_held_state, checks_pending_at, review_url, last_error "
+            "checks_held_state, checks_pending_at, verdict, review_url, "
+            "last_error "
             "FROM verdict_posts "
             "ORDER BY first_seen_at DESC, number DESC",
             limit,
