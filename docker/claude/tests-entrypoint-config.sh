@@ -47,6 +47,7 @@ out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
         -u ALISSA_MAX_CONCURRENT_SESSIONS \
         -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
         -u ALISSA_REVIEW_TASK_MISS_TTL_POLLS -u ALISSA_TASK_LIST_SELF_SCOPE \
+        -u ALISSA_REV_LOOP_EVENTS_ENABLED \
         bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
 assert_key_absent "${out}" poll_interval "poll_interval omitted when ALISSA_POLL_INTERVAL unset"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP unset"
@@ -64,6 +65,8 @@ assert_key_absent "${out}" review_task_miss_ttl_polls \
   "review_task_miss_ttl_polls omitted when ALISSA_REVIEW_TASK_MISS_TTL_POLLS unset"
 assert_key_absent "${out}" task_list_self_scope \
   "task_list_self_scope omitted when ALISSA_TASK_LIST_SELF_SCOPE unset"
+assert_key_absent "${out}" loop_events_enabled \
+  "loop_events_enabled omitted when ALISSA_REV_LOOP_EVENTS_ENABLED unset"
 assert_eq "${out}" '.on_missing_hub' '"add"'    "on_missing_hub always emitted (structural: add)"
 assert_eq "${out}" '.agent_profile'  '"claude"' "agent_profile always emitted (structural: claude)"
 assert_eq "${out}" '.repos'          "${REPOS}" "repos emitted from allowlist"
@@ -150,6 +153,26 @@ else
   pass "a non-boolean ALISSA_TASK_LIST_SELF_SCOPE is refused, not silently false"
 fi
 
+# Loop telemetry (issue #112): the renderer's second boolean pass-through, with
+# the same accepted spellings and the same refusal of anything else. The daemon
+# library also reads ALISSA_REV_LOOP_EVENTS_ENABLED directly (env wins over the
+# rendered file), so this pin is about the render never CONTRADICTING the env.
+for truthy in 1 true TRUE yes on; do
+  out="$(ALISSA_REV_LOOP_EVENTS_ENABLED="${truthy}" render_revloop_config "${REPOS}")"
+  assert_eq "${out}" '.loop_events_enabled' 'true' \
+    "loop_events_enabled=${truthy} renders JSON true"
+done
+for falsy in 0 false FALSE no off; do
+  out="$(ALISSA_REV_LOOP_EVENTS_ENABLED="${falsy}" render_revloop_config "${REPOS}")"
+  assert_eq "${out}" '.loop_events_enabled' 'false' \
+    "loop_events_enabled=${falsy} renders JSON false"
+done
+if ALISSA_REV_LOOP_EVENTS_ENABLED=enable render_revloop_config "${REPOS}" >/dev/null 2>&1; then
+  bad "a non-boolean ALISSA_REV_LOOP_EVENTS_ENABLED is refused, not silently false"
+else
+  pass "a non-boolean ALISSA_REV_LOOP_EVENTS_ENABLED is refused, not silently false"
+fi
+
 echo "== override: structural keys still overridable =="
 out="$(ALISSA_ON_MISSING_HUB=skip ALISSA_AGENT_PROFILE=custom render_revloop_config "${REPOS}")"
 assert_eq "${out}" '.on_missing_hub' '"skip"'   "on_missing_hub override wins"
@@ -159,8 +182,8 @@ echo "== cross-check: omitted keys resolve to the LIBRARY default =="
 if python3 -c 'import alissa.tools.github.revloop.config' 2>/dev/null; then
   # ALISSA_STABILITY_ROUNDS, ALISSA_CHECKS_WAIT_SECONDS,
   # ALISSA_CHECKS_SPAWN_WAIT_SECONDS,
-  # ALISSA_MAX_CONCURRENT_SESSIONS, ALISSA_REVIEW_TASK_MISS_TTL_POLLS and
-  # ALISSA_TASK_LIST_SELF_SCOPE are unset here
+  # ALISSA_MAX_CONCURRENT_SESSIONS, ALISSA_REVIEW_TASK_MISS_TTL_POLLS,
+  # ALISSA_TASK_LIST_SELF_SCOPE and ALISSA_REV_LOOP_EVENTS_ENABLED are unset here
   # too: the library this cross-check imports is the Dockerfile-PINNED release,
   # which predates those keys and would reject them as unknown. Rendering either
   # into the config would then fail the cross-check for a version skew rather
@@ -170,6 +193,7 @@ if python3 -c 'import alissa.tools.github.revloop.config' 2>/dev/null; then
           -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
           -u ALISSA_MAX_CONCURRENT_SESSIONS \
           -u ALISSA_REVIEW_TASK_MISS_TTL_POLLS -u ALISSA_TASK_LIST_SELF_SCOPE \
+          -u ALISSA_REV_LOOP_EVENTS_ENABLED \
           bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
   # Pass the rendered JSON via an env var (not a pipe) so the heredoc can own
   # stdin as the python program.

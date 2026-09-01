@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import (
     HUB_ADD,
     HUB_SKIP,
+    LOOP_EVENTS_ENV,
     ON_MISSING_CREATE,
     ON_MISSING_SKIP,
     ON_MISSING_SPAWN,
@@ -200,6 +201,31 @@ def build_parser() -> argparse.ArgumentParser:
         f"invisible to this daemon. Overridden by ${TASK_LIST_BOW_ENV}",
     )
 
+    events = over.add_mutually_exclusive_group()
+    events.add_argument(
+        "--loop-events",
+        dest="loop_events_enabled",
+        action="store_true",
+        default=None,
+        help="push loop telemetry (rounds spawned, verdicts, cap-outs, "
+        "stability holds, stalls, checks holds) to Studio's POST "
+        "/v1/loop-events once per poll pass — best-effort, never fatal. "
+        f"Overridden by ${LOOP_EVENTS_ENV}",
+    )
+    events.add_argument(
+        "--no-loop-events",
+        dest="loop_events_enabled",
+        action="store_false",
+        help="do not push loop telemetry even if the config enables it",
+    )
+    over.add_argument(
+        "--alissa-endpoint",
+        dest="alissa_endpoint",
+        metavar="URL",
+        help="the Alissa API base the loop-events client posts to "
+        "(default: https://api.alissa.app)",
+    )
+
     dry = over.add_mutually_exclusive_group()
     dry.add_argument(
         "--dry-run",
@@ -242,6 +268,8 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "review_task_miss_ttl_polls": args.review_task_miss_ttl_polls,
         "task_list_self_scope": args.task_list_self_scope,
         "task_list_bow_id": args.task_list_bow_id,
+        "loop_events_enabled": args.loop_events_enabled,
+        "alissa_endpoint": args.alissa_endpoint,
         "dry_run": args.dry_run,
     }
 

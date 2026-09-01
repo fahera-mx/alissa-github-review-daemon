@@ -68,5 +68,11 @@
   "_task_list_self_scope": "Narrow `alissa task list` to THIS actor's own rows (--self), dropping the sponsor's corpus. OFF by default on evidence, not caution: on the live fleet corpus (2026-08-16) --self removes 4% of the payload, and 3 of the 371 review tasks in it are among the rows it removes — they are owned by another actor. A review task the list cannot see is a round the daemon cannot count, which is a worse trade than 4% of the wire. Turn it on only where EVERY review task is created by this daemon's own reviewer sessions. Ignored (with a startup warning) when the installed alissa CLI does not advertise the flag; the status filter and digest view are adopted automatically wherever the CLI offers them and need no key here.",
   "task_list_self_scope": false,
 
+  "_loop_events_enabled": "STUDIO LOOP TELEMETRY. When true, the daemon pushes one idempotent batch of loop events per poll pass to POST /v1/loop-events on the Alissa API — rounds spawned, verdicts posted (with head/URL/attempts/held time), rounds abandoned, CR9 cap-outs, stability holds, stalls, checks holds, operator re-entry grants and session reaps — derived from the local ledger with deterministic dedupe keys, so re-emission (a failed pass, a daemon restart's backfill) lands as silent server-side duplicates. Best-effort and never fatal: a failed push is one WARN and the pass completes; there is no retry queue because the keys make re-sending the retry. Uses the same ALISSA_API_TOKEN the alissa CLI reads. Also settable by the environment (ALISSA_REV_LOOP_EVENTS_ENABLED, which wins over this file AND the CLI flags). Off by default: telemetry is an outbound write, and an upgrade must not start posting on its own.",
+  "loop_events_enabled": false,
+
+  "_alissa_endpoint": "The Alissa API base the loop-events client posts to. Leave it at the default unless the deployment points telemetry at a staging API.",
+  "alissa_endpoint": "https://api.alissa.app",
+
   "dry_run": false
 }

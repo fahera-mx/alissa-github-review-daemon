@@ -6,12 +6,15 @@ Settings come from three layers, later winning over earlier:
 2. a JSON config file (see `resolve_config_path`)
 3. CLI arguments
 
-`task_list_bow_id` adds a fourth above them all — the environment
-(`ALISSA_REVIEW_TASK_BOW`, see `env_task_list_bow_id`). It is the only key that
-does, and the reason is that it is the only one a second entry point needs:
-`alissa-pr-review` builds its own `Alissa` client with no config file and no
-argv of the daemon's, so an id that lives only in the file or the flags reaches
-the poll loop and silently misses that call site.
+Two keys add a fourth layer above them all — the environment. `task_list_bow_id`
+(`ALISSA_REVIEW_TASK_BOW`, see `env_task_list_bow_id`) has it because it is the
+one key a second entry point needs: `alissa-pr-review` builds its own `Alissa`
+client with no config file and no argv of the daemon's, so an id that lives only
+in the file or the flags reaches the poll loop and silently misses that call
+site. `loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`, see
+`env_loop_events_enabled`) has it because a container deployment toggles
+telemetry with one variable and no config-file edit (issue #112); the env wins
+over both other layers so the two env-backed keys share one precedence story.
 
 `workspace_root` is deliberately **not** a config key — it is a property of the
 running process, not of the settings. That lets one config file drive several
@@ -28,6 +31,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 # A POSIX-ish environment variable name -- what `reviewer_token_env` must be.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -147,6 +151,8 @@ CONFIG_KEYS = (
     "review_task_miss_ttl_polls",
     "task_list_self_scope",
     "task_list_bow_id",
+    "loop_events_enabled",
+    "alissa_endpoint",
     "dry_run",
 )
 
@@ -154,6 +160,81 @@ CONFIG_KEYS = (
 # both the config file and the CLI flag -- see the module docstring for why this
 # one key gets a layer the others do not.
 TASK_LIST_BOW_ENV = "ALISSA_REVIEW_TASK_BOW"
+
+
+# The environment variable toggling loop telemetry (issue #112). Like
+# TASK_LIST_BOW_ENV it outranks both the config file and the CLI flag — see the
+# module docstring for the shared precedence story.
+LOOP_EVENTS_ENV = "ALISSA_REV_LOOP_EVENTS_ENABLED"
+
+# The default Studio API base the loop-events client posts to. Mirrors
+# alissa_client.DEFAULT_ENDPOINT (a test pins the two together); defined here
+# too so config stays importable without the client module.
+DEFAULT_ALISSA_ENDPOINT = "https://api.alissa.app"
+
+# The boolean spellings the env layer accepts, matching the container
+# renderer's contract for its other boolean (ALISSA_TASK_LIST_SELF_SCOPE):
+# anything else is REFUSED rather than read as false, because a silently-false
+# typo is indistinguishable from the default it was trying to change.
+_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+# Hosts a cleartext `alissa_endpoint` is allowed to name. The loop-events
+# client sends a bearer token with every POST, so a non-https endpoint puts
+# that token on the wire — refused at load, except toward the machine itself
+# (a local stub or port-forward, which is how the client is tested against a
+# fake ingest).
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _validate_alissa_endpoint(endpoint: str) -> str:
+    """`endpoint`, or a ValueError naming why it cannot carry a credential.
+
+    https is the rule; http is allowed only toward loopback. Anything else —
+    a bare host, another scheme, an unparsable value — is refused at load,
+    where the operator reads `config error`, rather than discovered as a
+    token on a cleartext hop (PR #113 round 1, minor).
+    """
+    parts = urlsplit(endpoint)
+    # A host is required on BOTH branches (PR #113 round 2, nit): a bare
+    # "https://" parses with the right scheme and no host, and would then
+    # fail on the wire as a per-pass transient WARN — the exact symptom this
+    # load-time check exists to prevent.
+    if parts.scheme == "https" and parts.hostname:
+        return endpoint
+    if parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS:
+        return endpoint
+    raise ValueError(
+        f"alissa_endpoint must be an https:// URL with a host (or http:// "
+        f"toward loopback — localhost, 127.0.0.1, ::1 — for a local stub): "
+        f"the loop-events client sends a bearer token with every request, "
+        f"and a cleartext endpoint puts it on the wire. Got {endpoint!r}"
+    )
+
+
+def env_loop_events_enabled(
+    environ: "Mapping[str, str] | None" = None,
+) -> "bool | None":
+    """The loop-events toggle from the environment, or None when unset.
+
+    None and empty are the SAME answer — an exported-but-empty variable is how
+    a container renders "unset" (the Dockerfile bakes empty ENV defaults), and
+    it must fall through to the file/CLI layers rather than read as false. A
+    non-boolean spelling raises: the startup phase turns a ValueError into
+    `config error` + exit 2, which is where a typo belongs.
+    """
+    raw = (os.environ if environ is None else environ).get(LOOP_EVENTS_ENV)
+    value = (raw or "").strip().lower()
+    if not value:
+        return None
+    if value in _ENV_TRUE:
+        return True
+    if value in _ENV_FALSE:
+        return False
+    raise ValueError(
+        f"{LOOP_EVENTS_ENV} must be a boolean "
+        f"(1/0, true/false, yes/no, on/off), got {raw!r}"
+    )
 
 
 def env_task_list_bow_id(environ: "Mapping[str, str] | None" = None) -> "str | None":
@@ -496,6 +577,20 @@ class Config:
     # get the id wrong (a repo's `autodev:` feed BOW; a `mirrorInstanceId`).
     task_list_bow_id: str | None = None
 
+    # Whether the loop pushes its telemetry — rounds spawned, verdicts posted,
+    # cap-outs, stability holds, stalls, checks holds, grants, reaps — to
+    # Studio's `POST /v1/loop-events` once per poll pass (issue #112). OFF by
+    # default: telemetry is an outbound write to an external service, and an
+    # existing deployment must not start posting because it upgraded. Toggled
+    # by the env var LOOP_EVENTS_ENV above the file and the CLI. Best-effort
+    # when on: a failed push is one WARN and the pass completes.
+    loop_events_enabled: bool = False
+
+    # The Alissa/Studio API base the loop-events client posts to. One knob so
+    # a staging deployment can point telemetry somewhere else; everything else
+    # about the client (its bearer token) comes from the environment.
+    alissa_endpoint: str = DEFAULT_ALISSA_ENDPOINT
+
     dry_run: bool = False
 
     def __post_init__(self) -> None:
@@ -602,6 +697,26 @@ class Config:
         # or a flag means "unset" too rather than `--bow ""` -- a call the CLI
         # takes and answers with nobody's tasks.
         bow_id = (bow_id or "").strip() or None
+
+        # The loop-events toggle's env layer, applied after the CLI overrides
+        # like the BOW id's above and for the same reason: the variable is how
+        # a container flips telemetry without editing a file on its volume.
+        env_events = env_loop_events_enabled(environ)
+        if env_events is not None:
+            raw["loop_events_enabled"] = env_events
+
+        endpoint = raw.get("alissa_endpoint", cls.alissa_endpoint)
+        if not isinstance(endpoint, str):
+            raise ValueError(
+                f"alissa_endpoint must be a URL string, got a "
+                f"{type(endpoint).__name__}"
+            )
+        # "" falls back to the default rather than building a client with an
+        # empty base — the same unset-means-default reading every optional
+        # string key here has.
+        endpoint = _validate_alissa_endpoint(
+            endpoint.strip() or cls.alissa_endpoint
+        )
 
         mode = raw.get("on_missing_review_task", ON_MISSING_SPAWN)
         if mode not in _MISSING_MODES:
@@ -781,6 +896,8 @@ class Config:
             review_task_miss_ttl_polls=miss_ttl,
             task_list_self_scope=bool(raw.get("task_list_self_scope", False)),
             task_list_bow_id=bow_id,
+            loop_events_enabled=bool(raw.get("loop_events_enabled", False)),
+            alissa_endpoint=endpoint,
             dry_run=bool(raw.get("dry_run", False)),
         )
 

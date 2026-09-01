@@ -106,8 +106,10 @@ alissa-revloop --workspace-root ~/ws/beta  --repo org/beta-web &
 Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
 the flag wins. `--repo` is repeatable and *replaces* the config list rather than
 extending it. `--dry-run` / `--no-dry-run` override the config in both directions.
-One key — `task_list_bow_id` — has a third layer above both, the environment
-variable `ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why.
+Two keys have a third layer above both, the environment: `task_list_bow_id`
+(`ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why) and
+`loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`; see *Loop telemetry*).
+The environment wins over the file **and** the flags for both.
 
 | key / flag | default | meaning |
 | --- | --- | --- |
@@ -134,6 +136,8 @@ variable `ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why.
 | `review_task_miss_ttl_polls` | `10` | how many polls a PR with **no** review task is taken on trust before the task corpus is searched for one again. Trades **latency** for reads: a review task created mid-window is picked up at the re-arm rather than the next poll. Floor `1` — there is no value that turns it off — see *Bounding the task-list read* |
 | `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
 | `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon, which on the default `on_missing_review_task` means a round spawned *untethered from its task* — see *Bounding the task-list read* for the id's contract, the two ways to get it wrong, and what `--bow` does to the other narrowing flags |
+| `loop_events_enabled` | `false` | push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability holds, stalls, checks holds, grants, reaps) to Studio's `POST /v1/loop-events` **once per poll pass** — one idempotent, ledger-derived batch, best-effort and never fatal. Settable by the environment (`ALISSA_REV_LOOP_EVENTS_ENABLED`, which wins over the file and `--loop-events`/`--no-loop-events`) — see *Loop telemetry (Studio ingest)* |
+| `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events client posts to; the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
 #### Who the loop serves
 
@@ -840,6 +844,41 @@ happened, and the reap count is `0`). `State.read_snapshots()` is the reader the
 console consumes — newest first, with the `stages` JSON decoded back to a
 list. Nothing in the decision logic reads a snapshot, so persisting it can never
 change which reviewers spawn.
+
+### Loop telemetry (Studio ingest)
+
+With `loop_events_enabled` on, the end of every poll pass derives **loop
+events** from the local ledger and pushes them to the Alissa API's
+`POST /v1/loop-events` (`seat: "revloop"`) — the Factory console's source for
+rounds-to-approve, verdict mix, cap-outs and holds over time. One batch per
+pass, split at the ingest cap of 200; authenticated with the same
+`ALISSA_API_TOKEN` the `alissa` CLI reads (the CLI itself has no loop-events
+command, so this is the package's one direct REST write — `alissa_client.py`).
+
+The kinds, each carrying the **ledger's** timestamp as `at` and a dedupe key
+built from the ledger's own keys:
+
+| kind | ledger source | payload |
+| --- | --- | --- |
+| `round.spawned` | `spawns` | `session`, `round`, `data.headSha`, `data.taskRef` |
+| `round.verdict` | `verdict_posts` once `posted_at` is set | `round`, `data.verdict` (`approve` \| `request_changes`), `data.headSha`, `data.reviewUrl`, `data.attempts`, `data.checksHeldMs` when the round was held. **Coverage bound**: `verdict_posts` is the per-round *obligation* record — a row exists only when the daemon had to post the native fallback verdict itself, i.e. when the reviewer session did not submit its own review. On a fleet whose sessions post every review (0 of the last 58 rounds on this repo took the fallback path), this series is **expected to be empty**; covering session-posted rounds is TASK-1086576582 |
+| `round.abandoned` | `verdict_posts` once `abandoned_at` is set | `round`, `reason` (= `last_error`), `data.headSha`. Same coverage bound as `round.verdict` |
+| `round.capped` | `escalations` (CR9 cap-outs) | `round` (the newest spawn **at or before** `escalated_at` — the round in flight when the cap was recorded; omitted when no spawn row qualifies), `data.headSha` |
+| `stability.hold` | `stability:` pings, enriched from `stability_notices` | `data.headSha`, `data.rcRounds`, `data.grantsSeen` |
+| `stalled` | `stalled:<session>` pings | `session` |
+| `checks.held` | `checks-unsettled:` pings **and** `spawn_checks_holds` | `round`, `data.headSha`, `data.gate` (`verdict` \| `spawn`) |
+| `grant` | `grants` (operator re-entry acks) | `data.author`, `data.rounds` |
+| `reap` | `reaps` | `session` |
+
+**Best-effort, never fatal, no retry queue.** A failed push is one WARN and the
+pass completes. The emitter keeps an in-memory watermark of the newest ledger
+stamp it sent: a failure leaves it put, so the next pass re-derives and
+re-sends, and the deterministic dedupe keys make the overlap land as silent
+server-side duplicates (the ingest is idempotent on `(user, dedupeKey)`). A
+daemon restart resets the watermark, so the first enabled pass re-sends the
+whole ledger — that is the **backfill**, batched and deduped, not a bug. No
+events are pushed in `--dry-run` (an outbound POST is an act), and none are
+derived from vitals.
 
 ## Reviewer console (`alissa-revloop-ui`)
 

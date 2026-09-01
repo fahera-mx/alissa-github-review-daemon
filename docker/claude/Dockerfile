@@ -277,6 +277,18 @@ ARG ALISSA_REVIEW_TASK_MISS_TTL_POLLS=""
 # digest view) are adopted automatically wherever the installed CLI offers them
 # and need no variable. Pass-through, REQUIRES REVLOOP_VERSION >= 0.18.0.
 ARG ALISSA_TASK_LIST_SELF_SCOPE=""
+# Push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability
+# holds, stalls, checks holds, grants, reaps) to Studio's POST /v1/loop-events
+# once per poll pass (issue #112) -- one idempotent, ledger-derived batch,
+# best-effort and never fatal, authenticated with the container's existing
+# ALISSA_API_TOKEN. Boolean like ALISSA_TASK_LIST_SELF_SCOPE (1/0, true/false,
+# yes/no, on/off; anything else refused). Off unless set: telemetry is an
+# outbound write and an image upgrade must not start posting on its own. The
+# daemon library ALSO reads this exact variable directly (it outranks the
+# rendered config), so the render below is belt to that brace. Pass-through,
+# and it REQUIRES REVLOOP_VERSION >= 0.28.0 for the same reason the keys above
+# do: an older library rejects the unknown config key at load.
+ARG ALISSA_REV_LOOP_EVENTS_ENABLED=""
 # STRUCTURAL container constants (not pass-through): agent_profile must name a
 # profile the baked agents.yaml ships (`claude`); on_missing_hub must be `add`
 # for the self-contained hub-ify-on-demand model (the library default `skip`
@@ -318,6 +330,7 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_CHECKS_SPAWN_WAIT_SECONDS=${ALISSA_CHECKS_SPAWN_WAIT_SECONDS} \
     ALISSA_REVIEW_TASK_MISS_TTL_POLLS=${ALISSA_REVIEW_TASK_MISS_TTL_POLLS} \
     ALISSA_TASK_LIST_SELF_SCOPE=${ALISSA_TASK_LIST_SELF_SCOPE} \
+    ALISSA_REV_LOOP_EVENTS_ENABLED=${ALISSA_REV_LOOP_EVENTS_ENABLED} \
     ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} \
     ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \
