@@ -283,9 +283,9 @@ assert_file "${WORKSPACE}/.alissa-config/agents.yaml" \
   "the resolved agents.yaml is copied to the executor's config dir"
 # start_boot runs under `env -i` with no ALISSA_AGENT_MODEL, so this is the
 # UNSET path: the pin must be the baked default, not an alias.
-assert_eq "$(profile_cmd)" "${BASE_CMD} --model claude-fable-5" \
-  "...with the model pin applied (unset -> default claude-fable-5), exactly as the daemon role gets it"
-assert_contains "${LOG2}" "reviewer model: claude-fable-5 (ALISSA_AGENT_MODEL)" \
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model claude-fable-5-1" \
+  "...with the model pin applied (unset -> default claude-fable-5-1), exactly as the daemon role gets it"
+assert_contains "${LOG2}" "reviewer model: claude-fable-5-1 (ALISSA_AGENT_MODEL)" \
   "...and the boot log names the default"
 assert_not_contains "${WORKSPACE}/.alissa-config/agents.yaml" "disable_alissa_code" \
   "...and WITHOUT disable_alissa_code, so job sessions still launch via alissa code"

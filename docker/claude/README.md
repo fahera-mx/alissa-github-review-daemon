@@ -301,8 +301,9 @@ reviewer inherits whatever the persisted `claude /login` account defaults to —
 and on plan-based accounts that default can **silently fall back to a smaller
 model** once a usage threshold is hit. `ALISSA_AGENT_MODEL` makes the model an
 explicit boot-time decision instead of a rebuild-time one. The unset default is
-`claude-fable-5` — the most capable generally-available Claude model, one tier
-above Opus — because the reviewer is the pipeline's quality gate.
+`claude-fable-5-1` — the latest and most capable generally-available Claude
+model, one tier above Opus — because the reviewer is the pipeline's quality
+gate.
 
 At container boot the entrypoint appends `--model "$ALISSA_AGENT_MODEL"` to the
 claude profile's `command:` and logs the effective command (grep the startup log
@@ -310,7 +311,7 @@ for `effective reviewer command:`).
 
 | `ALISSA_AGENT_MODEL` | reviewer `command:` becomes |
 | --- | --- |
-| *(unset)* → default `claude-fable-5` | `claude … --model claude-fable-5` |
+| *(unset)* → default `claude-fable-5-1` | `claude … --model claude-fable-5-1` |
 | `claude-opus-4-8` (any alias or full id) | `claude … --model claude-opus-4-8` |
 | `default` *or* empty | `claude …` (no `--model` — restores account default) |
 
@@ -355,7 +356,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_TASK_LIST_SELF_SCOPE` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` narrows `alissa task list` to this actor's own rows (`--self`), dropping the sponsor's corpus; `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false`. Off by default on measured evidence: it saves ~4% of the payload, and a small minority of review tasks on the live fleet are owned by another actor — one the list cannot see is a round the daemon cannot count. Set it only where every review task is created by this daemon's own reviewer sessions. The other narrowings (status filter, digest view) are probed from the installed CLI and need no variable. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.18.0` |
 | `ALISSA_REV_LOOP_EVENTS_ENABLED` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` makes the daemon push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability holds, stalls, checks holds, grants, reaps) to Studio's `POST /v1/loop-events` once per poll pass — one idempotent, ledger-derived batch, best-effort and never fatal, authenticated with the container's existing `ALISSA_API_TOKEN`; `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false`. The daemon library also reads this exact variable directly and it **wins over the rendered config and the CLI flags**, so the render can never contradict the env. Off by default: telemetry is an outbound write and an image upgrade must not start posting on its own. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.28.0` |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
-| `ALISSA_AGENT_MODEL` | `claude-fable-5` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
+| `ALISSA_AGENT_MODEL` | `claude-fable-5-1` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
 | `ALISSA_WORKER_INTERVAL` | `2` | worker reconcile tick (seconds) |
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |
@@ -805,8 +806,8 @@ the rest only mean anything on a service that already set those two.
 | `ALISSA_BRIDGE_POLL_SECONDS` | *(CLI default: 15)* | seconds between queue polls; maps to the CLI's `--interval`; **pass-through** |
 
 The model pin works exactly as it does for the daemon: `ALISSA_AGENT_MODEL`
-(default `claude-fable-5`) is rewritten into the `claude` profile's `command:` at
-boot, and job sessions inherit it. The profile deliberately carries **no**
+(default `claude-fable-5-1`) is rewritten into the `claude` profile's `command:`
+at boot, and job sessions inherit it. The profile deliberately carries **no**
 `disable_alissa_code`, which is what makes the CLI launch it via `alissa code -y
 --handoff claude` — that wrapper is what registers the codeSession and its
 10-minute log checkpoints. Adding the flag would launch a bare `claude` and lose
