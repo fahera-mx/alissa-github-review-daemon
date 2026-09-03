@@ -211,7 +211,7 @@ EXECUTOR_UP="starting alissa bridge start"
 # agents.yaml, value only. BASE_CMD mirrors the entrypoint's step-2e constant:
 # a model pin is exactly BASE_CMD plus `--model <value>`, and no pin is exactly
 # BASE_CMD — so every model assertion compares the WHOLE line.
-BASE_CMD="claude --dangerously-skip-permissions --permission-mode acceptEdits"
+BASE_CMD="claude --dangerously-skip-permissions"
 profile_cmd() {
   sed -n -E 's/^[[:space:]]*command:[[:space:]]*//p' \
     "${WORKSPACE}/.alissa-config/agents.yaml" 2>/dev/null | head -n 1
@@ -289,6 +289,17 @@ assert_contains "${LOG2}" "reviewer model: claude-fable-5-1 (ALISSA_AGENT_MODEL)
   "...and the boot log names the default"
 assert_not_contains "${WORKSPACE}/.alissa-config/agents.yaml" "disable_alissa_code" \
   "...and WITHOUT disable_alissa_code, so job sessions still launch via alissa code"
+# Issue #116: the profile shipped `--dangerously-skip-permissions --permission-mode
+# acceptEdits` for a while, and the explicit mode OVERRIDES the bypass — sessions
+# ran in acceptEdits and wedged on hard prompts (dangerous rm) that nothing in a
+# headless container answers. BASE_CMD above already pins the whole line, but the
+# contract deserves its own named check so a re-added mode fails by name. The
+# rendered `command:` value is checked (not the whole file) because the header
+# comment explains the prohibition and so mentions the flag itself.
+case "$(profile_cmd)" in
+  *--permission-mode*) bad "the rendered claude command must NOT carry an explicit --permission-mode (it overrides --dangerously-skip-permissions and re-enables prompts)" ;;
+  *) pass "the rendered claude command carries no --permission-mode (bypass flag is the whole unattended contract)" ;;
+esac
 
 # -----------------------------------------------------------------------------
 info ""

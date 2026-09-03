@@ -602,7 +602,11 @@ if [ ! -f "${AGENTS_YAML}" ]; then
 elif ! grep -q 'alissa-managed:' "${AGENTS_YAML}"; then
   log "custom agents.yaml in effect (no alissa-managed marker) — using it verbatim, ALISSA_AGENT_MODEL ignored"
 else
-  BASE_CMD="claude --dangerously-skip-permissions --permission-mode acceptEdits"
+  # Single flag by contract (issue #116): an explicit permission-mode flag next
+  # to the bypass overrides it and re-enables hard prompts (dangerous rm,
+  # un-allowlisted Bash) that wedge a headless session. Keep this in step with
+  # the baked agents.yaml and the executor test's mirror constant.
+  BASE_CMD="claude --dangerously-skip-permissions"
   if [ -z "${AGENT_MODEL}" ] || [ "${AGENT_MODEL}" = "default" ]; then
     CLAUDE_CMD="${BASE_CMD}"
     log "reviewer model: account default (ALISSA_AGENT_MODEL='${AGENT_MODEL}') — no --model flag"
