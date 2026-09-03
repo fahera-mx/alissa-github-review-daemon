@@ -597,6 +597,13 @@ AGENTS_YAML="${HOME}/.config/alissa/agents.yaml"
 # Default `claude-fable-5-1` only when UNSET (use `-`, not `:-`): an explicitly
 # empty value is a valid opt-out and must NOT be re-defaulted back to the pin.
 AGENT_MODEL="${ALISSA_AGENT_MODEL-claude-fable-5-1}"
+# Trim leading/trailing whitespace first: a padded `opus ` pasted out of a
+# platform env editor is a working configuration at base (the shell drops the
+# padding when it splits the command line) and must not become a boot refusal
+# at the next redeploy. Interior whitespace is NOT trimmed — it is a smuggling
+# shape and the shape check below refuses it.
+AGENT_MODEL="${AGENT_MODEL#"${AGENT_MODEL%%[![:space:]]*}"}"
+AGENT_MODEL="${AGENT_MODEL%"${AGENT_MODEL##*[![:space:]]}"}"
 if [ ! -f "${AGENTS_YAML}" ]; then
   log "WARN: ${AGENTS_YAML} not found — skipping model pin (worker will fall back to a bare claude)"
 elif ! grep -q 'alissa-managed:' "${AGENTS_YAML}"; then
@@ -607,17 +614,23 @@ else
     CLAUDE_CMD="${BASE_CMD}"
     log "reviewer model: account default (ALISSA_AGENT_MODEL='${AGENT_MODEL}') — no --model flag"
   else
-    # The pin is appended VERBATIM (no model allowlist, by design), which makes
-    # it a route for smuggling extra flags into the reviewer spawn: a value of
-    # `opus --permission-mode acceptEdits` renders a command whose explicit mode
-    # overrides --dangerously-skip-permissions and re-enables the hard prompts
-    # that wedge headless sessions (issue #116, PR #117 round-1 finding). A
-    # model alias or id is one bare token, so refuse anything with whitespace
-    # or a leading dash — same posture as the executor-id validation above:
-    # a mis-set knob is fatal at boot with a message that names the fix.
+    # The pin is appended VERBATIM (no model allowlist, by design) to a command
+    # line that the CLI later TYPES into the agent's tmux pane (`send-keys -l`
+    # + Enter), so the pane's shell splits and expands it. That makes the pin a
+    # shell-metacharacter surface, not just a flag surface: `opus --permission-
+    # mode acceptEdits`, `opus${IFS}--permission-mode${IFS}acceptEdits` and
+    # `opus;<cmd>` all reach the shell intact and the first two rebuild the
+    # exact argv that wedged issue #116 (PR #117 / PR #118 round-1 findings).
+    # So the check is POSITIVE, like the executor-id validation above: a model
+    # alias or id is one bare token of letters, digits, dot, underscore or dash
+    # — the CLI's own ENV_VALUE_RE for values it interpolates into this same
+    # launch string — and it does not START with a dash (that class admits
+    # `-`, so a bare `--permission-mode` would otherwise pass and render as
+    # `--model --permission-mode`). Anything else is fatal at boot with a
+    # message naming the fix. A shape rule, not an allowlist on model names.
     case "${AGENT_MODEL}" in
-      -*|*[[:space:]]*)
-        die "ALISSA_AGENT_MODEL='${AGENT_MODEL}' is not a model alias or id — it must be one bare token (no whitespace, no leading dash). The value is appended verbatim to the claude command as '--model <value>', so anything else smuggles extra flags into the reviewer spawn; an explicit --permission-mode there overrides --dangerously-skip-permissions and re-enables the permission prompts that wedge headless sessions (issue #116). Use an alias or id such as 'opus' or 'claude-fable-5-1', or 'default' / empty to inherit the account default." ;;
+      -*|*[!A-Za-z0-9._-]*)
+        die "ALISSA_AGENT_MODEL='${AGENT_MODEL}' is not a model alias or id — it must be one bare token of letters, digits, dot, underscore or dash, not starting with a dash. The value is appended verbatim to the claude command as '--model <value>' and that command is typed into the agent's shell, so any other character smuggles flags or commands into the reviewer spawn; an explicit --permission-mode there overrides --dangerously-skip-permissions and re-enables the permission prompts that wedge headless sessions (issue #116). Use an alias or id such as 'opus' or 'claude-fable-5-1', or 'default' / empty to inherit the account default." ;;
     esac
     CLAUDE_CMD="${BASE_CMD} --model ${AGENT_MODEL}"
     log "reviewer model: ${AGENT_MODEL} (ALISSA_AGENT_MODEL)"
