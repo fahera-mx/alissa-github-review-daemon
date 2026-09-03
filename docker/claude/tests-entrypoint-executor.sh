@@ -331,6 +331,33 @@ assert_eq "$(profile_cmd)" "${BASE_CMD}" \
 assert_contains "${LOG2E}" "reviewer model: account default (ALISSA_AGENT_MODEL='')" \
   "...and the log says so"
 
+# Verbatim pass-through is the feature, but it is also a second route back into
+# issue #116: a pin carrying flags renders them straight into the spawn, and the
+# rendered-command assertions never see it because every value above is a bare
+# token. A model alias or id has no whitespace and no leading dash, so those two
+# shapes are refused at boot (PR #117 round-1 finding).
+LOG2F="${TMPROOT}/model-smuggled-flag.log"
+model_boot "${LOG2F}" "ALISSA_AGENT_MODEL=opus --permission-mode acceptEdits"
+[ "${BOOT_STATUS}" != "0" ] && pass "a model pin carrying whitespace (smuggled flags) is fatal at BOOT" \
+  || bad "a pin of 'opus --permission-mode acceptEdits' should not have booted"
+assert_contains "${LOG2F}" "is not a model alias or id" \
+  "the refusal names the shape rule"
+assert_contains "${LOG2F}" "overrides --dangerously-skip-permissions" \
+  "...and why a smuggled flag is the hazard"
+assert_no_file "${SPY}/bridge-argv" "nothing registers on a refused pin"
+case "$(profile_cmd)" in
+  *--permission-mode*) bad "the rendered command must never carry the smuggled flag" ;;
+  *) pass "the rendered command never carried the smuggled flag" ;;
+esac
+
+LOG2G="${TMPROOT}/model-leading-dash.log"
+model_boot "${LOG2G}" "ALISSA_AGENT_MODEL=--permission-mode"
+[ "${BOOT_STATUS}" != "0" ] && pass "a model pin with a leading dash (a bare flag) is fatal at BOOT" \
+  || bad "a pin of '--permission-mode' should not have booted"
+assert_contains "${LOG2G}" "is not a model alias or id" \
+  "the refusal names the shape rule"
+assert_no_file "${SPY}/bridge-argv" "nothing registers on a refused pin"
+
 # -----------------------------------------------------------------------------
 info ""
 info "3. the executor id is required and validated"

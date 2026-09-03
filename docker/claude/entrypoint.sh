@@ -607,6 +607,18 @@ else
     CLAUDE_CMD="${BASE_CMD}"
     log "reviewer model: account default (ALISSA_AGENT_MODEL='${AGENT_MODEL}') — no --model flag"
   else
+    # The pin is appended VERBATIM (no model allowlist, by design), which makes
+    # it a route for smuggling extra flags into the reviewer spawn: a value of
+    # `opus --permission-mode acceptEdits` renders a command whose explicit mode
+    # overrides --dangerously-skip-permissions and re-enables the hard prompts
+    # that wedge headless sessions (issue #116, PR #117 round-1 finding). A
+    # model alias or id is one bare token, so refuse anything with whitespace
+    # or a leading dash — same posture as the executor-id validation above:
+    # a mis-set knob is fatal at boot with a message that names the fix.
+    case "${AGENT_MODEL}" in
+      -*|*[[:space:]]*)
+        die "ALISSA_AGENT_MODEL='${AGENT_MODEL}' is not a model alias or id — it must be one bare token (no whitespace, no leading dash). The value is appended verbatim to the claude command as '--model <value>', so anything else smuggles extra flags into the reviewer spawn; an explicit --permission-mode there overrides --dangerously-skip-permissions and re-enables the permission prompts that wedge headless sessions (issue #116). Use an alias or id such as 'opus' or 'claude-fable-5-1', or 'default' / empty to inherit the account default." ;;
+    esac
     CLAUDE_CMD="${BASE_CMD} --model ${AGENT_MODEL}"
     log "reviewer model: ${AGENT_MODEL} (ALISSA_AGENT_MODEL)"
   fi

@@ -316,7 +316,13 @@ for `effective reviewer command:`).
 | `default` *or* empty | `claude …` (no `--model` — restores account default) |
 
 The value passes through **verbatim** — both aliases (`opus`, `sonnet`) and full
-ids (`claude-opus-4-8`) are valid; there is no allowlist.
+ids (`claude-opus-4-8`) are valid; there is no allowlist. There is a **shape
+rule**, though: the value must be one bare token, with no whitespace and no
+leading dash, and the entrypoint refuses to boot otherwise. Because the pin is
+appended verbatim, anything else would smuggle extra flags into the reviewer
+spawn — and an explicit `--permission-mode` there overrides
+`--dangerously-skip-permissions` and brings back the permission prompts that
+wedge headless sessions (issue #116). Pin models with this knob, never flags.
 
 **Precedence.** The entrypoint only rewrites the **baked default** profile, which
 it recognizes by an `alissa-managed:` marker comment. A custom `agents.yaml`
