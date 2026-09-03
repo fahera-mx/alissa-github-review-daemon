@@ -300,6 +300,12 @@ case "$(profile_cmd)" in
   *--permission-mode*) bad "the rendered claude command must NOT carry an explicit --permission-mode (it overrides --dangerously-skip-permissions and re-enables prompts)" ;;
   *) pass "the rendered claude command carries no --permission-mode (bypass flag is the whole unattended contract)" ;;
 esac
+# The rewrite above composes from the entrypoint's BASE_CMD, so it would mask a
+# mode flag re-added to the CHECKED-IN profile. Pin the source file too: its
+# unrendered `command:` must be exactly BASE_CMD, so the two agree before boot.
+assert_eq "$(sed -n -E 's/^[[:space:]]*command:[[:space:]]*//p' "${HERE}/agents.yaml" | head -n 1)" \
+  "${BASE_CMD}" \
+  "the checked-in agents.yaml command is exactly BASE_CMD (no --permission-mode, no pin)"
 
 # -----------------------------------------------------------------------------
 info ""
