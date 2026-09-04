@@ -4,10 +4,22 @@
 # (default: claude). Without this file the worker falls back to a bare `claude`,
 # which stops on its first-run trust / permission prompt and hangs the reviewer.
 #
-# `--dangerously-skip-permissions --permission-mode acceptEdits` is what makes
-# claude run unattended. It requires a non-root user (claude refuses that flag as
-# root) — the image runs as uid 1000, which satisfies it. Reviewer posture (CR6:
-# reviewers never write) is enforced by the round directive, not by this profile.
+# `--dangerously-skip-permissions` ALONE is what makes claude run unattended: it
+# bypasses every permission prompt, so a headless session never stops to ask.
+# It requires a non-root user (claude refuses that flag as root) — the image runs
+# as uid 1000, which satisfies it. Reviewer posture (CR6: reviewers never write)
+# is enforced by the round directive, not by this profile.
+#
+# Do NOT add an explicit `--permission-mode <mode>` next to the bypass flag. An
+# explicit mode OVERRIDES the bypass: the session runs in that mode instead, and
+# every hard prompt that mode does not auto-approve comes back — Claude Code's
+# dangerous-rm check ("Dangerous rm operation on statically-unresolvable
+# target"), un-allowlisted Bash, and the like. Nothing in a headless container
+# answers those dialogs (the supervisor's `promptPatterns` below only detect and
+# escalate), so each one is a permanent wedge: this profile shipped with
+# `--permission-mode acceptEdits` alongside the bypass until 2026-09-03, and a
+# reviewer sat at exactly that rm prompt for 7+ hours holding its slot while
+# the queue re-delivered the same round (issue #116).
 #
 # To pin the reviewer model, set the ALISSA_AGENT_MODEL env var (default:
 # claude-fable-5-1) — the entrypoint rewrites the `command:` below with
@@ -21,7 +33,7 @@
 # profile at boot from ALISSA_AGENT_MODEL — do not remove this marker line, it is
 # what distinguishes the baked default from a runtime-mounted custom agents.yaml.
 claude:
-  command: claude --dangerously-skip-permissions --permission-mode acceptEdits
+  command: claude --dangerously-skip-permissions
   mode: interactive
   quietSeconds: 30
   promptPatterns:

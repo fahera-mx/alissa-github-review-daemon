@@ -291,7 +291,11 @@ The reviewer's claude launch command lives in [`agents.yaml`](./agents.yaml). To
 pin the model, set `ALISSA_AGENT_MODEL` (see [Pinning the reviewer model](#pinning-the-reviewer-model))
 rather than editing the file; to change flags, mount your own file over
 `/home/alissa/.config/alissa/agents.yaml`. The image runs as a non-root user
-because claude refuses `--dangerously-skip-permissions` as root.
+because claude refuses `--dangerously-skip-permissions` as root. That flag is the
+whole unattended contract: do **not** pair it with an explicit `--permission-mode`
+(a mounted file included) — an explicit mode overrides the bypass and re-enables
+the hard prompts (dangerous `rm`, un-allowlisted Bash) that nothing in a headless
+container answers, so the session wedges at the dialog until it is killed.
 
 ### Pinning the reviewer model
 
