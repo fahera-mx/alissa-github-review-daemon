@@ -348,6 +348,55 @@ assert_eq "$(profile_cmd)" "${BASE_CMD}" \
 assert_contains "${LOG2E}" "reviewer model: account default (ALISSA_AGENT_MODEL='')" \
   "...and the log says so"
 
+# Verbatim pass-through is the feature, but it is also a second route back into
+# issue #116: the rendered command is TYPED into the agent's tmux pane, so the
+# pane's shell splits and expands whatever the pin carries, and the
+# rendered-command assertions never see it because every value above is a bare
+# token. The entrypoint therefore checks the shape POSITIVELY — one bare token
+# of [A-Za-z0-9._-], the CLI's own ENV_VALUE_RE, not starting with a dash (the
+# class admits `-`, so a bare flag needs its own arm) — and refuses the rest at
+# boot (PR #117 / PR #118 round-1 findings). A refused pin dies in step 2e, BEFORE
+# 2e-ii copies the profile, so the strongest true assertion is "no profile was
+# rendered at all", not a match against an empty read.
+refused_pin() {  # <log> <value> <label>
+  model_boot "$1" "ALISSA_AGENT_MODEL=$2"
+  [ "${BOOT_STATUS}" != "0" ] && pass "$3 is fatal at BOOT" \
+    || bad "a pin of '$2' should not have booted"
+  assert_contains "$1" "is not a model alias or id" \
+    "...the refusal names the shape rule"
+  assert_no_file "${SPY}/bridge-argv" "...nothing registers on a refused pin"
+  assert_no_file "${WORKSPACE}/.alissa-config/agents.yaml" \
+    "...and a refused pin renders no profile at all"
+}
+refused_pin "${TMPROOT}/model-smuggled-flag.log" 'opus --permission-mode acceptEdits' \
+  "a model pin carrying whitespace (smuggled flags)"
+assert_contains "${TMPROOT}/model-smuggled-flag.log" "overrides --dangerously-skip-permissions" \
+  "...and the refusal says why a smuggled flag is the hazard"
+refused_pin "${TMPROOT}/model-leading-dash.log" '--permission-mode' \
+  "a model pin that is a bare flag"
+# No literal whitespace, no leading dash — the pane's shell expands ${IFS} back
+# into the issue #116 argv. This is the case a deny-list on those two shapes
+# let through (PR #118 round 1); the positive class refuses the `$`, `{`, `}`.
+refused_pin "${TMPROOT}/model-ifs.log" 'opus${IFS}--permission-mode${IFS}acceptEdits' \
+  "a model pin rebuilding the flag through \${IFS}"
+refused_pin "${TMPROOT}/model-semicolon.log" 'opus;id' \
+  "a model pin carrying a shell command separator"
+
+# Padding is NOT smuggling: a copy-pasted `opus ` boots at base (the shell drops
+# the padding) and must keep booting — trimmed, pinned, and logged as `opus`.
+# The same trim makes `default ` take the no-`--model` path instead of being
+# pinned as a model literally named "default ".
+LOG2H="${TMPROOT}/model-padded.log"
+model_boot "${LOG2H}" "ALISSA_AGENT_MODEL= opus "
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model opus" \
+  "a padded pin (' opus ') is trimmed and pinned as opus, not refused"
+assert_contains "${LOG2H}" "reviewer model: opus (ALISSA_AGENT_MODEL)" \
+  "...and the log names the trimmed value"
+LOG2I="${TMPROOT}/model-padded-default.log"
+model_boot "${LOG2I}" "ALISSA_AGENT_MODEL=default "
+assert_eq "$(profile_cmd)" "${BASE_CMD}" \
+  "a padded 'default ' still omits --model"
+
 # -----------------------------------------------------------------------------
 info ""
 info "3. the executor id is required and validated"

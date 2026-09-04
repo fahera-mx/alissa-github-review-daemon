@@ -320,7 +320,16 @@ for `effective reviewer command:`).
 | `default` *or* empty | `claude …` (no `--model` — restores account default) |
 
 The value passes through **verbatim** — both aliases (`opus`, `sonnet`) and full
-ids (`claude-opus-4-8`) are valid; there is no allowlist.
+ids (`claude-opus-4-8`) are valid; there is no allowlist. There is a **shape
+rule**, though: the value must be one bare token of letters, digits, dot,
+underscore or dash (`[A-Za-z0-9._-]`, the same rule the CLI applies to every
+value it puts on this launch line) that does not start with a dash, and the
+entrypoint refuses to boot otherwise. The rendered command is typed into the agent's shell, so any other
+character would smuggle flags or commands into the reviewer spawn — and an
+explicit `--permission-mode` there overrides `--dangerously-skip-permissions`
+and brings back the permission prompts that wedge headless sessions (issue
+#116). Leading and trailing whitespace is trimmed, so a padded paste still
+boots. Pin models with this knob, never flags.
 
 **Precedence.** The entrypoint only rewrites the **baked default** profile, which
 it recognizes by an `alissa-managed:` marker comment. A custom `agents.yaml`
